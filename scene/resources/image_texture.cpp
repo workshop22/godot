@@ -78,10 +78,13 @@ void ImageTexture::set_image(const Ref<Image> &p_image) {
 	format = p_image->get_format();
 	mipmaps = p_image->has_mipmaps();
 
+	// Queued uploads outlive the producer call (font atlases reuse their Image).
+	// Copy the Image object; its packed pixels detach on the next producer write.
+	Ref<Image> upload = RS::get_singleton()->is_on_render_thread() ? p_image : Ref<Image>(p_image->duplicate());
 	if (texture.is_null()) {
-		texture = RenderingServer::get_singleton()->texture_2d_create(p_image);
+		texture = RenderingServer::get_singleton()->texture_2d_create(upload);
 	} else {
-		RID new_texture = RenderingServer::get_singleton()->texture_2d_create(p_image);
+		RID new_texture = RenderingServer::get_singleton()->texture_2d_create(upload);
 		RenderingServer::get_singleton()->texture_replace(texture, new_texture);
 	}
 	notify_property_list_changed();
@@ -104,7 +107,9 @@ void ImageTexture::update(const Ref<Image> &p_image) {
 	ERR_FAIL_COND_MSG(mipmaps != p_image->has_mipmaps(),
 			"The new image mipmaps configuration must match the texture's image mipmaps configuration");
 
-	RS::get_singleton()->texture_2d_update(texture, p_image);
+	// The render queue owns a stable snapshot, not the producer's mutable Image.
+	Ref<Image> upload = RS::get_singleton()->is_on_render_thread() ? p_image : Ref<Image>(p_image->duplicate());
+	RS::get_singleton()->texture_2d_update(texture, upload);
 
 	notify_property_list_changed();
 	emit_changed();
