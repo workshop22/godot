@@ -48,6 +48,8 @@ class PrimitiveMesh : public Mesh {
 private:
 	RID mesh;
 	mutable AABB aabb;
+	// Keep the exact packed upload for CPU consumers (collision, navigation, RT).
+	mutable RenderingServerTypes::SurfaceData surface_data;
 	AABB custom_aabb;
 
 	mutable int array_len = 0;

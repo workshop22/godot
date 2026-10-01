@@ -126,7 +126,9 @@ void PrimitiveMesh::_update() const {
 	index_array_len = indices.size();
 	// in with the new
 	RenderingServer::get_singleton()->mesh_clear(mesh);
-	RenderingServer::get_singleton()->mesh_add_surface_from_arrays(mesh, (RSE::PrimitiveType)primitive_type, arr);
+	Error err = RenderingServer::get_singleton()->mesh_create_surface_data_from_arrays(&surface_data, (RSE::PrimitiveType)primitive_type, arr);
+	ERR_FAIL_COND(err != OK);
+	RenderingServer::get_singleton()->mesh_add_surface(mesh, surface_data);
 	RenderingServer::get_singleton()->mesh_surface_set_material(mesh, 0, material.is_null() ? RID() : material->get_rid());
 
 	pending_request = false;
@@ -174,7 +176,8 @@ Array PrimitiveMesh::surface_get_arrays(int p_surface) const {
 		_update();
 	}
 
-	return RenderingServer::get_singleton()->mesh_surface_get_arrays(mesh, 0);
+	// Decode the same packed bytes as the renderer, without waiting for its queue.
+	return RenderingServer::get_singleton()->mesh_create_arrays_from_surface_data(surface_data);
 }
 
 Dictionary PrimitiveMesh::surface_get_lods(int p_surface) const {
