@@ -258,6 +258,8 @@ void ShaderRD::_initialize_version(Version *p_version) {
 	p_version->variants.resize_initialized(variant_defines.size());
 	p_version->variant_data.resize(variant_defines.size());
 	p_version->group_compilation_tasks.resize_initialized(group_enabled.size());
+	p_version->group_started.resize(group_enabled.size());
+	p_version->group_started.fill(false);
 }
 
 void ShaderRD::_clear_version(Version *p_version) {
@@ -714,9 +716,16 @@ void ShaderRD::_allocate_placeholders(Version *p_version, int p_group) {
 // Try to compile all variants for a given group.
 // Will skip variants that are disabled.
 void ShaderRD::_compile_version_start(Version *p_version, int p_group) {
-	if (!group_enabled[p_group]) {
+	if (!group_enabled[p_group] || p_version->group_started.size() <= p_group) {
+		return; // A newly created version may not have received its code yet.
+	}
+	// The caller holds the version mutex. A group enabled while another caller
+	// initializes this version may already have been started there (or loaded
+	// from cache). Never fill the same placeholder shader a second time.
+	if (p_version->group_started[p_group]) {
 		return;
 	}
+	p_version->group_started.write[p_group] = true;
 
 	p_version->dirty = false;
 

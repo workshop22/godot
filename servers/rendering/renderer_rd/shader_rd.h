@@ -82,6 +82,7 @@ private:
 		HashMap<StringName, CharString> code_sections;
 		Vector<CharString> custom_defines;
 		Vector<WorkerThreadPool::GroupID> group_compilation_tasks;
+		Vector<bool> group_started; // Includes cache hits, whose task ID stays zero.
 
 		Vector<Vector<uint8_t>> variant_data;
 		Vector<RID> variants;
