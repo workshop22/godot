@@ -736,8 +736,26 @@ void AudioDriverWASAPI::write_sample(WORD format_tag, int bits_per_sample, BYTE 
 	}
 }
 
+// Lightcycle: the mix thread must not starve while loading fills every core with normal-priority
+// work (shader compiles, resource loads); a starved mix underruns and the output crackles. Register
+// the thread with MMCSS "Pro Audio" (avrt.dll, loaded at runtime so the build needs no new link
+// library), else raise it to time-critical. Each pass of this thread is a short mix.
+static void _wasapi_raise_thread_priority() {
+	typedef HANDLE(WINAPI * AvSetMmThreadCharacteristicsWFn)(LPCWSTR, LPDWORD);
+	HMODULE avrt = LoadLibraryW(L"avrt.dll");
+	if (avrt != nullptr) {
+		AvSetMmThreadCharacteristicsWFn set_characteristics = (AvSetMmThreadCharacteristicsWFn)(void *)GetProcAddress(avrt, "AvSetMmThreadCharacteristicsW");
+		DWORD task_index = 0;
+		if (set_characteristics != nullptr && set_characteristics(L"Pro Audio", &task_index) != nullptr) {
+			return;
+		}
+	}
+	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+}
+
 void AudioDriverWASAPI::thread_func(void *p_udata) {
 	CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+	_wasapi_raise_thread_priority();
 
 	AudioDriverWASAPI *ad = static_cast<AudioDriverWASAPI *>(p_udata);
 	uint32_t avail_frames = 0;
