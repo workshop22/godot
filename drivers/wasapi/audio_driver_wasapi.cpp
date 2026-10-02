@@ -747,10 +747,12 @@ static void _wasapi_raise_thread_priority() {
 		AvSetMmThreadCharacteristicsWFn set_characteristics = (AvSetMmThreadCharacteristicsWFn)(void *)GetProcAddress(avrt, "AvSetMmThreadCharacteristicsW");
 		DWORD task_index = 0;
 		if (set_characteristics != nullptr && set_characteristics(L"Pro Audio", &task_index) != nullptr) {
+			print_verbose("WASAPI: mix thread registered with MMCSS Pro Audio");
 			return;
 		}
 	}
-	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+	const bool raised = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+	print_verbose(raised ? "WASAPI: mix thread raised to time-critical priority" : "WASAPI: mix thread priority unchanged");
 }
 
 void AudioDriverWASAPI::thread_func(void *p_udata) {
