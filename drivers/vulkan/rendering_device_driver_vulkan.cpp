@@ -69,6 +69,11 @@
 // Disable dead code elimination when using re-spirv.
 #define RESPV_DONT_REMOVE_DEAD_CODE 0
 
+// Lightcycle: shaders with specialization constants defer their re-spirv parse (most of a
+// shader's creation cost) to the first pipeline that specializes them, usually on a
+// pipeline worker thread; many variants never get one. One lock guards the deferred parse.
+static Mutex respv_parse_mutex;
+
 // Record numerous statistics about pipeline creation such as time and shader sizes. When combined with enabling
 // and disabling re-spirv, this can be used to measure its effects.
 #define RECORD_PIPELINE_STATISTICS 0
@@ -4364,6 +4369,7 @@ RDD::ShaderID RenderingDeviceDriverVulkan::shader_create_from_container(const Re
 
 	if (store_respv) {
 		shader_info.respv_stage_shaders.reserve(stage_count);
+		shader_info.respv_pending_spirv.reserve(stage_count);
 	}
 
 	for (int i = 0; i < stage_count; i++) {
@@ -4398,7 +4404,11 @@ RDD::ShaderID RenderingDeviceDriverVulkan::shader_create_from_container(const Re
 
 		shader_info.original_stage_size.push_back(decoded_spirv.size());
 
-		if (use_respv) {
+		if (store_respv) {
+			// Parsed on the first pipeline with specialization constants.
+			shader_info.respv_stage_shaders.push_back(respv::Shader());
+			shader_info.respv_pending_spirv.push_back(decoded_spirv);
+		} else if (use_respv) {
 			const bool inline_data = store_respv || (RESPV_ONLY_INLINE_SHADERS_WITH_SPEC_CONSTANTS == 0);
 			respv::Shader respv_shader(decoded_spirv.ptr(), decoded_spirv.size(), inline_data);
 			if (respv_shader.empty()) {
@@ -6149,7 +6159,18 @@ RDD::PipelineID RenderingDeviceDriverVulkan::render_pipeline_create(
 
 		if (p_specialization_constants.size()) {
 			bool use_pipeline_spec_constants = true;
-			if ((i < shader_info->respv_stage_shaders.size()) && !shader_info->respv_stage_shaders[i].empty()) {
+			bool respv_ready = false;
+			if (i < shader_info->respv_stage_shaders.size()) {
+				MutexLock lock(respv_parse_mutex);
+				if (shader_info->respv_stage_shaders[i].empty() && !shader_info->respv_pending_spirv[i].is_empty()) {
+					ShaderInfo *parsed = const_cast<ShaderInfo *>(shader_info);
+					const Vector<uint8_t> &spirv = parsed->respv_pending_spirv[i];
+					parsed->respv_stage_shaders[i] = respv::Shader(spirv.ptr(), spirv.size(), true);
+					parsed->respv_pending_spirv[i].clear();
+				}
+				respv_ready = !shader_info->respv_stage_shaders[i].empty();
+			}
+			if (respv_ready) {
 #if RECORD_PIPELINE_STATISTICS
 				uint64_t respv_start_time = OS::get_singleton()->get_ticks_usec();
 #endif
