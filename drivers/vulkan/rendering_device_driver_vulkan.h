@@ -141,6 +141,7 @@ class RenderingDeviceDriverVulkan : public RenderingDeviceDriver {
 
 	VkDevice vk_device = VK_NULL_HANDLE;
 	RenderingContextDriverVulkan *context_driver = nullptr;
+	bool process_exiting = false;
 	RenderingContextDriver::Device context_device = {};
 	uint32_t frame_count = 1;
 	VkPhysicalDevice physical_device = VK_NULL_HANDLE;
@@ -828,6 +829,7 @@ private:
 	/******************/
 
 public:
+	virtual void set_process_exiting() override final { process_exiting = true; }
 	RenderingDeviceDriverVulkan(RenderingContextDriverVulkan *p_context_driver);
 	virtual ~RenderingDeviceDriverVulkan();
 };

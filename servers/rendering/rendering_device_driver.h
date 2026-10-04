@@ -952,6 +952,11 @@ public:
 
 	virtual DriverWorkarounds get_driver_workarounds() const { return DriverWorkarounds(); }
 
+	// Lightcycle: the process is exiting. The driver may leave its device for the OS to reclaim
+	// instead of waiting on the GPU driver's own background work (NVIDIA's compiler can take
+	// minutes on a pipeline it re-optimizes, and vkDestroyDevice waits for it).
+	virtual void set_process_exiting() {}
+
 	/******************/
 
 	virtual ~RenderingDeviceDriver();

@@ -9009,6 +9009,10 @@ void RenderingDevice::finalize() {
 
 	// Delete the driver once everything else has been deleted.
 	if (driver != nullptr) {
+		if (is_main_instance) {
+			// Lightcycle: only the main device lives until the process exits.
+			driver->set_process_exiting();
+		}
 		context->driver_free(driver);
 		driver = nullptr;
 	}

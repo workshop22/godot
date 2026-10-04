@@ -391,7 +391,7 @@ RenderingContextDriverVulkan::~RenderingContextDriverVulkan() {
 		functions.DestroyDebugReportCallbackEXT(instance, debug_report, get_allocation_callbacks(VK_OBJECT_TYPE_DEBUG_REPORT_CALLBACK_EXT));
 	}
 
-	if (instance != VK_NULL_HANDLE) {
+	if (instance != VK_NULL_HANDLE && !device_left_to_exit) {
 		vkDestroyInstance(instance, get_allocation_callbacks(VK_OBJECT_TYPE_INSTANCE));
 	}
 }

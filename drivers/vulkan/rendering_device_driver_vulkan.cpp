@@ -7549,6 +7549,11 @@ RenderingDeviceDriverVulkan::~RenderingDeviceDriverVulkan() {
 	}
 
 	if (vk_device != VK_NULL_HANDLE) {
-		vkDestroyDevice(vk_device, VKC::get_allocation_callbacks(VK_OBJECT_TYPE_DEVICE));
+		if (process_exiting) {
+			// Lightcycle: the OS reclaims the device with the process; the instance stays too.
+			context_driver->device_left_to_exit = true;
+		} else {
+			vkDestroyDevice(vk_device, VKC::get_allocation_callbacks(VK_OBJECT_TYPE_DEVICE));
+		}
 	}
 }

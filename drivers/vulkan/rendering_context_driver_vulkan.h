@@ -174,6 +174,7 @@ public:
 	};
 
 	VkInstance instance_get() const;
+	bool device_left_to_exit = false; // Lightcycle: a device was left for the OS at process exit.
 	VkPhysicalDevice physical_device_get(uint32_t p_device_index) const;
 	uint32_t queue_family_get_count(uint32_t p_device_index) const;
 	VkQueueFamilyProperties queue_family_get(uint32_t p_device_index, uint32_t p_queue_family_index) const;
