@@ -127,6 +127,19 @@ void RenderSceneDataRD::update_ubo(RID p_uniform_buffer, RSE::ViewportDebugDraw 
 	RendererRD::MaterialStorage::store_soft_shadow_kernel(render_scene_render->penumbra_shadow_kernel_get(), ubo.penumbra_shadow_kernel);
 	RendererRD::MaterialStorage::store_soft_shadow_kernel(render_scene_render->soft_shadow_kernel_get(), ubo.soft_shadow_kernel);
 	ubo.camera_visible_layers = camera_visible_layers;
+	if (use_clip_plane) {
+		// The plane in view space: a view-space point p is under it when dot(n_view, p) + w < 0.
+		Vector3 n_view = cam_transform.basis.xform_inv(clip_plane.normal);
+		ubo.clip_plane[0] = n_view.x;
+		ubo.clip_plane[1] = n_view.y;
+		ubo.clip_plane[2] = n_view.z;
+		ubo.clip_plane[3] = clip_plane.normal.dot(cam_transform.origin) - clip_plane.d;
+	} else {
+		ubo.clip_plane[0] = 0.0;
+		ubo.clip_plane[1] = 0.0;
+		ubo.clip_plane[2] = 0.0;
+		ubo.clip_plane[3] = 1.0;
+	}
 	ubo.pass_alpha_multiplier = p_opaque_render_buffers && p_apply_alpha_multiplier ? 0.0f : 1.0f;
 
 	ubo.viewport_size[0] = p_viewport_size.x;

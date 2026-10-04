@@ -190,6 +190,15 @@
 				Sets [Transform3D] of camera.
 			</description>
 		</method>
+		<method name="camera_set_clip_plane">
+			<return type="void" />
+			<param index="0" name="camera" type="RID" />
+			<param index="1" name="enable" type="bool" />
+			<param index="2" name="plane" type="Plane" />
+			<description>
+				Lightcycle build: if [param enable] is [code]true[/code], geometry on the negative side of the world-space [param plane] is clipped (and culled when wholly under it) when this camera renders the main scene pass, as a planar reflection's mirror plane needs. Shadow passes are not clipped.
+			</description>
+		</method>
 		<method name="camera_set_use_vertical_aspect">
 			<return type="void" />
 			<param index="0" name="camera" type="RID" />

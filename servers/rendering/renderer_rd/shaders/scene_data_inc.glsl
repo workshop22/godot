@@ -81,4 +81,6 @@ struct SceneData {
 	float IBL_exposure_normalization;
 	uint camera_visible_layers;
 	float pass_alpha_multiplier;
+
+	vec4 clip_plane; // Lightcycle: view space; (0, 0, 0, 1) clips nothing.
 };

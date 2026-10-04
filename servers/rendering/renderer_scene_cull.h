@@ -88,6 +88,10 @@ public:
 		RID attributes;
 		RID compositor;
 
+		// Lightcycle: geometry under this world-space plane is clipped (planar reflections).
+		bool use_clip_plane = false;
+		Plane clip_plane;
+
 		Transform3D transform;
 
 		Camera() {
@@ -116,6 +120,7 @@ public:
 	virtual void camera_set_camera_attributes(RID p_camera, RID p_attributes);
 	virtual void camera_set_compositor(RID p_camera, RID p_compositor);
 	virtual void camera_set_use_vertical_aspect(RID p_camera, bool p_enable);
+	virtual void camera_set_clip_plane(RID p_camera, bool p_enable, const Plane &p_plane);
 	virtual bool is_camera(RID p_camera) const;
 
 	/* OCCLUDER API */

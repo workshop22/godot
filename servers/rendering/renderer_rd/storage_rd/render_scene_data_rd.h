@@ -53,6 +53,10 @@ public:
 	// For billboards to cast correct shadows.
 	Transform3D main_cam_transform;
 
+	// Lightcycle: the camera's world-space clip plane (planar reflections); shadow and other passes leave it off.
+	bool use_clip_plane = false;
+	Plane clip_plane;
+
 	// For stereo rendering
 	uint32_t view_count = 1;
 	Vector3 view_eye_offset[RendererSceneRender::MAX_RENDER_VIEWS];
@@ -181,6 +185,8 @@ private:
 		float IBL_exposure_normalization; // Adjusts for baked exposure.
 		uint32_t camera_visible_layers;
 		float pass_alpha_multiplier;
+
+		float clip_plane[4]; // Lightcycle: view space; (0, 0, 0, 1) clips nothing.
 	};
 
 	struct UBODATA {

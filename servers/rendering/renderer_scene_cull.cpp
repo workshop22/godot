@@ -153,6 +153,13 @@ void RendererSceneCull::camera_set_use_vertical_aspect(RID p_camera, bool p_enab
 	camera->vaspect = p_enable;
 }
 
+void RendererSceneCull::camera_set_clip_plane(RID p_camera, bool p_enable, const Plane &p_plane) {
+	Camera *camera = camera_owner.get_or_null(p_camera);
+	ERR_FAIL_NULL(camera);
+	camera->use_clip_plane = p_enable;
+	camera->clip_plane = p_plane.normalized();
+}
+
 bool RendererSceneCull::is_camera(RID p_camera) const {
 	return camera_owner.owns(p_camera);
 }
@@ -2732,6 +2739,8 @@ void RendererSceneCull::render_camera(const Ref<RenderSceneBuffers> &p_render_bu
 		}
 
 		camera_data.set_camera(transform, projection, is_orthogonal, vaspect, jitter, taa_frame_count, camera->visible_layers);
+		camera_data.use_clip_plane = camera->use_clip_plane;
+		camera_data.clip_plane = camera->clip_plane;
 #ifndef XR_DISABLED
 	} else {
 		XRServer *xr_server = XRServer::get_singleton();
@@ -3350,6 +3359,9 @@ void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_c
 	/* STEP 2 - CULL */
 
 	Vector<Plane> planes = p_camera_data->main_projection.get_projection_planes(p_camera_data->main_transform);
+	if (p_camera_data->use_clip_plane) {
+		planes.push_back(-p_camera_data->clip_plane); // Lightcycle: what lies wholly under the clip plane is culled too.
+	}
 	cull.frustum = Frustum(planes);
 
 	Vector<RID> directional_lights;
