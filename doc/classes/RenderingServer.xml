@@ -190,6 +190,15 @@
 				Sets [Transform3D] of camera.
 			</description>
 		</method>
+		<method name="camera_set_sdfgi_origin">
+			<return type="void" />
+			<param index="0" name="camera" type="RID" />
+			<param index="1" name="enable" type="bool" />
+			<param index="2" name="origin" type="Vector3" />
+			<description>
+				When enabled, centers this camera's SDFGI cascades at [param origin] instead of the view position. Prepare a forthcoming shot while loading, keep that origin through its establishing flight, then disable the override after the cut. This does not change the camera transform, culling, shadows, GI settings or probe sampling. Disabled by default; unsupported rendering methods ignore it.
+			</description>
+		</method>
 		<method name="camera_set_clip_plane">
 			<return type="void" />
 			<param index="0" name="camera" type="RID" />

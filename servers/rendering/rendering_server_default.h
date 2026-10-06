@@ -718,6 +718,7 @@ public:
 	FUNC2(camera_set_compositor, RID, RID)
 	FUNC2(camera_set_use_vertical_aspect, RID, bool)
 	FUNC3(camera_set_clip_plane, RID, bool, const Plane &)
+	FUNC3(camera_set_sdfgi_origin, RID, bool, const Vector3 &)
 
 	/* OCCLUDER */
 	FUNCRIDSPLIT(occluder)

@@ -2846,6 +2846,7 @@ void RenderingServer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("camera_set_compositor", "camera", "compositor"), &RenderingServer::camera_set_compositor);
 	ClassDB::bind_method(D_METHOD("camera_set_use_vertical_aspect", "camera", "enable"), &RenderingServer::camera_set_use_vertical_aspect);
 	ClassDB::bind_method(D_METHOD("camera_set_clip_plane", "camera", "enable", "plane"), &RenderingServer::camera_set_clip_plane);
+	ClassDB::bind_method(D_METHOD("camera_set_sdfgi_origin", "camera", "enable", "origin"), &RenderingServer::camera_set_sdfgi_origin);
 
 	/* VIEWPORT */
 

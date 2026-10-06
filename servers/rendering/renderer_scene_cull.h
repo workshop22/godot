@@ -92,6 +92,10 @@ public:
 		bool use_clip_plane = false;
 		Plane clip_plane;
 
+		// Lightcycle: keep warmed GI at a forthcoming camera cut.
+		bool use_sdfgi_origin = false;
+		Vector3 sdfgi_origin;
+
 		Transform3D transform;
 
 		Camera() {
@@ -121,6 +125,7 @@ public:
 	virtual void camera_set_compositor(RID p_camera, RID p_compositor);
 	virtual void camera_set_use_vertical_aspect(RID p_camera, bool p_enable);
 	virtual void camera_set_clip_plane(RID p_camera, bool p_enable, const Plane &p_plane);
+	virtual void camera_set_sdfgi_origin(RID p_camera, bool p_enable, const Vector3 &p_origin);
 	virtual bool is_camera(RID p_camera) const;
 
 	/* OCCLUDER API */
@@ -1162,7 +1167,7 @@ public:
 
 	bool _render_reflection_probe_step(Instance *p_instance, int p_step);
 
-	void _render_scene(const RendererSceneRender::CameraData *p_camera_data, const Ref<RenderSceneBuffers> &p_render_buffers, RID p_environment, RID p_force_camera_attributes, RID p_compositor, uint32_t p_visible_layers, RID p_scenario, RID p_viewport, RID p_shadow_atlas, RID p_reflection_probe, int p_reflection_probe_pass, float p_screen_mesh_lod_threshold, float p_window_output_max_value, bool p_using_shadows = true, RenderingServerTypes::RenderInfo *r_render_info = nullptr);
+	void _render_scene(const RendererSceneRender::CameraData *p_camera_data, const Ref<RenderSceneBuffers> &p_render_buffers, RID p_environment, RID p_force_camera_attributes, RID p_compositor, uint32_t p_visible_layers, RID p_scenario, RID p_viewport, RID p_shadow_atlas, RID p_reflection_probe, int p_reflection_probe_pass, float p_screen_mesh_lod_threshold, float p_window_output_max_value, bool p_using_shadows = true, RenderingServerTypes::RenderInfo *r_render_info = nullptr, const Vector3 *p_sdfgi_origin = nullptr);
 	void render_empty_scene(const Ref<RenderSceneBuffers> &p_render_buffers, RID p_scenario, RID p_shadow_atlas, float p_window_output_max_value);
 
 	void render_camera(const Ref<RenderSceneBuffers> &p_render_buffers, RID p_camera, RID p_scenario, RID p_viewport, Size2 p_viewport_size, uint32_t p_jitter_phase_count, float p_screen_mesh_lod_threshold, RID p_shadow_atlas, Ref<XRInterface> &p_xr_interface, float p_window_output_max_value, RenderingServerTypes::RenderInfo *r_render_info = nullptr);
