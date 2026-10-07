@@ -29,6 +29,7 @@
 /**************************************************************************/
 
 #include "gi.h"
+#include "sdfgi_scroll.h"
 
 #include "core/config/project_settings.h"
 #include "core/math/geometry_3d.h"
@@ -1230,18 +1231,8 @@ void GI::SDFGI::update(RID p_env, const Vector3 &p_world_position) {
 			}
 		}
 
-		if (cascade.dirty_regions != Vector3i() && cascade.dirty_regions != SDFGI::Cascade::DIRTY_ALL) {
-			//see how much the total dirty volume represents from the total volume
-			uint32_t total_volume = cascade_size * cascade_size * cascade_size;
-			uint32_t safe_volume = 1;
-			for (int j = 0; j < 3; j++) {
-				safe_volume *= cascade_size - Math::abs(cascade.dirty_regions[j]);
-			}
-			uint32_t dirty_volume = total_volume - safe_volume;
-			if (dirty_volume > (safe_volume / 2)) {
-				//more than half the volume is dirty, make all dirty so its only rendered once
-				cascade.dirty_regions = SDFGI::Cascade::DIRTY_ALL;
-			}
+		if (cascade.dirty_regions != SDFGI::Cascade::DIRTY_ALL && SDFGIScroll::redraw_all(cascade.dirty_regions, cascade_size)) {
+			cascade.dirty_regions = SDFGI::Cascade::DIRTY_ALL;
 		}
 	}
 }
