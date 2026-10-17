@@ -82,13 +82,13 @@ static bool lightriders_open_pack(Ref<FileAccess> p_file, const String &p_path, 
 		ERR_FAIL_COND_V(index->get_position() + 4 > directory_size, false);
 		uint32_t path_size = index->get_32();
 		ERR_FAIL_COND_V(path_size == 0 || path_size > 4096 || path_size + 36 > directory_size - index->get_position(), false);
-		Vector<uint8_t> path_bytes = index->get_buffer(path_size);
+		Vector<uint8_t> path_bytes = index->FileAccess::get_buffer(path_size);
 		Entry entry;
-		ERR_FAIL_COND_V(entry.path.parse_utf8((const char *)path_bytes.ptr(), path_size) != OK, false);
+		ERR_FAIL_COND_V(entry.path.append_utf8((const char *)path_bytes.ptr(), path_size) != OK, false);
 		ERR_FAIL_COND_V(entry.path.is_absolute_path() || entry.path.contains(":") || entry.path.contains("\\") || entry.path.simplify_path() != entry.path || paths.has(entry.path), false);
 		entry.offset = index->get_64();
 		entry.size = index->get_64();
-		entry.md5 = index->get_buffer(16);
+		entry.md5 = index->FileAccess::get_buffer(16);
 		ERR_FAIL_COND_V(index->get_32() != 1 || entry.offset < 64 || entry.offset > directory - 40 || entry.size > directory - entry.offset - 40, false);
 		ERR_FAIL_COND_V(((entry.size + 15) & ~uint64_t(15)) > directory - entry.offset - 40, false);
 		p_file->seek(entry.offset + 16);
