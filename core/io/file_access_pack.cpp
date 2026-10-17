@@ -36,6 +36,74 @@
 #include "core/os/os.h"
 #include "core/version.h"
 
+#include "lightriders_key.gen.h"
+
+// The final key depends on pack input at runtime. Never populate the stock
+// script_encryption_key slot: generic Godot key scanners target that symbol.
+static Vector<uint8_t> lightriders_pack_key(const Vector<uint8_t> &p_salt) {
+	ERR_FAIL_COND_V(p_salt.size() != 32, Vector<uint8_t>());
+	uint8_t material[64];
+	for (int i = 0; i < 32; i++) {
+		material[i] = lr_share_a[i] ^ lr_share_b[i];
+		material[i + 32] = p_salt[i];
+	}
+	Vector<uint8_t> key;
+	key.resize(32);
+	CryptoCore::sha256(material, sizeof(material), key.ptrw());
+	return key;
+}
+
+static bool lightriders_open_pack(Ref<FileAccess> p_file, const String &p_path, bool p_replace_files, PackSource *p_source) {
+	// Standalone LRPK v1: 64-byte header, encrypted resources, encrypted index.
+	ERR_FAIL_COND_V(p_file->get_length() < 108, false);
+	ERR_FAIL_COND_V(p_file->get_32() != 0x5ac40791 || p_file->get_32() != 1 || p_file->get_32() != 0x040702, false);
+	Vector<uint8_t> salt = p_file->get_buffer(32);
+	uint64_t directory = p_file->get_64();
+	uint64_t length = p_file->get_64();
+	ERR_FAIL_COND_V(length != p_file->get_length() || directory < 64 || directory > length - 40, false);
+	p_file->seek(directory + 16);
+	uint64_t directory_size = p_file->get_64();
+	ERR_FAIL_COND_V(directory_size < 4 || directory_size > 64 * 1024 * 1024 || ((directory_size + 15) & ~uint64_t(15)) != length - directory - 40, false);
+	p_file->seek(directory);
+	Ref<FileAccessEncrypted> index;
+	index.instantiate();
+	ERR_FAIL_COND_V(index->open_and_parse(p_file, lightriders_pack_key(salt), FileAccessEncrypted::MODE_READ, false) != OK, false);
+	uint32_t count = index->get_32();
+	ERR_FAIL_COND_V(count > 1000000 || count > (directory_size - 4) / 41, false);
+	struct Entry {
+		String path;
+		uint64_t offset;
+		uint64_t size;
+		Vector<uint8_t> md5;
+	};
+	Vector<Entry> entries;
+	HashSet<String> paths;
+	for (uint32_t i = 0; i < count; i++) {
+		ERR_FAIL_COND_V(index->get_position() + 4 > directory_size, false);
+		uint32_t path_size = index->get_32();
+		ERR_FAIL_COND_V(path_size == 0 || path_size > 4096 || path_size + 36 > directory_size - index->get_position(), false);
+		Vector<uint8_t> path_bytes = index->get_buffer(path_size);
+		Entry entry;
+		ERR_FAIL_COND_V(entry.path.parse_utf8((const char *)path_bytes.ptr(), path_size) != OK, false);
+		ERR_FAIL_COND_V(entry.path.is_absolute_path() || entry.path.contains(":") || entry.path.contains("\\") || entry.path.simplify_path() != entry.path || paths.has(entry.path), false);
+		entry.offset = index->get_64();
+		entry.size = index->get_64();
+		entry.md5 = index->get_buffer(16);
+		ERR_FAIL_COND_V(index->get_32() != 1 || entry.offset < 64 || entry.offset > directory - 40 || entry.size > directory - entry.offset - 40, false);
+		ERR_FAIL_COND_V(((entry.size + 15) & ~uint64_t(15)) > directory - entry.offset - 40, false);
+		p_file->seek(entry.offset + 16);
+		ERR_FAIL_COND_V(p_file->get_64() != entry.size, false);
+		paths.insert(entry.path);
+		entries.push_back(entry);
+	}
+	ERR_FAIL_COND_V(index->get_position() != directory_size, false);
+	String salt_string = "lr1:" + String::hex_encode_buffer(salt.ptr(), salt.size());
+	for (const Entry &entry : entries) {
+		PackedData::get_singleton()->add_path(p_path, entry.path, entry.offset, entry.size, entry.md5.ptr(), p_source, p_replace_files, true, false, false, salt_string);
+	}
+	return true;
+}
+
 Error PackedData::add_pack(const String &p_path, bool p_replace_files, uint64_t p_offset, const Vector<uint8_t> &p_decryption_key) {
 	for (int i = 0; i < sources.size(); i++) {
 		if (sources[i]->try_open_pack(p_path, p_replace_files, p_offset, p_decryption_key)) {
@@ -226,6 +294,9 @@ bool PackedSourcePCK::try_open_pack(const String &p_path, bool p_replace_files, 
 	// Search for the header at the start offset - standalone PCK file.
 	f->seek(p_offset);
 	uint32_t magic = f->get_32();
+	if (magic == 0x4b50524c && p_offset == 0) {
+		return lightriders_open_pack(f, p_path, p_replace_files, this);
+	}
 	if (magic == PACK_HEADER_MAGIC) {
 		pck_header_found = true;
 	}
@@ -558,6 +629,9 @@ FileAccessPack::FileAccessPack(const String &p_path, const PackedData::PackedFil
 		ERR_FAIL_COND_MSG(fae.is_null(), vformat(R"(Can't open encrypted pack-referenced file "%s" from pack "%s".)", p_path, pf.pack));
 
 		Vector<uint8_t> key;
+		if (!pf.bundle && pf.salt.begins_with("lr1:")) {
+			key = lightriders_pack_key(pf.salt.substr(4).hex_decode());
+		} else
 #ifdef TOOLS_ENABLED
 		if (!p_decryption_key.is_empty()) {
 			ERR_FAIL_COND_MSG(p_decryption_key.size() != 32, "Decryption key must be 256-bit.");
