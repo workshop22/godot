@@ -614,7 +614,9 @@ void FileAccessPack::set_big_endian(bool p_big_endian) {
 	ERR_FAIL_COND_MSG(f.is_null(), "File must be opened before use.");
 
 	FileAccess::set_big_endian(p_big_endian);
-	f->set_big_endian(p_big_endian);
+	if (lr_key.is_empty()) {
+		f->set_big_endian(p_big_endian);
+	}
 }
 
 Error FileAccessPack::get_error() const {
