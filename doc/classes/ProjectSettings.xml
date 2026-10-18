@@ -3076,6 +3076,9 @@
 			The number of rays to throw per frame when computing signed distance field global illumination. Higher values lead to a less noisy result, at the cost of performance. See also [member rendering/global_illumination/sdfgi/frames_to_converge] and [member rendering/global_illumination/sdfgi/frames_to_update_lights].
 			[b]Note:[/b] This property is only read when the project starts. To control SDFGI quality at runtime, call [method RenderingServer.environment_set_sdfgi_ray_count] instead.
 		</member>
+		<member name="rendering/global_illumination/voxel_gi/dynamic_object_oversample" type="int" setter="" getter="" default="4">
+			How many times the first map used to capture dynamic objects for a [VoxelGI] is doubled over the probe's octree size (each further map halves it). Each map is allocated when the probe's data loads, whether or not any dynamic object uses it: at [code]4[/code] a 256-cell probe holds 4096×4096 maps, about 0.5 GB of video memory. Set it lower when VoxelGI only lights static geometry. [b]Note:[/b] Only effective on the Forward+ and Mobile renderers.
+		</member>
 		<member name="rendering/global_illumination/voxel_gi/quality" type="int" setter="" getter="" default="0">
 			The VoxelGI quality to use. High quality leads to more precise lighting and better reflections, but is slower to render. This setting does not affect the baked data and doesn't require baking the [VoxelGI] again to apply.
 			[b]Note:[/b] This property is only read when the project starts. To control VoxelGI quality at runtime, call [method RenderingServer.voxel_gi_set_quality] instead.

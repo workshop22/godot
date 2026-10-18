@@ -3709,6 +3709,7 @@ void RenderingServer::init() {
 	GLOBAL_DEF("rendering/global_illumination/gi/use_half_resolution", false);
 
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/global_illumination/voxel_gi/quality", PROPERTY_HINT_ENUM, "Low (4 Cones - Fast),High (6 Cones - Slow)"), 0);
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/global_illumination/voxel_gi/dynamic_object_oversample", PROPERTY_HINT_RANGE, "0,4"), 4);
 
 	GLOBAL_DEF_RST("rendering/shading/overrides/force_vertex_shading", false);
 	GLOBAL_DEF("rendering/shading/overrides/force_lambert_over_burley", false);

@@ -550,6 +550,9 @@ public:
 	void voxel_gi_instance_free(RID p_rid);
 
 	RSE::VoxelGIQuality voxel_gi_quality = RSE::VOXEL_GI_QUALITY_LOW;
+	// Doublings of the first dynamic-object map over the octree size (each halved after); 4 is
+	// upstream's. Maps are allocated up front whether or not anything dynamic uses them.
+	uint32_t voxel_gi_dynamic_oversample = 4;
 
 	/* SDFGI */
 
