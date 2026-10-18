@@ -187,6 +187,10 @@ class FileAccessPack : public FileAccess {
 	mutable uint64_t pos;
 	mutable bool eof;
 	uint64_t off;
+	Vector<uint8_t> lr_key;
+	mutable Ref<FileAccess> lr_block;
+	mutable uint64_t lr_block_index = UINT64_MAX;
+	mutable Error lr_error = OK;
 
 	Ref<FileAccess> f;
 	virtual Error open_internal(const String &p_path, int p_mode_flags) override;

@@ -53,10 +53,12 @@ static Vector<uint8_t> lightriders_pack_key(const Vector<uint8_t> &p_salt) {
 	return key;
 }
 
+static constexpr uint64_t LR_BLOCK_SIZE = 65536;
+
 static bool lightriders_open_pack(Ref<FileAccess> p_file, const String &p_path, bool p_replace_files, PackSource *p_source) {
-	// Standalone LRPK v1: 64-byte header, encrypted resources, encrypted index.
+	// Standalone LRPK v2: 64-byte header, encrypted resources, encrypted index.
 	ERR_FAIL_COND_V(p_file->get_length() < 108, false);
-	ERR_FAIL_COND_V(p_file->get_32() != 0x5ac40791 || p_file->get_32() != 1 || p_file->get_32() != 0x040702, false);
+	ERR_FAIL_COND_V(p_file->get_32() != 0x5ac40791 || p_file->get_32() != 2 || p_file->get_32() != 0x040702, false);
 	Vector<uint8_t> salt = p_file->get_buffer(32);
 	uint64_t directory = p_file->get_64();
 	uint64_t length = p_file->get_64();
@@ -90,14 +92,15 @@ static bool lightriders_open_pack(Ref<FileAccess> p_file, const String &p_path, 
 		entry.size = index->get_64();
 		entry.md5 = index->FileAccess::get_buffer(16);
 		ERR_FAIL_COND_V(index->get_32() != 1 || entry.offset < 64 || entry.offset > directory - 40 || entry.size > directory - entry.offset - 40, false);
-		ERR_FAIL_COND_V(((entry.size + 15) & ~uint64_t(15)) > directory - entry.offset - 40, false);
+		uint64_t blocks = MAX(uint64_t(1), entry.size / LR_BLOCK_SIZE + (entry.size % LR_BLOCK_SIZE != 0));
+		ERR_FAIL_COND_V(((entry.size + 15) & ~uint64_t(15)) + blocks * 40 > directory - entry.offset, false);
 		p_file->seek(entry.offset + 16);
-		ERR_FAIL_COND_V(p_file->get_64() != entry.size, false);
+		ERR_FAIL_COND_V(p_file->get_64() != MIN(entry.size, LR_BLOCK_SIZE), false);
 		paths.insert(entry.path);
 		entries.push_back(entry);
 	}
 	ERR_FAIL_COND_V(index->get_position() != directory_size, false);
-	String salt_string = "lr1:" + String::hex_encode_buffer(salt.ptr(), salt.size());
+	String salt_string = "lr2:" + String::hex_encode_buffer(salt.ptr(), salt.size());
 	for (const Entry &entry : entries) {
 		PackedData::get_singleton()->add_path(p_path, entry.path, entry.offset, entry.size, entry.md5.ptr(), p_source, p_replace_files, true, false, false, salt_string);
 	}
@@ -520,7 +523,9 @@ void FileAccessPack::seek(uint64_t p_position) {
 		eof = false;
 	}
 
-	f->seek(off + p_position);
+	if (lr_key.is_empty()) {
+		f->seek(off + p_position);
+	}
 	pos = p_position;
 }
 
@@ -548,6 +553,47 @@ uint64_t FileAccessPack::get_buffer(uint8_t *p_dst, uint64_t p_length) const {
 		return 0;
 	}
 
+	if (!lr_key.is_empty()) {
+		// Resource probes and streaming reads decrypt only the touched 64 KiB blocks.
+		// Each block keeps FileAccessEncrypted's checksum and length verification.
+		if (pos >= pf.size) {
+			eof = p_length > 0;
+			return 0;
+		}
+		uint64_t remaining = MIN(p_length, pf.size - pos);
+		eof = remaining < p_length;
+		uint64_t done = 0;
+		while (remaining > 0) {
+			uint64_t block = pos / LR_BLOCK_SIZE;
+			if (block != lr_block_index) {
+				uint64_t start = off + block * (LR_BLOCK_SIZE + 40);
+				f->seek(start + 16);
+				if (f->get_64() != MIN(LR_BLOCK_SIZE, pf.size - block * LR_BLOCK_SIZE)) {
+					lr_error = ERR_FILE_CORRUPT;
+					ERR_FAIL_V_MSG(done, "Invalid protected resource block length.");
+				}
+				f->seek(start);
+				Ref<FileAccessEncrypted> decrypted;
+				decrypted.instantiate();
+				lr_error = decrypted->open_and_parse(f, lr_key, FileAccessEncrypted::MODE_READ, false);
+				ERR_FAIL_COND_V_MSG(lr_error != OK, done, "Corrupt protected resource block.");
+				lr_block = decrypted;
+				lr_block_index = block;
+			}
+			lr_block->seek(pos % LR_BLOCK_SIZE);
+			uint64_t amount = MIN(remaining, LR_BLOCK_SIZE - pos % LR_BLOCK_SIZE);
+			uint64_t read = lr_block->get_buffer(p_dst + done, amount);
+			pos += read;
+			done += read;
+			remaining -= read;
+			if (read != amount) {
+				lr_error = ERR_FILE_CORRUPT;
+				ERR_FAIL_V_MSG(done, "Short protected resource block.");
+			}
+		}
+		return done;
+	}
+
 	int64_t to_read = p_length;
 	if (to_read + pos > pf.size) {
 		eof = true;
@@ -572,6 +618,9 @@ void FileAccessPack::set_big_endian(bool p_big_endian) {
 }
 
 Error FileAccessPack::get_error() const {
+	if (lr_error != OK) {
+		return lr_error;
+	}
 	if (eof) {
 		return ERR_FILE_EOF;
 	}
@@ -591,6 +640,7 @@ bool FileAccessPack::file_exists(const String &p_name) {
 }
 
 void FileAccessPack::close() {
+	lr_block.unref();
 	f = Ref<FileAccess>();
 }
 
@@ -623,15 +673,14 @@ FileAccessPack::FileAccessPack(const String &p_path, const PackedData::PackedFil
 		off = pf.offset;
 	}
 
-	if (pf.encrypted) {
+	if (pf.encrypted && !pf.bundle && pf.salt.begins_with("lr2:")) {
+		lr_key = lightriders_pack_key(pf.salt.substr(4).hex_decode());
+	} else if (pf.encrypted) {
 		Ref<FileAccessEncrypted> fae;
 		fae.instantiate();
 		ERR_FAIL_COND_MSG(fae.is_null(), vformat(R"(Can't open encrypted pack-referenced file "%s" from pack "%s".)", p_path, pf.pack));
 
 		Vector<uint8_t> key;
-		if (!pf.bundle && pf.salt.begins_with("lr1:")) {
-			key = lightriders_pack_key(pf.salt.substr(4).hex_decode());
-		} else
 #ifdef TOOLS_ENABLED
 		if (!p_decryption_key.is_empty()) {
 			ERR_FAIL_COND_MSG(p_decryption_key.size() != 32, "Decryption key must be 256-bit.");
