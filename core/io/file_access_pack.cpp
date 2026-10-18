@@ -56,7 +56,7 @@ static Vector<uint8_t> lightriders_pack_key(const Vector<uint8_t> &p_salt) {
 static constexpr uint64_t LR_BLOCK_SIZE = 65536;
 
 static bool lightriders_open_pack(Ref<FileAccess> p_file, const String &p_path, bool p_replace_files, PackSource *p_source) {
-	// Standalone LRPK v2: 64-byte header, encrypted resources, encrypted index.
+	// Standalone LRPK v2: 64-byte header, flagged resource bodies, encrypted index.
 	ERR_FAIL_COND_V(p_file->get_length() < 108, false);
 	ERR_FAIL_COND_V(p_file->get_32() != 0x5ac40791 || p_file->get_32() != 2 || p_file->get_32() != 0x040702, false);
 	Vector<uint8_t> salt = p_file->get_buffer(32);
@@ -77,6 +77,7 @@ static bool lightriders_open_pack(Ref<FileAccess> p_file, const String &p_path, 
 		uint64_t offset;
 		uint64_t size;
 		Vector<uint8_t> md5;
+		bool encrypted;
 	};
 	Vector<Entry> entries;
 	HashSet<String> paths;
@@ -91,18 +92,22 @@ static bool lightriders_open_pack(Ref<FileAccess> p_file, const String &p_path, 
 		entry.offset = index->get_64();
 		entry.size = index->get_64();
 		entry.md5 = index->FileAccess::get_buffer(16);
-		ERR_FAIL_COND_V(index->get_32() != 1 || entry.offset < 64 || entry.offset > directory - 40 || entry.size > directory - entry.offset - 40, false);
-		uint64_t blocks = MAX(uint64_t(1), entry.size / LR_BLOCK_SIZE + (entry.size % LR_BLOCK_SIZE != 0));
-		ERR_FAIL_COND_V(((entry.size + 15) & ~uint64_t(15)) + blocks * 40 > directory - entry.offset, false);
-		p_file->seek(entry.offset + 16);
-		ERR_FAIL_COND_V(p_file->get_64() != MIN(entry.size, LR_BLOCK_SIZE), false);
+		uint32_t flags = index->get_32();
+		ERR_FAIL_COND_V(flags > 1 || entry.offset < 64 || entry.offset > directory || entry.size > directory - entry.offset, false);
+		entry.encrypted = flags == 1;
+		if (entry.encrypted) {
+			uint64_t blocks = MAX(uint64_t(1), entry.size / LR_BLOCK_SIZE + (entry.size % LR_BLOCK_SIZE != 0));
+			ERR_FAIL_COND_V(((entry.size + 15) & ~uint64_t(15)) + blocks * 40 > directory - entry.offset, false);
+			p_file->seek(entry.offset + 16);
+			ERR_FAIL_COND_V(p_file->get_64() != MIN(entry.size, LR_BLOCK_SIZE), false);
+		}
 		paths.insert(entry.path);
 		entries.push_back(entry);
 	}
 	ERR_FAIL_COND_V(index->get_position() != directory_size, false);
 	String salt_string = "lr2:" + String::hex_encode_buffer(salt.ptr(), salt.size());
 	for (const Entry &entry : entries) {
-		PackedData::get_singleton()->add_path(p_path, entry.path, entry.offset, entry.size, entry.md5.ptr(), p_source, p_replace_files, true, false, false, salt_string);
+		PackedData::get_singleton()->add_path(p_path, entry.path, entry.offset, entry.size, entry.md5.ptr(), p_source, p_replace_files, entry.encrypted, false, false, salt_string);
 	}
 	return true;
 }
