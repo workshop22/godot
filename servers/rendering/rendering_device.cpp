@@ -8615,30 +8615,37 @@ Vector<uint8_t> RenderingDevice::_load_pipeline_cache() {
 	}
 }
 
-void RenderingDevice::update_pipeline_cache(bool p_closing) {
+void RenderingDevice::update_pipeline_cache(bool p_closing, bool p_force) {
 	_THREAD_SAFE_METHOD_
 
 	{
 		bool still_saving = pipeline_cache_save_task != WorkerThreadPool::INVALID_TASK_ID && !WorkerThreadPool::get_singleton()->is_task_completed(pipeline_cache_save_task);
 		if (still_saving) {
 			if (p_closing) {
+				// The writer takes the device lock while serializing. Never join it
+				// with that lock held (including an interrupted loading-screen exit).
+				_thread_safe_.unlock();
 				WorkerThreadPool::get_singleton()->wait_for_task_completion(pipeline_cache_save_task);
+				_thread_safe_.lock();
 				pipeline_cache_save_task = WorkerThreadPool::INVALID_TASK_ID;
 			} else {
 				// We can't save until the currently running save is done. We'll retry next time; worst case, we'll save when exiting.
 				return;
 			}
+		} else if (pipeline_cache_save_task != WorkerThreadPool::INVALID_TASK_ID) {
+			WorkerThreadPool::get_singleton()->wait_for_task_completion(pipeline_cache_save_task);
+			pipeline_cache_save_task = WorkerThreadPool::INVALID_TASK_ID;
 		}
 	}
 
 	{
 		size_t new_pipelines_cache_size = driver->pipeline_cache_query_size();
 		ERR_FAIL_COND(!new_pipelines_cache_size);
-		size_t difference = new_pipelines_cache_size - pipeline_cache_size;
+		size_t difference = new_pipelines_cache_size > pipeline_cache_size ? new_pipelines_cache_size - pipeline_cache_size : 0;
 
 		bool must_save = false;
 
-		if (p_closing) {
+		if (p_closing || p_force) {
 			must_save = difference > 0;
 		} else {
 			float save_interval = GLOBAL_GET("rendering/rendering_device/pipeline_cache/save_chunk_size_mb");
@@ -8659,6 +8666,15 @@ void RenderingDevice::update_pipeline_cache(bool p_closing) {
 	}
 }
 
+void RenderingDevice::save_pipeline_cache() {
+	update_pipeline_cache(false, true);
+}
+
+bool RenderingDevice::is_pipeline_cache_save_complete() {
+	_THREAD_SAFE_METHOD_
+	return pipeline_cache_save_task == WorkerThreadPool::INVALID_TASK_ID || WorkerThreadPool::get_singleton()->is_task_completed(pipeline_cache_save_task);
+}
+
 void RenderingDevice::_save_pipeline_cache(void *p_data) {
 	RenderingDevice *self = static_cast<RenderingDevice *>(p_data);
 
@@ -8671,10 +8687,17 @@ void RenderingDevice::_save_pipeline_cache(void *p_data) {
 	}
 	print_verbose(vformat("Updated PSO cache (%.1f MiB)", cache_blob.size() / (1024.0f * 1024.0f)));
 
-	Ref<FileAccess> f = FileAccess::open(self->pipeline_cache_file_path, FileAccess::WRITE, nullptr);
-	if (f.is_valid()) {
-		f->store_buffer(cache_blob);
-	}
+	// Never truncate the last usable cache. A crash during this write leaves
+	// either the previous complete generation or the new complete generation.
+	String temporary = self->pipeline_cache_file_path + ".tmp";
+	Ref<FileAccess> f = FileAccess::open(temporary, FileAccess::WRITE, nullptr);
+	ERR_FAIL_COND_MSG(f.is_null(), "Could not open temporary pipeline cache.");
+	f->store_buffer(cache_blob);
+	f->flush();
+	Error error = f->get_error();
+	f->close();
+	ERR_FAIL_COND_MSG(error != OK, "Could not write pipeline cache.");
+	ERR_FAIL_COND_MSG(DirAccess::rename_absolute(temporary, self->pipeline_cache_file_path) != OK, "Could not replace pipeline cache.");
 }
 
 template <typename T>
@@ -9225,6 +9248,8 @@ void RenderingDevice::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_device_vendor_name"), &RenderingDevice::get_device_vendor_name);
 	ClassDB::bind_method(D_METHOD("get_device_name"), &RenderingDevice::get_device_name);
 	ClassDB::bind_method(D_METHOD("get_device_pipeline_cache_uuid"), &RenderingDevice::get_device_pipeline_cache_uuid);
+	ClassDB::bind_method(D_METHOD("save_pipeline_cache"), &RenderingDevice::save_pipeline_cache);
+	ClassDB::bind_method(D_METHOD("is_pipeline_cache_save_complete"), &RenderingDevice::is_pipeline_cache_save_complete);
 
 	ClassDB::bind_method(D_METHOD("get_memory_usage", "type"), &RenderingDevice::get_memory_usage);
 
