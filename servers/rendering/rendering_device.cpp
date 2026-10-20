@@ -8667,10 +8667,14 @@ void RenderingDevice::update_pipeline_cache(bool p_closing, bool p_force) {
 }
 
 void RenderingDevice::save_pipeline_cache() {
-	update_pipeline_cache(false, true);
+	ERR_RENDER_THREAD_GUARD();
+	if (pipeline_cache_enabled) {
+		update_pipeline_cache(false, true);
+	}
 }
 
 bool RenderingDevice::is_pipeline_cache_save_complete() {
+	ERR_RENDER_THREAD_GUARD_V(true);
 	_THREAD_SAFE_METHOD_
 	return pipeline_cache_save_task == WorkerThreadPool::INVALID_TASK_ID || WorkerThreadPool::get_singleton()->is_task_completed(pipeline_cache_save_task);
 }
