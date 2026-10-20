@@ -957,6 +957,16 @@
 				Returns [code]true[/code] if the render pipeline specified by the [param render_pipeline] RID is valid, [code]false[/code] otherwise.
 			</description>
 		</method>
+		<method name="save_pipeline_cache">
+			<return type="void" />
+			<description>
+				Requests an asynchronous save of all compiled pipelines. Call on the rendering thread after preparation. If a save is already running, wait for [method is_pipeline_cache_save_complete] and request again to include subsequent compilation. The previous complete file survives an interrupted write.
+			</description>
+		</method>
+		<method name="is_pipeline_cache_save_complete">
+			<return type="bool" />
+			<description>Returns whether the pipeline cache writer is idle. Call on the rendering thread.</description>
+		</method>
 		<method name="sampler_create">
 			<return type="RID" />
 			<param index="0" name="state" type="RDSamplerState" />
