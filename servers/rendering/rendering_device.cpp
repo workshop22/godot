@@ -8646,7 +8646,8 @@ void RenderingDevice::update_pipeline_cache(bool p_closing, bool p_force) {
 		bool must_save = false;
 
 		if (p_closing || p_force) {
-			must_save = difference > 0;
+			// A driver may replace entries without growing its opaque cache blob.
+			must_save = p_force || difference > 0;
 		} else {
 			float save_interval = GLOBAL_GET("rendering/rendering_device/pipeline_cache/save_chunk_size_mb");
 			must_save = difference > 0 && difference / (1024.0f * 1024.0f) >= save_interval;
