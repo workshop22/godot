@@ -1412,6 +1412,53 @@ void PXTGI3D::notify_body_changed(Node3D *p_body) {
 	moved_poses.insert(p_body->get_instance_id(), p_body->get_global_transform());
 }
 
+// Batched bridge for the underground pulse material. Parameters are shared by a
+// group; geometry is retained and only changed radiance is published.
+void PXTGI3D::update_emitter_group(const PackedInt64Array &p_bodies, const PackedFloat32Array &p_stations, const Dictionary &p_values, double p_time) {
+	ERR_FAIL_COND(p_bodies.size() != p_stations.size());
+	const Color colour = Color(p_values["colour"]).srgb_to_linear();
+	const float energy = p_values["energy"];
+	const float presence = 1.0f + float(p_values["presence_gain"]) * float(p_values["presence"]);
+	const float age = p_values["wave_age"];
+	const float wave_speed = p_values["wave_speed"];
+	const float wave_width = p_values["wave_width"];
+	const float wave_gain = p_values["wave_gain"];
+	const float life = p_values["wave_life"];
+	const Vector3 origin = p_values["wave_origin"];
+	const float chase = p_values["chase"];
+	const float chase_gain = p_values["chase_gain"];
+	const float wavelength = p_values["wavelength"];
+	const float width = p_values["width"];
+	const float speed = p_values["speed"];
+	const float fade = age >= 0.0f ? 1.0f - Math::smoothstep(life * 0.5f, life, age) : 0.0f;
+	const Color uniform_emission = (colour * (energy * presence)).linear_to_srgb();
+	for (int i = 0; i < p_bodies.size(); i++) {
+		Node3D *body = ObjectDB::get_instance<Node3D>(ObjectID(uint64_t(p_bodies[i])));
+		if (body == nullptr) {
+			continue;
+		}
+		Color emission = uniform_emission;
+		if (chase > 0.0f || fade > 0.0f) {
+			float pulse = 0.0f;
+			if (chase > 0.0f) {
+				const float ahead = Math::fposmod(p_stations[i] - float(p_time) * speed, wavelength);
+				const float d = MIN(ahead, wavelength - ahead);
+				pulse = chase * Math::exp(-d * d / (width * width));
+			}
+			float wave = 0.0f;
+			if (fade > 0.0f) {
+				const float front = body->get_global_position().distance_to(origin) - age * wave_speed;
+				wave = (front > 0.0f ? Math::exp(-front * front / (wave_width * wave_width)) : Math::exp(front / (wave_width * 4.0f)) * 0.5f) * fade;
+			}
+			emission = (colour * (energy * (presence + chase_gain * pulse + wave_gain * wave))).linear_to_srgb();
+		}
+		if (!Color(body->get_meta(meta_emission())).is_equal_approx(emission)) {
+			body->set_meta(meta_emission(), emission);
+			notify_body_changed(body);
+		}
+	}
+}
+
 void PXTGI3D::_publish() {
 	if (!is_visible_in_tree()) {
 		PhysXGIEffect::remove_settings(get_instance_id());
@@ -1630,6 +1677,7 @@ PackedStringArray PXTGI3D::get_configuration_warnings() const {
 
 void PXTGI3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("notify_body_changed", "body"), &PXTGI3D::notify_body_changed);
+	ClassDB::bind_method(D_METHOD("update_emitter_group", "bodies", "stations", "values", "time"), &PXTGI3D::update_emitter_group);
 	ClassDB::bind_method(D_METHOD("set_intensity", "intensity"), &PXTGI3D::set_intensity);
 	ClassDB::bind_method(D_METHOD("get_intensity"), &PXTGI3D::get_intensity);
 	ClassDB::bind_method(D_METHOD("set_max_distance", "distance"), &PXTGI3D::set_max_distance);

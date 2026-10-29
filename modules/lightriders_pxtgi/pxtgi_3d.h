@@ -170,6 +170,7 @@ class PXTGI3D : public Node3D {
 public:
 	static void free_shared();
 	void notify_body_changed(Node3D *p_body);
+	void update_emitter_group(const PackedInt64Array &p_bodies, const PackedFloat32Array &p_stations, const Dictionary &p_values, double p_time);
 
 private:
 	bool active = false; // in the world and visible: delivering the GI
