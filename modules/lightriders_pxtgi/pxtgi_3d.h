@@ -55,6 +55,7 @@ class PXTGI3D : public Node3D {
 	float world_ray_distance = 30.0f;
 	float reflection_distance = 60.0f;
 	bool filtered_reflections = false;
+	float reflection_softness = 1.0f;
 	int debug = 0;
 	bool multi_bounce = true;
 	int rays_per_texel = 4;
@@ -192,6 +193,8 @@ public:
 	float get_reflection_distance() const { return reflection_distance; }
 	void set_filtered_reflections(bool p_value) { filtered_reflections = p_value; }
 	bool get_filtered_reflections() const { return filtered_reflections; }
+	void set_reflection_softness(float p_value) { reflection_softness = CLAMP(p_value, 1.0f, 8.0f); }
+	float get_reflection_softness() const { return reflection_softness; }
 	void set_rays_per_texel(int p_value) { rays_per_texel = CLAMP(p_value, 1, 4); }
 	int get_rays_per_texel() const { return rays_per_texel; }
 	void set_multi_bounce(bool p_value) { multi_bounce = p_value; }

@@ -117,7 +117,7 @@ layout(set = 0, binding = 9, std140) uniform Frame {
 	vec4 src_capture[8];
 	ivec4 srcs; // x: count
 	vec4 src_border; // x: the atlas maps' border, y: the scale inside it, z: the roughest level
-	vec4 trace_settings; // x: reflection reach, y: filtered mirror rays, z: previous colour is valid
+	vec4 trace_settings; // x: reflection reach, y: filtered mirror rays, z: previous colour is valid, w: reflection softness
 }
 f;
 
@@ -833,7 +833,7 @@ vec3 world_light(vec3 x, vec3 n, int hit, sampler2D depth_tex, sampler2D color_t
 }
 )";
 
-const char *SHADERS[7] = {
+const char *SHADERS[8] = {
 	// PASS_TRACE: a few rays per texel from the surface, cosine-weighted about its normal, marched against the depth
 	// buffer; a hit takes the light that point had on last frame's image. Stores the hits' light / rays (so,
 	// premultiplied) and the fraction of rays that hit: misses are left to Godot's own ambient light.
@@ -1450,6 +1450,37 @@ void main() {
 	cells.c[slot].outgoing = vec4(cell.albedo.rgb * (direct_light(cell.pos.xyz, n) + incoming), 0.0);
 }
 )",
+	// PASS_REFLECT_BLUR: a separable reflection-only blur, kept out of temporal history.
+	R"(
+#[compute]
+#version 450
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+@COMMON@
+layout(push_constant, std430) uniform Params { ivec4 size_axis; } pc;
+layout(set = 0, binding = 0) uniform sampler2D source_tex;
+layout(set = 0, binding = 1) uniform sampler2D depth_tex;
+layout(set = 0, binding = 2) uniform sampler2D normal_tex;
+layout(rgba16f, set = 0, binding = 3) uniform restrict writeonly image2D dst;
+void main() {
+	ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+	if (any(greaterThanEqual(px, pc.size_axis.xy))) return;
+	float depth = texelFetch(depth_tex, px, 0).r;
+	vec3 normal = normalize(texelFetch(normal_tex, px, 0).xyz * 2.0 - 1.0);
+	float sigma = max(f.trace_settings.w, 1.0);
+	vec4 sum = vec4(0.0);
+	float weights = 0.0;
+	for (int i = -12; i <= 12; i++) {
+		ivec2 at = clamp(px + pc.size_axis.zw * i, ivec2(0), pc.size_axis.xy - 1);
+		float d = texelFetch(depth_tex, at, 0).r;
+		vec3 n = normalize(texelFetch(normal_tex, at, 0).xyz * 2.0 - 1.0);
+		float w = exp(-float(i * i) / (2.0 * sigma * sigma));
+		w *= exp(-abs(d - depth) / max(0.03 * depth, 0.01)) * pow(max(dot(n, normal), 0.0), 32.0);
+		sum += texelFetch(source_tex, at, 0) * w;
+		weights += w;
+	}
+	imageStore(dst, px, weights > 1e-4 ? sum / weights : texelFetch(source_tex, px, 0));
+}
+)",
 	// PASS_RESOLVE: up to Godot's GI buffer size, each pixel taking the accumulated texels around it that lie on the
 	// same surface (close in depth, facing the same way). Written as Godot's ambient buffer: rgb the light the hits
 	// saw, alpha the fraction that hit, which the surface shader mixes over its own ambient light, then multiplies by
@@ -1655,7 +1686,7 @@ void main() {
 )",
 };
 
-const char *PASS_NAMES[7] = { "trace", "temporal", "atrous", "reflect", "reflect temporal", "cache", "resolve" };
+const char *PASS_NAMES[8] = { "trace", "temporal", "atrous", "reflect", "reflect temporal", "cache", "reflect blur", "resolve" };
 
 struct FrameData {
 	float view_to_world[16];
@@ -1837,7 +1868,7 @@ void PhysXGIView::free_data() {
 	if (rd == nullptr) {
 		return;
 	}
-	for (RID *r : { &trace, &accum[0], &accum[1], &accum_depth[0], &accum_depth[1], &moments[0], &moments[1], &variance, &filtered[0], &filtered[1], &filtered_variance[0], &filtered_variance[1], &reflect_trace, &reflect_accum[0], &reflect_accum[1], &reflect_depth[0], &reflect_depth[1] }) {
+	for (RID *r : { &trace, &accum[0], &accum[1], &accum_depth[0], &accum_depth[1], &moments[0], &moments[1], &variance, &filtered[0], &filtered[1], &filtered_variance[0], &filtered_variance[1], &reflect_filtered, &reflect_trace, &reflect_accum[0], &reflect_accum[1], &reflect_depth[0], &reflect_depth[1] }) {
 		if (r->is_valid()) {
 			rd->free_rid(*r);
 			*r = RID();
@@ -1880,6 +1911,7 @@ void PhysXGIView::ensure(RenderingDevice *p_rd, const Size2i &p_frame) {
 	}
 	tf.format = RD::DATA_FORMAT_R16G16B16A16_SFLOAT;
 	reflect_trace = p_rd->texture_create(tf, RD::TextureView());
+	reflect_filtered = p_rd->texture_create(tf, RD::TextureView());
 	for (int i = 0; i < 2; i++) {
 		reflect_accum[i] = p_rd->texture_create(tf, RD::TextureView());
 	}
@@ -2122,6 +2154,7 @@ void PhysXGIEffect::_render(int p_callback_type, const RenderData *p_render_data
 	data.trace_settings[0] = s.reflection_distance;
 	data.trace_settings[1] = s.filtered_reflections ? 1.0f : 0.0f;
 	data.trace_settings[2] = v.have_history ? 1.0f : 0.0f;
+	data.trace_settings[3] = s.reflection_softness;
 	data.reflect[1] = s.reflection_cutoff;
 	data.reflect[2] = (float)s.emissive_count;
 	data.reflect[3] = s.light_changed ? 1.0f : 0.0f;
@@ -2245,8 +2278,19 @@ void PhysXGIEffect::_render(int p_callback_type, const RenderData *p_render_data
 		_dispatch(rd, PASS_REFLECT_TEMPORAL, { sampled(0, nearest_sampler, v.reflect_trace), sampled(1, linear_sampler, v.reflect_accum[prev]), sampled(2, nearest_sampler, v.reflect_depth[prev]), sampled(3, nearest_sampler, depth), sampled(4, nearest_sampler, normal), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 5, v.reflect_accum[v.current]), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 6, v.reflect_depth[v.current]) }, v.reflect_size, size, sizeof(size));
 	}
 
+	RID reflect_result = v.reflect_accum[v.current];
+	if (s.reflection_softness > 1.0f && s.reflection_mode != 0) {
+		for (int axis = 0; axis < 2; axis++) {
+			int32_t size[4] = { v.reflect_size.x, v.reflect_size.y, axis == 0 ? 1 : 0, axis == 0 ? 0 : 1 };
+			RID source = axis == 0 ? v.reflect_accum[v.current] : v.reflect_trace;
+			RID target = axis == 0 ? v.reflect_trace : v.reflect_filtered;
+			_dispatch(rd, PASS_REFLECT_BLUR, { sampled(0, nearest_sampler, source), sampled(1, nearest_sampler, v.reflect_depth[v.current]), sampled(2, nearest_sampler, normal), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 3, target) }, v.reflect_size, size, sizeof(size));
+		}
+		reflect_result = v.reflect_filtered;
+	}
+
 	int32_t out[4] = { out_size.x, out_size.y, v.reflect_size.x, v.reflect_size.y };
-	_dispatch(rd, PASS_RESOLVE, { sampled(0, nearest_sampler, light_in), sampled(1, nearest_sampler, v.accum_depth[v.current]), sampled(2, nearest_sampler, depth), sampled(3, nearest_sampler, normal), sampled(6, linear_sampler, color), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 4, ambient), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 5, reflection), sampled(7, nearest_sampler, v.reflect_accum[v.current]), sampled(8, nearest_sampler, v.reflect_depth[v.current]), sampled(12, mip_sampler, probe_atlas) }, out_size, out, sizeof(out));
+	_dispatch(rd, PASS_RESOLVE, { sampled(0, nearest_sampler, light_in), sampled(1, nearest_sampler, v.accum_depth[v.current]), sampled(2, nearest_sampler, depth), sampled(3, nearest_sampler, normal), sampled(6, linear_sampler, color), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 4, ambient), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 5, reflection), sampled(7, nearest_sampler, reflect_result), sampled(8, nearest_sampler, v.reflect_depth[v.current]), sampled(12, mip_sampler, probe_atlas) }, out_size, out, sizeof(out));
 
 	rd->capture_timestamp("PXTGI end");
 	v.have_history = true;

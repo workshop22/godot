@@ -57,6 +57,7 @@ public:
 	RID variance; // trace size: how noisy each accumulated texel still is
 	RID filtered[2]; // trace size: the edge-aware filter's passes, ping-ponged
 	RID filtered_variance[2];
+	RID reflect_filtered; // softened output; temporal history remains sharp
 	RID reflect_trace; // full size: this frame's reflection rays (light, found)
 	RID reflect_accum[2]; // full size: accumulated, ping-ponged
 	RID reflect_depth[2];
@@ -129,6 +130,7 @@ public:
 		float world_distance = 30.0f; // how far a GI ray goes against the collision shapes
 		float reflection_distance = 60.0f;
 		bool filtered_reflections = false;
+		float reflection_softness = 1.0f;
 		int rays_per_texel = 4;
 		// Emissive shapes sampled directly by every texel (the nearest to the camera): an oriented box each (centre and
 		// three half axes, world space) and the light its surface gives off.
@@ -166,6 +168,7 @@ private:
 		PASS_REFLECT,
 		PASS_REFLECT_TEMPORAL,
 		PASS_CACHE,
+		PASS_REFLECT_BLUR,
 		PASS_RESOLVE,
 		PASS_MAX,
 	};
