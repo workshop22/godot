@@ -68,6 +68,7 @@ public:
 	bool have_history = false;
 	Transform3D prev_cam_transform;
 	Projection prev_projection;
+	Projection prev_camera_projection; // unjittered, for actual camera changes
 
 	void ensure(RenderingDevice *p_rd, const Size2i &p_frame, float p_reflection_scale);
 	void configure(RenderSceneBuffersRD *p_render_buffers) override {}

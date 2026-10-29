@@ -1979,12 +1979,14 @@ void PhysXGIEffect::_render(int p_callback_type, const RenderData *p_render_data
 	v.ensure(rd, size, s.reflection_resolution_scale);
 
 	const Transform3D cam_transform = scene->get_cam_transform();
-	// The raw projection, as Godot's own GI step uses it: get_cam_projection() already has the depth correction (and TAA
-	// jitter) applied, which the depth linearisation below doesn't expect.
+	// The depth/normal prepass is jittered by TAA/FSR2. Strip only the depth and raster-Y
+	// correction: retaining its subpixel offset keeps reconstruction and history on that prepass.
 	const RenderSceneDataRD *scene_rd = Object::cast_to<RenderSceneDataRD>(scene);
 	ERR_FAIL_NULL(scene_rd);
-	const Projection projection = scene_rd->cam_projection;
-	if (v.have_history && (cam_transform != v.prev_cam_transform || projection != v.prev_projection)) {
+	Projection correction;
+	correction.set_depth_correction(scene_rd->flip_y);
+	const Projection projection = correction.inverse() * scene->get_cam_projection();
+	if (v.have_history && (cam_transform != v.prev_cam_transform || scene_rd->cam_projection != v.prev_camera_projection)) {
 		unsettle();
 	}
 	if (v.have_history && (cam_transform.origin.distance_squared_to(v.prev_cam_transform.origin) > 400.0f ||
@@ -2297,4 +2299,5 @@ void PhysXGIEffect::_render(int p_callback_type, const RenderData *p_render_data
 	v.have_history = true;
 	v.prev_cam_transform = cam_transform;
 	v.prev_projection = projection;
+	v.prev_camera_projection = scene_rd->cam_projection;
 }
