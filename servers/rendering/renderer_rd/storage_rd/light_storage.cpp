@@ -1559,6 +1559,17 @@ void LightStorage::_reflection_atlas_clear(ReflectionAtlas *p_reflection_atlas) 
 	RD::get_singleton()->free_rid(p_reflection_atlas->reflection);
 	p_reflection_atlas->reflection = RID();
 
+	// The temporary capture cubemap owns its six face views and their framebuffer
+	// dependencies. Retire it on atlas resize as well as final teardown.
+	if (p_reflection_atlas->color_buffer.is_valid()) {
+		RD::get_singleton()->free_rid(p_reflection_atlas->color_buffer);
+		p_reflection_atlas->color_buffer = RID();
+	}
+	for (int i = 0; i < 6; i++) {
+		p_reflection_atlas->color_views[i] = RID();
+		p_reflection_atlas->color_fbs[i] = RID();
+	}
+
 	RD::get_singleton()->free_rid(p_reflection_atlas->depth_fb);
 	p_reflection_atlas->depth_fb = RID();
 
