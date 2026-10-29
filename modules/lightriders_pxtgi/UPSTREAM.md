@@ -21,3 +21,12 @@ coherent mirror rays and the existing roughness resolve instead of stochastic GG
 directions; this is an artistic approximation for the wet-road study. Camera cuts
 invalidate previous-colour reuse. These changes are experimental, not upstream
 quality or performance claims.
+
+The standalone module also carries the upstream lens dirt, lens flare/settings and
+light shafts nodes/effects from the same source revision. They use the local render
+thread callable and compositor helper, without an SDK dependency. Flare ghost scales
+use aligned vec4 records on both sides of the GPU buffer; explicit UV rejection
+replaces border-sampler reads. Lens extraction bounds non-finite HDR inputs. A local
+`reflection_softness` setting adds a separable depth/normal-aware reflection-only blur
+without feeding blurred output back into temporal history. These effects remain
+opt-in through the game experiment.

@@ -306,7 +306,7 @@ PhysXLensFlareEffect::~PhysXLensFlareEffect() {
 				rd->free_rid(shaders[i]);
 			}
 		}
-		for (RID r : { linear_sampler, border_sampler, ghost_buffer }) {
+		for (RID r : { linear_sampler, ghost_buffer }) {
 			if (r.is_valid()) {
 				rd->free_rid(r);
 			}
@@ -347,11 +347,6 @@ bool PhysXLensFlareEffect::_ensure(RenderingDevice *p_rd) {
 	linear.repeat_u = RD::SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE;
 	linear.repeat_v = RD::SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE;
 	linear_sampler = p_rd->sampler_create(linear);
-	RD::SamplerState border = linear;
-	border.repeat_u = RD::SAMPLER_REPEAT_MODE_CLAMP_TO_BORDER;
-	border.repeat_v = RD::SAMPLER_REPEAT_MODE_CLAMP_TO_BORDER;
-	border.border_color = RD::SAMPLER_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
-	border_sampler = p_rd->sampler_create(border);
 	ghost_buffer = p_rd->uniform_buffer_create(sizeof(GhostData));
 	failed = false;
 	return true;
