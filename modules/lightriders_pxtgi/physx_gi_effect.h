@@ -57,8 +57,8 @@ public:
 	RID variance; // trace size: how noisy each accumulated texel still is
 	RID filtered[2]; // trace size: the edge-aware filter's passes, ping-ponged
 	RID filtered_variance[2];
-	RID reflect_trace; // half size: this frame's reflection rays (light, found)
-	RID reflect_accum[2]; // half size: accumulated, ping-ponged
+	RID reflect_trace; // full size: this frame's reflection rays (light, found)
+	RID reflect_accum[2]; // full size: accumulated, ping-ponged
 	RID reflect_depth[2];
 	Size2i reflect_size;
 	Size2i trace_size;
@@ -127,6 +127,8 @@ public:
 		float intensity = 1.0f;
 		float max_distance = 8.0f;
 		float world_distance = 30.0f; // how far a GI ray goes against the collision shapes
+		float reflection_distance = 60.0f;
+		bool filtered_reflections = false;
 		int rays_per_texel = 4;
 		// Emissive shapes sampled directly by every texel (the nearest to the camera): an oriented box each (centre and
 		// three half axes, world space) and the light its surface gives off.
@@ -135,6 +137,7 @@ public:
 		Vector3 emissive_center[MAX_EMISSIVES];
 		Vector3 emissive_axis[MAX_EMISSIVES][3];
 		Color emissive_color[MAX_EMISSIVES];
+		int emissive_primitive[MAX_EMISSIVES] = {};
 		bool multi_bounce = true; // off-screen hits light from the radiance cache
 		bool light_changed = false; // the light sources just changed: the radiance cache follows quickly
 		int reflection_mode = 2; // 0: Godot's own, 1: screen space, 2: screen space then the collision shapes, 3: and the probes

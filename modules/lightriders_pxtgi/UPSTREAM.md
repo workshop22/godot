@@ -12,3 +12,12 @@ server header. Engine base: Lightriders' pinned Godot 4.7.2 patch series.
 
 This is a visual comparison candidate. The normal project does not instantiate
 PXTGI; the game trial opts in with `--pxtgi` on `route.first`.
+
+Local scene-integration changes expose reflection reach independently of GI reach,
+allow a proxy to opt out of box-light sampling with `pxtgi_sample_emission`, and
+retain traced emission for sources outside the direct-light selection. Reflections
+run at full viewport resolution. The optional `filtered_reflections` mode uses
+coherent mirror rays and the existing roughness resolve instead of stochastic GGX
+directions; this is an artistic approximation for the wet-road study. Camera cuts
+invalidate previous-colour reuse. These changes are experimental, not upstream
+quality or performance claims.

@@ -117,6 +117,7 @@ layout(set = 0, binding = 9, std140) uniform Frame {
 	vec4 src_capture[8];
 	ivec4 srcs; // x: count
 	vec4 src_border; // x: the atlas maps' border, y: the scale inside it, z: the roughest level
+	vec4 trace_settings; // x: reflection reach, y: filtered mirror rays, z: previous colour is valid
 }
 f;
 
@@ -771,8 +772,19 @@ vec3 direct_light(vec3 x, vec3 n) {
 // which shows the point itself) lights it directly and takes only the cell's bounce light: a cell is a quarter metre
 // or more across, too coarse to show as it is.
 vec3 world_light(vec3 x, vec3 n, int hit, sampler2D depth_tex, sampler2D color_tex, bool from_pixels, bool with_glow, bool sharp) {
+	// Direct sampling replaces only the emitters actually selected, not every glowing
+	// surface in the world. Unselected sources still contribute through traced hits.
+	if (!with_glow) {
+		with_glow = true;
+		for (int i = 0; i < int(f.reflect.z); i++) {
+			if (int(f.emit_center[i].w) == hit) {
+				with_glow = false;
+				break;
+			}
+		}
+	}
 	vec3 v = (f.world_to_view * vec4(x, 1.0)).xyz;
-	if (v.z < -f.clip.x) {
+	if (f.trace_settings.z > 0.5 && v.z < -f.clip.x) {
 		vec2 sp = pixel_from_view(v, f.proj_info);
 		if (on_screen(sp)) {
 			float sd = texelFetch(depth_tex, ivec2(sp), 0).r;
@@ -955,7 +967,7 @@ void main() {
 		bool found = false;
 		float last = 0.0;
 		// Debug mode 3: only the collision shapes' light, to see what the world trace adds.
-		for (int s = 0; s < (int(f.misc.w) >= 3 ? 0 : STEPS); s++) {
+		for (int s = 0; s < (int(f.misc.w) >= 3 || f.trace_settings.z < 0.5 ? 0 : STEPS); s++) {
 			float along = f.misc.y * pow((float(s) + jitter) / float(STEPS), 2.0);
 			float in_front = last;
 			last = along;
@@ -1173,7 +1185,7 @@ void main() {
 	imageStore(variance_out, px, vec4(var));
 }
 )",
-	// PASS_REFLECT: one reflection ray per texel at half size, the view mirrored about a normal drawn from the surface's
+	// PASS_REFLECT: one reflection ray per texel at full size, the view mirrored about a normal drawn from the surface's
 	// roughness (GGX), so a mirror's rays stay together and a rough surface's spread. Marched against the depth buffer,
 	// then (traced mode) the collision shapes; stores the light found and whether anything was. Surfaces rougher than
 	// the cutoff, and rays that find nothing, are left to Godot's own reflection (probes, sky).
@@ -1268,16 +1280,24 @@ void main() {
 	if (dot(dir, n) <= 0.0) {
 		dir = reflect(v, n);
 	}
+	// The game's wet surfaces can use a coherent mirror ray and the resolve pass's
+	// roughness filter, instead of a new GGX microfacet every frame.
+	if (f.trace_settings.y > 0.5) {
+		dir = reflect(v, n);
+	}
 
 	vec3 origin = p + n * (0.02 + 0.002 * -p.z);
 	const int STEPS = 32;
 	float reach = 3.0 * f.misc.y;
 	float jitter = fract(ign(vec2(px) + vec2(13.0, 101.0)) + f.misc.x * 0.6180339887);
 	probe_texture = fract(ign(vec2(px) + vec2(71.0, 29.0)) + f.misc.x * 0.3819660113) < 1.0 - smoothstep(0.15, 0.25, rough);
+	if (f.trace_settings.y > 0.5) {
+		probe_texture = true;
+	}
 	vec3 light = vec3(0.0);
 	bool found = false;
 	float last = 0.0;
-	for (int s = 0; s < STEPS; s++) {
+	for (int s = 0; s < (f.trace_settings.z > 0.5 ? STEPS : 0); s++) {
 		float along = reach * pow((float(s) + jitter) / float(STEPS), 2.0);
 		float in_front = last;
 		last = along;
@@ -1311,7 +1331,7 @@ void main() {
 	if (!found && int(f.reflect.x) >= 2 && f.counts.x > 0) {
 		vec3 world_origin = (f.view_to_world * vec4(origin, 1.0)).xyz;
 		vec3 world_dir = mat3(f.view_to_world) * dir;
-		float far = 60.0;
+		float far = f.trace_settings.x;
 		vec3 wn;
 		int hit = trace_world(world_origin, world_dir, far, wn);
 		if (hit >= 0) {
@@ -1513,7 +1533,7 @@ void main() {
 	vec3 n = normalize(nr.xyz * 2.0 - 1.0);
 	float d = -p.z;
 
-	// Reflections: the half-size reflection texels on the same surface around this pixel, blurred more the rougher the
+	// Reflections: the reflection texels on the same surface around this pixel, blurred more the rougher the
 	// surface; alpha is how many of their rays found something, the rest left to Godot's reflection (probes, sky).
 	vec4 reflection = vec4(0.0);
 	float rough = clamp(decode_roughness(nr.w), 0.0, 1.0);
@@ -1681,6 +1701,7 @@ struct FrameData {
 	float src_capture[8][4];
 	int32_t srcs[4];
 	float src_border[4];
+	float trace_settings[4];
 };
 
 void projection_info(const Projection &p_projection, const Size2i &p_size, float *r_info) {
@@ -1851,7 +1872,7 @@ void PhysXGIView::ensure(RenderingDevice *p_rd, const Size2i &p_frame) {
 	}
 	variance = p_rd->texture_create(tf, RD::TextureView());
 
-	reflect_size = Size2i(MAX(p_frame.x / 2, 1), MAX(p_frame.y / 2, 1));
+	reflect_size = p_frame;
 	tf.width = reflect_size.x;
 	tf.height = reflect_size.y;
 	for (int i = 0; i < 2; i++) {
@@ -1932,6 +1953,12 @@ void PhysXGIEffect::_render(int p_callback_type, const RenderData *p_render_data
 	const Projection projection = scene_rd->cam_projection;
 	if (v.have_history && (cam_transform != v.prev_cam_transform || projection != v.prev_projection)) {
 		unsettle();
+	}
+	if (v.have_history && (cam_transform.origin.distance_squared_to(v.prev_cam_transform.origin) > 400.0f ||
+			Math::abs(cam_transform.basis.get_rotation_quaternion().dot(v.prev_cam_transform.basis.get_rotation_quaternion())) < 0.9f)) {
+		// A teleport or hard camera cut has no trustworthy previous colour. Do not
+		// seed the new view's reflection/radiance history with the old scene.
+		v.have_history = false;
 	}
 	if (!v.have_history) {
 		v.prev_cam_transform = cam_transform;
@@ -2092,6 +2119,9 @@ void PhysXGIEffect::_render(int p_callback_type, const RenderData *p_render_data
 		data.spot_cone[i][0] = s.spot_cone_attenuation[i];
 	}
 	data.reflect[0] = (float)s.reflection_mode;
+	data.trace_settings[0] = s.reflection_distance;
+	data.trace_settings[1] = s.filtered_reflections ? 1.0f : 0.0f;
+	data.trace_settings[2] = v.have_history ? 1.0f : 0.0f;
 	data.reflect[1] = s.reflection_cutoff;
 	data.reflect[2] = (float)s.emissive_count;
 	data.reflect[3] = s.light_changed ? 1.0f : 0.0f;
@@ -2100,6 +2130,7 @@ void PhysXGIEffect::_render(int p_callback_type, const RenderData *p_render_data
 		data.emit_center[i][0] = c.x;
 		data.emit_center[i][1] = c.y;
 		data.emit_center[i][2] = c.z;
+		data.emit_center[i][3] = float(s.emissive_primitive[i]);
 		float *axes[3] = { data.emit_x[i], data.emit_y[i], data.emit_z[i] };
 		for (int k = 0; k < 3; k++) {
 			axes[k][0] = s.emissive_axis[i][k].x;
