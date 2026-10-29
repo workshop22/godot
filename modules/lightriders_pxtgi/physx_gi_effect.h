@@ -69,7 +69,7 @@ public:
 	Transform3D prev_cam_transform;
 	Projection prev_projection;
 
-	void ensure(RenderingDevice *p_rd, const Size2i &p_frame);
+	void ensure(RenderingDevice *p_rd, const Size2i &p_frame, float p_reflection_scale);
 	void configure(RenderSceneBuffersRD *p_render_buffers) override {}
 	void free_data() override;
 	~PhysXGIView() { free_data(); }
@@ -131,6 +131,7 @@ public:
 		float reflection_distance = 60.0f;
 		bool filtered_reflections = false;
 		float reflection_softness = 1.0f;
+		float reflection_resolution_scale = 1.0f;
 		int rays_per_texel = 4;
 		// Emissive shapes sampled directly by every texel (the nearest to the camera): an oriented box each (centre and
 		// three half axes, world space) and the light its surface gives off.

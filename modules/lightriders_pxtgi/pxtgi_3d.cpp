@@ -1394,6 +1394,7 @@ void PXTGI3D::_publish() {
 	s.reflection_distance = reflection_distance;
 	s.filtered_reflections = filtered_reflections;
 	s.reflection_softness = reflection_softness;
+	s.reflection_resolution_scale = reflection_resolution_scale;
 	s.debug = debug;
 	s.multi_bounce = multi_bounce;
 	s.rays_per_texel = rays_per_texel;
@@ -1518,6 +1519,7 @@ void PXTGI3D::_publish() {
 	h = hash_murmur3_one_float(s.reflection_distance, h);
 	h = hash_murmur3_one_32(s.filtered_reflections, h);
 	h = hash_murmur3_one_float(s.reflection_softness, h);
+	h = hash_murmur3_one_float(s.reflection_resolution_scale, h);
 	h = hash_murmur3_one_32(s.debug | (s.reflection_mode << 4) | (s.multi_bounce ? 256 : 0) | (s.rays_per_texel << 10), h);
 	h = hash_murmur3_one_float(s.sun_direction.x + s.sun_direction.y * 3.1f + s.sun_direction.z * 7.3f + s.sun_color.get_luminance(), h);
 	for (int i = 0; i < s.spot_count; i++) {
@@ -1609,6 +1611,8 @@ void PXTGI3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_filtered_reflections"), &PXTGI3D::get_filtered_reflections);
 	ClassDB::bind_method(D_METHOD("set_reflection_softness", "softness"), &PXTGI3D::set_reflection_softness);
 	ClassDB::bind_method(D_METHOD("get_reflection_softness"), &PXTGI3D::get_reflection_softness);
+	ClassDB::bind_method(D_METHOD("set_reflection_resolution_scale", "scale"), &PXTGI3D::set_reflection_resolution_scale);
+	ClassDB::bind_method(D_METHOD("get_reflection_resolution_scale"), &PXTGI3D::get_reflection_resolution_scale);
 	ClassDB::bind_method(D_METHOD("set_rays_per_texel", "rays"), &PXTGI3D::set_rays_per_texel);
 	ClassDB::bind_method(D_METHOD("get_rays_per_texel"), &PXTGI3D::get_rays_per_texel);
 	ClassDB::bind_method(D_METHOD("set_multi_bounce", "enabled"), &PXTGI3D::set_multi_bounce);
@@ -1625,6 +1629,7 @@ void PXTGI3D::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "reflection_distance", PROPERTY_HINT_RANGE, "1,300,0.5,or_greater,suffix:m"), "set_reflection_distance", "get_reflection_distance");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "filtered_reflections"), "set_filtered_reflections", "get_filtered_reflections");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "reflection_softness", PROPERTY_HINT_RANGE, "1,8,0.1"), "set_reflection_softness", "get_reflection_softness");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "reflection_resolution_scale", PROPERTY_HINT_RANGE, "0.5,1,0.5"), "set_reflection_resolution_scale", "get_reflection_resolution_scale");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "rays_per_texel", PROPERTY_HINT_RANGE, "1,4,1"), "set_rays_per_texel", "get_rays_per_texel");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "multi_bounce"), "set_multi_bounce", "get_multi_bounce");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "reflection_mode", PROPERTY_HINT_ENUM, "Godot,Screen Space,Traced,Traced + Probes"), "set_reflection_mode", "get_reflection_mode");

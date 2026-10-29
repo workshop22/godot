@@ -1465,14 +1465,14 @@ void main() {
 	ivec2 px = ivec2(gl_GlobalInvocationID.xy);
 	if (any(greaterThanEqual(px, pc.size_axis.xy))) return;
 	float depth = texelFetch(depth_tex, px, 0).r;
-	vec3 normal = normalize(texelFetch(normal_tex, px, 0).xyz * 2.0 - 1.0);
+	vec3 normal = normalize(texelFetch(normal_tex, frame_pixel(px, pc.size_axis.xy), 0).xyz * 2.0 - 1.0);
 	float sigma = max(f.trace_settings.w, 1.0);
 	vec4 sum = vec4(0.0);
 	float weights = 0.0;
 	for (int i = -12; i <= 12; i++) {
 		ivec2 at = clamp(px + pc.size_axis.zw * i, ivec2(0), pc.size_axis.xy - 1);
 		float d = texelFetch(depth_tex, at, 0).r;
-		vec3 n = normalize(texelFetch(normal_tex, at, 0).xyz * 2.0 - 1.0);
+		vec3 n = normalize(texelFetch(normal_tex, frame_pixel(at, pc.size_axis.xy), 0).xyz * 2.0 - 1.0);
 		float w = exp(-float(i * i) / (2.0 * sigma * sigma));
 		w *= exp(-abs(d - depth) / max(0.03 * depth, 0.01)) * pow(max(dot(n, normal), 0.0), 32.0);
 		sum += texelFetch(source_tex, at, 0) * w;
@@ -1878,8 +1878,9 @@ void PhysXGIView::free_data() {
 	have_history = false;
 }
 
-void PhysXGIView::ensure(RenderingDevice *p_rd, const Size2i &p_frame) {
-	if (p_frame == targets_for && trace.is_valid()) {
+void PhysXGIView::ensure(RenderingDevice *p_rd, const Size2i &p_frame, float p_reflection_scale) {
+	const Size2i desired_reflections(MAX(1, int(p_frame.x * p_reflection_scale)), MAX(1, int(p_frame.y * p_reflection_scale)));
+	if (p_frame == targets_for && reflect_size == desired_reflections && trace.is_valid()) {
 		return;
 	}
 	free_data();
@@ -1903,7 +1904,7 @@ void PhysXGIView::ensure(RenderingDevice *p_rd, const Size2i &p_frame) {
 	}
 	variance = p_rd->texture_create(tf, RD::TextureView());
 
-	reflect_size = p_frame;
+	reflect_size = desired_reflections;
 	tf.width = reflect_size.x;
 	tf.height = reflect_size.y;
 	for (int i = 0; i < 2; i++) {
@@ -1975,7 +1976,7 @@ void PhysXGIEffect::_render(int p_callback_type, const RenderData *p_render_data
 		buffers->set_custom_data(view_scope, view);
 	}
 	PhysXGIView &v = *view.ptr();
-	v.ensure(rd, size);
+	v.ensure(rd, size, s.reflection_resolution_scale);
 
 	const Transform3D cam_transform = scene->get_cam_transform();
 	// The raw projection, as Godot's own GI step uses it: get_cam_projection() already has the depth correction (and TAA
