@@ -1026,6 +1026,7 @@ void PXTGI3D::_rescan() {
 		shapes.push_back(entry);
 	}
 	body_entries.clear();
+	dynamic_entries.clear();
 	proxy_entries.clear();
 	emissive_entries.clear();
 	for (uint32_t i = 0; i < shapes.size(); i++) {
@@ -1041,6 +1042,9 @@ void PXTGI3D::_rescan() {
 			proxy_entries.push_back(i);
 		} else if (CollisionShape3D *cs = Object::cast_to<CollisionShape3D>(node)) {
 			body_entries[cs->get_parent()->get_instance_id()].push_back(i);
+			if (!shapes[i].fixed && !bool(cs->get_parent()->get_meta("pxtgi_manual_updates", false))) {
+				dynamic_entries.push_back(i);
+			}
 			shape_signature = hash_murmur3_one_64(cs->get_shape().is_valid() ? uint64_t(cs->get_shape()->get_instance_id()) : 0, shape_signature);
 		}
 	}
@@ -1265,9 +1269,30 @@ void PXTGI3D::_update_primitives(PhysXGIEffect::Snapshot &r_snapshot) {
 		for (int i : restyled) {
 			candidates.push_back({ i, nullptr });
 		}
-		// Presentation proxies are updated directly; the trial has no PhysX simulation.
-		for (int i = 0; i < n; i++) {
+		// Presentation-driven movers are checked every frame. Static geometry stays cached;
+		// explicit notifications refresh manually maintained shapes (ribbons), while an
+		// amortized verification catches authoring edits and parent visibility changes.
+		for (int i : dynamic_entries) {
 			candidates.push_back({ i, nullptr });
+		}
+		for (int i : proxy_entries) {
+			candidates.push_back({ i, nullptr });
+		}
+		for (const KeyValue<ObjectID, Transform3D> &moved : moved_poses) {
+			if (const LocalVector<int> *entries = body_entries.getptr(moved.key)) {
+				for (int i : *entries) {
+					if (Node *node = ObjectDB::get_instance<Node>(shapes[i].shape_node)) {
+						const Pair<Color, Color> look = _look_of(node);
+						shapes[i].albedo = look.first;
+						shapes[i].emission = look.second;
+						looks.insert(shapes[i].shape_node, look);
+					}
+					candidates.push_back({ i, nullptr });
+				}
+			}
+		}
+		for (int k = 0; k < n / 60 + 1 && n > 0; k++) {
+			candidates.push_back({ int(verify_cursor++ % n), nullptr });
 		}
 
 		float scratch[PF];
@@ -1380,6 +1405,11 @@ void PXTGI3D::_update_primitives(PhysXGIEffect::Snapshot &r_snapshot) {
 	r_snapshot.node_count = published_nodes.size() / PhysXGIEffect::NODE_FLOATS;
 	r_snapshot.primitives_version = primitives_version;
 	moved_poses.clear();
+}
+
+void PXTGI3D::notify_body_changed(Node3D *p_body) {
+	ERR_FAIL_NULL(p_body);
+	moved_poses.insert(p_body->get_instance_id(), p_body->get_global_transform());
 }
 
 void PXTGI3D::_publish() {
@@ -1599,6 +1629,7 @@ PackedStringArray PXTGI3D::get_configuration_warnings() const {
 }
 
 void PXTGI3D::_bind_methods() {
+	ClassDB::bind_method(D_METHOD("notify_body_changed", "body"), &PXTGI3D::notify_body_changed);
 	ClassDB::bind_method(D_METHOD("set_intensity", "intensity"), &PXTGI3D::set_intensity);
 	ClassDB::bind_method(D_METHOD("get_intensity"), &PXTGI3D::get_intensity);
 	ClassDB::bind_method(D_METHOD("set_max_distance", "distance"), &PXTGI3D::set_max_distance);

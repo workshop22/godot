@@ -143,6 +143,7 @@ class PXTGI3D : public Node3D {
 	// The poses of the PhysX bodies awake in the physics steps since the last frame, by their nodes: read during
 	// physics process, where the space may be read even with physics on its own thread.
 	HashMap<ObjectID, Transform3D> moved_poses;
+	LocalVector<int> dynamic_entries; // moving presentation bodies, excluding explicitly notified ribbons
 	LocalVector<int> proxy_entries; // emissive meshes outside any body: checked every frame
 	LocalVector<int> emissive_entries; // shapes that give off light: sampled directly
 	LocalVector<float> ordered_floats; // the records in the tree's leaf order
@@ -168,6 +169,7 @@ class PXTGI3D : public Node3D {
 
 public:
 	static void free_shared();
+	void notify_body_changed(Node3D *p_body);
 
 private:
 	bool active = false; // in the world and visible: delivering the GI
