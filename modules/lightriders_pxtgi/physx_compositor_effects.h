@@ -49,7 +49,10 @@ public:
 	// Lower runs first, among effects at the same callback point (the fluid
 	// runs before transparent geometry, Flow and the light shafts after it:
 	// the shafts after Flow, so the gas is in the frame they read).
+	// Negative: before the user's own effects at that point (a copy of the frame
+	// that must not yet hold their motion blur).
 	enum Order {
+		ORDER_GI_SOURCE = -1,
 		ORDER_FLUID = 0,
 		ORDER_FLOW = 1,
 		ORDER_SHAFTS = 2,

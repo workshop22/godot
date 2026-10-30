@@ -15,6 +15,7 @@ void initialize_lightriders_pxtgi_module(ModuleInitializationLevel p_level) {
 	if (p_level == MODULE_INITIALIZATION_LEVEL_SCENE) {
 		GDREGISTER_CLASS(PXTGI3D);
 		GDREGISTER_INTERNAL_CLASS(PhysXGIEffect);
+		GDREGISTER_INTERNAL_CLASS(PhysXGISourceEffect);
 		GDREGISTER_CLASS(PhysXLensDirt3D);
 		GDREGISTER_CLASS(PhysXLensFlare3D);
 		GDREGISTER_CLASS(PhysXLensFlareSettings);
@@ -31,6 +32,7 @@ void uninitialize_lightriders_pxtgi_module(ModuleInitializationLevel p_level) {
 		PhysXLensFlareEffect::free_shared();
 		PhysXLightShaftsEffect::free_shared();
 		PhysXGIEffect::free_shared();
+		PhysXGISourceEffect::free_shared();
 		PXTGI3D::free_shared();
 	}
 }

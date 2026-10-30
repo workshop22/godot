@@ -58,9 +58,16 @@ public:
 	RID filtered[2]; // trace size: the edge-aware filter's passes, ping-ponged
 	RID filtered_variance[2];
 	RID reflect_filtered; // softened output; temporal history remains sharp
-	RID reflect_trace; // full size: this frame's reflection rays (light, found)
-	RID reflect_accum[2]; // full size: accumulated, ping-ponged
+	RID reflect_trace; // reflection size: this frame's reflection rays (light, found)
+	RID reflect_hit; // reflection size: how far each ray went to what it found (negative: a moving object; 0: none)
+	RID reflect_accum[2]; // reflection size: accumulated, ping-ponged
+	RID reflect_info[2]; // reflection size: frames of history, hit distance, motion in the reflection
 	RID reflect_depth[2];
+	// Last frame's scene for the screen rays, copied before motion blur and the lens effects wrote into the colour
+	// (PhysXGISourceEffect), and the frame it was copied in.
+	RID source;
+	Size2i source_size;
+	uint64_t source_frame = UINT64_MAX;
 	Size2i reflect_size;
 	Size2i trace_size;
 	Size2i targets_for;
@@ -74,6 +81,24 @@ public:
 	void configure(RenderSceneBuffersRD *p_render_buffers) override {}
 	void free_data() override;
 	~PhysXGIView() { free_data(); }
+};
+
+// The frame PXTGI's screen rays read on the next one: copied after the transparent pass, before any other effect at that
+// point (motion blur, the lens effects) writes into the colour, so reflections and bounce light take the scene itself
+// rather than last frame's blur and flare (which would be blurred again).
+class PhysXGISourceEffect : public CompositorEffect {
+	GDCLASS(PhysXGISourceEffect, CompositorEffect);
+
+	void _render(int p_callback_type, const RenderData *p_render_data);
+
+protected:
+	static void _bind_methods() {}
+
+public:
+	static Ref<PhysXGISourceEffect> get_shared();
+	static void free_shared();
+
+	PhysXGISourceEffect();
 };
 
 // PXTGI's GPU side, computed before the opaque pass (PRE_OPAQUE) and written into Godot's per-pixel GI buffer, which

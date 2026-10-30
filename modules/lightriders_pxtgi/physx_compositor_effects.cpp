@@ -72,11 +72,18 @@ bool same_rids(const LocalVector<RID> &p_a, const LocalVector<RID> &p_b) {
 
 void PhysXCompositorEffects::_push(Compositor *p_compositor, const LocalVector<RID> &p_own, const CompositorState &p_state) {
 	TypedArray<RID> rids;
+	for (const Placed &p : p_state.ours) {
+		if (p.order < 0) {
+			rids.push_back(p.effect);
+		}
+	}
 	for (const RID &r : p_own) {
 		rids.push_back(r);
 	}
 	for (const Placed &p : p_state.ours) {
-		rids.push_back(p.effect);
+		if (p.order >= 0) {
+			rids.push_back(p.effect);
+		}
 	}
 	RenderingServer::get_singleton()->compositor_set_compositor_effects(p_compositor->get_rid(), rids);
 }
