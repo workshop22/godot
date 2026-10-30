@@ -2475,6 +2475,17 @@ void MaterialStorage::material_free(RID p_rid) {
 	material_set_shader(p_rid, RID()); //clean up shader
 	material->dependency.deleted_notify(p_rid);
 
+	{
+		// Materials created asynchronously (material_create_from_shader on loader or main threads) join the
+		// update list under this mutex while this thread frees others. Unlink here under the same mutex:
+		// the element's destructor would unlink it unlocked, and racing an add at the list's head leaves a
+		// dangling first element that _update_queued_materials then retries forever.
+		MutexLock lock(material_update_list_mutex);
+		if (material->update_element.in_list()) {
+			material->update_element.remove_from_list();
+		}
+	}
+
 	material_owner.free(p_rid);
 }
 
