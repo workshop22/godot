@@ -1752,6 +1752,9 @@ void PXTGI3D::_publish() {
 	s.debug = debug;
 	s.multi_bounce = multi_bounce;
 	s.rays_per_texel = rays_per_texel;
+	s.blue_noise = blue_noise;
+	s.gi_history_clamp = gi_history_clamp;
+	s.filtered_hits = filtered_hits;
 	s.reflection_mode = reflection_mode;
 	s.reflection_cutoff = reflection_cutoff;
 
@@ -1873,7 +1876,7 @@ void PXTGI3D::_publish() {
 	h = hash_murmur3_one_32(s.filtered_reflections, h);
 	h = hash_murmur3_one_float(s.reflection_softness, h);
 	h = hash_murmur3_one_float(s.reflection_resolution_scale, h);
-	h = hash_murmur3_one_32(s.debug | (s.reflection_mode << 4) | (s.multi_bounce ? 256 : 0) | (s.rays_per_texel << 10), h);
+	h = hash_murmur3_one_32(s.debug | (s.reflection_mode << 4) | (s.multi_bounce ? 256 : 0) | (s.rays_per_texel << 10) | (s.blue_noise ? 1 << 14 : 0) | (s.gi_history_clamp ? 1 << 15 : 0) | (s.filtered_hits ? 1 << 16 : 0), h);
 	h = hash_murmur3_one_float(s.sun_direction.x + s.sun_direction.y * 3.1f + s.sun_direction.z * 7.3f + s.sun_color.get_luminance(), h);
 	for (int i = 0; i < s.spot_count; i++) {
 		h = hash_murmur3_one_float(s.spot_position[i].x + s.spot_direction[i].y * 3.1f + s.spot_direction[i].z * 7.3f + s.spot_color[i].get_luminance(), h);
@@ -1972,6 +1975,12 @@ void PXTGI3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_reflection_resolution_scale"), &PXTGI3D::get_reflection_resolution_scale);
 	ClassDB::bind_method(D_METHOD("set_rays_per_texel", "rays"), &PXTGI3D::set_rays_per_texel);
 	ClassDB::bind_method(D_METHOD("get_rays_per_texel"), &PXTGI3D::get_rays_per_texel);
+	ClassDB::bind_method(D_METHOD("set_blue_noise", "enabled"), &PXTGI3D::set_blue_noise);
+	ClassDB::bind_method(D_METHOD("get_blue_noise"), &PXTGI3D::get_blue_noise);
+	ClassDB::bind_method(D_METHOD("set_gi_history_clamp", "enabled"), &PXTGI3D::set_gi_history_clamp);
+	ClassDB::bind_method(D_METHOD("get_gi_history_clamp"), &PXTGI3D::get_gi_history_clamp);
+	ClassDB::bind_method(D_METHOD("set_filtered_hits", "enabled"), &PXTGI3D::set_filtered_hits);
+	ClassDB::bind_method(D_METHOD("get_filtered_hits"), &PXTGI3D::get_filtered_hits);
 	ClassDB::bind_method(D_METHOD("set_multi_bounce", "enabled"), &PXTGI3D::set_multi_bounce);
 	ClassDB::bind_method(D_METHOD("get_multi_bounce"), &PXTGI3D::get_multi_bounce);
 	ClassDB::bind_method(D_METHOD("set_reflection_mode", "mode"), &PXTGI3D::set_reflection_mode);
@@ -1989,6 +1998,9 @@ void PXTGI3D::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "reflection_resolution_scale", PROPERTY_HINT_RANGE, "0.5,1,0.5"), "set_reflection_resolution_scale", "get_reflection_resolution_scale");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "rays_per_texel", PROPERTY_HINT_RANGE, "1,4,1"), "set_rays_per_texel", "get_rays_per_texel");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "multi_bounce"), "set_multi_bounce", "get_multi_bounce");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "blue_noise"), "set_blue_noise", "get_blue_noise");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "gi_history_clamp"), "set_gi_history_clamp", "get_gi_history_clamp");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "filtered_hits"), "set_filtered_hits", "get_filtered_hits");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "reflection_mode", PROPERTY_HINT_ENUM, "Godot,Screen Space,Traced,Traced + Probes"), "set_reflection_mode", "get_reflection_mode");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "reflection_roughness_cutoff", PROPERTY_HINT_RANGE, "0,1,0.01"), "set_reflection_roughness_cutoff", "get_reflection_roughness_cutoff");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "debug", PROPERTY_HINT_ENUM, "Off,Last Frame,Round Trip,World Only,World Hits,World Position,Screen Only"), "set_debug", "get_debug");

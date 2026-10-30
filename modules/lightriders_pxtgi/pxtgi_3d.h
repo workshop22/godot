@@ -62,6 +62,9 @@ class PXTGI3D : public Node3D {
 	int debug = 0;
 	bool multi_bounce = true;
 	int rays_per_texel = 4;
+	bool blue_noise = false;
+	bool gi_history_clamp = false;
+	bool filtered_hits = false;
 	int reflection_mode = 2;
 	float reflection_cutoff = 0.5f;
 	ObjectID attached_world;
@@ -250,6 +253,12 @@ public:
 	float get_reflection_resolution_scale() const { return reflection_resolution_scale; }
 	void set_rays_per_texel(int p_value) { rays_per_texel = CLAMP(p_value, 1, 4); }
 	int get_rays_per_texel() const { return rays_per_texel; }
+	void set_blue_noise(bool p_value) { blue_noise = p_value; }
+	bool get_blue_noise() const { return blue_noise; }
+	void set_gi_history_clamp(bool p_value) { gi_history_clamp = p_value; }
+	bool get_gi_history_clamp() const { return gi_history_clamp; }
+	void set_filtered_hits(bool p_value) { filtered_hits = p_value; }
+	bool get_filtered_hits() const { return filtered_hits; }
 	void set_multi_bounce(bool p_value) { multi_bounce = p_value; }
 	bool get_multi_bounce() const { return multi_bounce; }
 	void set_reflection_mode(int p_value) { reflection_mode = CLAMP(p_value, 0, 3); }

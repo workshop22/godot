@@ -32,6 +32,7 @@
 
 #include "pxtgi_render_thread.h"
 #include "physx_compositor_effects.h"
+#include "pxtgi_blue_noise.h"
 
 #include "core/object/callable_mp.h"
 #include "scene/3d/camera_3d.h"
@@ -120,8 +121,26 @@ layout(set = 0, binding = 9, std140) uniform Frame {
 	ivec4 srcs; // x: count
 	vec4 src_border; // x: the atlas maps' border, y: the scale inside it, z: the roughest level
 	vec4 trace_settings; // x: reflection reach, y: filtered mirror rays, z: previous colour is valid, w: reflection softness
+	vec4 polish; // x: blue noise, y: GI history clamp, z: the source's mip levels for screen hits (0: level 0 only), w: frame pixels a reflection texel spans
 }
 f;
+
+vec3 to_ycocg(vec3 c) {
+	return vec3(0.25 * c.r + 0.5 * c.g + 0.25 * c.b, 0.5 * c.r - 0.5 * c.b, -0.25 * c.r + 0.5 * c.g - 0.25 * c.b);
+}
+
+vec3 from_ycocg(vec3 c) {
+	return vec3(c.x + c.y - c.z, c.x + c.z, c.x - c.y - c.z);
+}
+
+// The source's mip a reflected point takes: its image is as small as from the whole reflected path (path) rather than
+// from where it stands (direct), and each reflection texel spans f.polish.w frame pixels. Level 0 without mips.
+float reflected_lod(float path, float direct) {
+	if (f.polish.z <= 0.0) {
+		return 0.0;
+	}
+	return clamp(log2(max(path / max(direct, 1e-3), 1.0)) + log2(max(f.polish.w, 1.0)), 0.0, f.polish.z - 1.0);
+}
 
 // Whether a reflection probe replaces this kind of light (1 bounce, 2 reflections) at world point w anyway: then
 // there's no point tracing it.
@@ -773,6 +792,10 @@ vec3 direct_light(vec3 x, vec3 n) {
 // its albedo. A pixel's ray (from_pixels) claims the cell for the cache and keeps it alive. A sharp one (a reflection,
 // which shows the point itself) lights it directly and takes only the cell's bounce light: a cell is a quarter metre
 // or more across, too coarse to show as it is.
+// The length of the reflected path to the point being lit (camera to surface plus the ray), or 0 for a GI ray: on-screen
+// hits read the source's mip for it (reflected_lod), a GI ray's a fixed blurrier one.
+float reflect_path = 0.0;
+
 vec3 world_light(vec3 x, vec3 n, int hit, sampler2D depth_tex, sampler2D color_tex, bool from_pixels, bool with_glow, bool sharp) {
 	// Direct sampling replaces only the emitters actually selected, not every glowing
 	// surface in the world. Unselected sources still contribute through traced hits.
@@ -795,7 +818,8 @@ vec3 world_light(vec3 x, vec3 n, int hit, sampler2D depth_tex, sampler2D color_t
 				float pd;
 				vec2 pp = prev_pixel(v, pd);
 				if (on_screen(pp)) {
-					vec3 seen = texture(color_tex, (pp + 0.5) / vec2(f.sizes.xy)).rgb;
+					float lod = reflect_path > 0.0 ? reflected_lod(reflect_path, -v.z) : min(2.0, max(f.polish.z - 1.0, 0.0));
+					vec3 seen = textureLod(color_tex, (pp + 0.5) / vec2(f.sizes.xy), lod).rgb;
 					return with_glow ? seen : max(seen - prims.p[hit].emission.rgb * f.sun_color.w, vec3(0.0));
 				}
 			}
@@ -932,6 +956,12 @@ float ign(vec2 p) {
 	return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715))));
 }
 
+// Blue noise (64 x 64, tiled) when asked for: finer-grained per frame than the gradient noise.
+layout(set = 0, binding = 14) uniform sampler2D blue_noise;
+float noise1(vec2 p) {
+	return f.polish.x > 0.5 ? texelFetch(blue_noise, ivec2(p) & 63, 0).r : ign(p);
+}
+
 void main() {
 	ivec2 px = ivec2(gl_GlobalInvocationID.xy);
 	if (any(greaterThanEqual(px, f.sizes.zw))) {
@@ -951,7 +981,7 @@ void main() {
 	vec3 n = normalize(texelFetch(normal_tex, fp, 0).xyz * 2.0 - 1.0);
 	vec3 t = normalize(cross(n, abs(n.y) < 0.99 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0)));
 	vec3 b = cross(n, t);
-	vec3 noise = vec3(ign(vec2(px)), ign(vec2(px) + vec2(47.0, 17.0)), ign(vec2(px) + vec2(13.0, 101.0)));
+	vec3 noise = vec3(noise1(vec2(px)), noise1(vec2(px) + vec2(47.0, 17.0)), noise1(vec2(px) + vec2(13.0, 101.0)));
 	int emissives = int(f.reflect.z);
 
 	const int RAYS = clamp(int(f.cache.w), 1, 4);
@@ -996,7 +1026,8 @@ void main() {
 				float pd;
 				vec2 pp = prev_pixel(view_from_pixel(floor(hp), hd > 0.0 ? hd : sd, f.proj_info, f.clip.x, f.clip.y), pd);
 				if (on_screen(pp)) {
-					vec3 seen = texture(color_tex, (pp + 0.5) / vec2(f.sizes.xy)).rgb;
+					// A diffuse ray's texel spans 4 x 4 frame pixels: with mips, it reads their average.
+					vec3 seen = textureLod(color_tex, (pp + 0.5) / vec2(f.sizes.xy), min(2.0, max(f.polish.z - 1.0, 0.0))).rgb;
 					if (emissives > 0) {
 						int e = emissive_at((f.view_to_world * vec4(view_from_pixel(floor(hp), hd > 0.0 ? hd : sd, f.proj_info, f.clip.x, f.clip.y), 1.0)).xyz);
 						if (e >= 0) {
@@ -1093,6 +1124,22 @@ void main() {
 				vec4 was_light = texture(prev_accum, uv);
 				vec3 was_m = texture(prev_moments, uv).xyz;
 				if (!any(isnan(was_light)) && !any(isnan(was_m))) {
+					// Clipped to this frame's neighbourhood, widened for the rays' own noise: light that has moved (a bike's
+					// glow passing, a pulse) stops trailing while the noise still averages out.
+					if (f.polish.y > 0.5) {
+						vec3 m1 = vec3(0.0);
+						vec3 m2 = vec3(0.0);
+						for (int y = -1; y <= 1; y++) {
+							for (int x = -1; x <= 1; x++) {
+								vec3 c = to_ycocg(texelFetch(trace_tex, clamp(px + ivec2(x, y), ivec2(0), f.sizes.zw - 1), 0).rgb);
+								m1 += c;
+								m2 += c * c;
+							}
+						}
+						m1 /= 9.0;
+						vec3 sigma = sqrt(max(m2 / 9.0 - m1 * m1, vec3(0.0)));
+						was_light.rgb = from_ycocg(clamp(to_ycocg(was_light.rgb), m1 - 2.0 * sigma, m1 + 2.0 * sigma));
+					}
 					// A surface just uncovered takes its first frames at full weight, then settles to a long average.
 					float frames = min(was_m.z + 1.0, 32.0);
 					float alpha = max(1.0 / frames, 0.05);
@@ -1250,6 +1297,11 @@ float ign(vec2 p) {
 	return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715))));
 }
 
+layout(set = 0, binding = 14) uniform sampler2D blue_noise;
+float noise1(vec2 p) {
+	return f.polish.x > 0.5 ? texelFetch(blue_noise, ivec2(p) & 63, 0).r : ign(p);
+}
+
 void main() {
 	ivec2 px = ivec2(gl_GlobalInvocationID.xy);
 	if (any(greaterThanEqual(px, pc.size.xy))) {
@@ -1274,7 +1326,7 @@ void main() {
 	vec3 v = normalize(p);
 
 	// A microfacet normal from the GGX distribution, low-discrepancy over frames.
-	vec2 xi = vec2(fract(ign(vec2(px)) + f.misc.x * 0.7548776662), fract(ign(vec2(px) + vec2(47.0, 17.0)) + f.misc.x * 0.5698402910));
+	vec2 xi = vec2(fract(noise1(vec2(px)) + f.misc.x * 0.7548776662), fract(noise1(vec2(px) + vec2(47.0, 17.0)) + f.misc.x * 0.5698402910));
 	float a2 = rough * rough * rough * rough;
 	float cos_t = sqrt((1.0 - xi.x) / (1.0 + (a2 - 1.0) * xi.x));
 	float sin_t = sqrt(max(0.0, 1.0 - cos_t * cos_t));
@@ -1295,8 +1347,8 @@ void main() {
 	vec3 origin = p + n * (0.02 + 0.002 * -p.z);
 	const int STEPS = 32;
 	float reach = 3.0 * f.misc.y;
-	float jitter = fract(ign(vec2(px) + vec2(13.0, 101.0)) + f.misc.x * 0.6180339887);
-	probe_texture = fract(ign(vec2(px) + vec2(71.0, 29.0)) + f.misc.x * 0.3819660113) < 1.0 - smoothstep(0.15, 0.25, rough);
+	float jitter = fract(noise1(vec2(px) + vec2(13.0, 101.0)) + f.misc.x * 0.6180339887);
+	probe_texture = fract(noise1(vec2(px) + vec2(71.0, 29.0)) + f.misc.x * 0.3819660113) < 1.0 - smoothstep(0.15, 0.25, rough);
 	if (f.trace_settings.y > 0.5) {
 		probe_texture = true;
 	}
@@ -1330,10 +1382,11 @@ void main() {
 			float t = refine_hit(depth_tex, origin, dir, in_front, along);
 			vec2 hp = clamp(pixel_from_view(origin + dir * t, f.proj_info), vec2(0.0), vec2(f.sizes.xy) - 1.0);
 			float hd = texelFetch(depth_tex, ivec2(hp), 0).r;
+			vec3 hv = view_from_pixel(floor(hp), hd > 0.0 ? hd : sd, f.proj_info, f.clip.x, f.clip.y);
 			float pd;
-			vec2 pp = prev_pixel(view_from_pixel(floor(hp), hd > 0.0 ? hd : sd, f.proj_info, f.clip.x, f.clip.y), pd);
+			vec2 pp = prev_pixel(hv, pd);
 			if (on_screen(pp)) {
-				light = texture(color_tex, (pp + 0.5) / vec2(f.sizes.xy)).rgb;
+				light = textureLod(color_tex, (pp + 0.5) / vec2(f.sizes.xy), reflected_lod(length(p) + t, length(hv))).rgb;
 				found = true;
 				hit_t = t;
 				hit_moves = texelFetch(normal_tex, ivec2(hp), 0).w > 0.5;
@@ -1348,6 +1401,7 @@ void main() {
 		vec3 wn;
 		int hit = trace_world(world_origin, world_dir, far, wn);
 		if (hit >= 0) {
+			reflect_path = length(p) + far;
 			light = world_light(world_origin + world_dir * far, wn, hit, depth_tex, color_tex, true, true, true);
 			found = true;
 			hit_t = far;
@@ -1386,14 +1440,6 @@ layout(r32f, set = 0, binding = 6) uniform restrict writeonly image2D accum_dept
 layout(set = 0, binding = 7) uniform sampler2D hit_tex;
 layout(set = 0, binding = 8) uniform sampler2D prev_info;
 layout(rgba16f, set = 0, binding = 10) uniform restrict writeonly image2D info;
-
-vec3 to_ycocg(vec3 c) {
-	return vec3(0.25 * c.r + 0.5 * c.g + 0.25 * c.b, 0.5 * c.r - 0.5 * c.b, -0.25 * c.r + 0.5 * c.g - 0.25 * c.b);
-}
-
-vec3 from_ycocg(vec3 c) {
-	return vec3(c.x + c.y - c.z, c.x + c.z, c.x - c.y - c.z);
-}
 
 void main() {
 	ivec2 px = ivec2(gl_GlobalInvocationID.xy);
@@ -1814,6 +1860,7 @@ struct FrameData {
 	int32_t srcs[4];
 	float src_border[4];
 	float trace_settings[4];
+	float polish[4];
 };
 
 void projection_info(const Projection &p_projection, const Size2i &p_size, float *r_info) {
@@ -1859,19 +1906,37 @@ void PhysXGISourceEffect::_render(int p_callback_type, const RenderData *p_rende
 	const RD::TextureFormat format = rd->texture_get_format(color);
 	const Size2i size(format.width, format.height);
 	if (view->source.is_null() || view->source_size != size) {
+		for (const RID &level : view->source_levels) {
+			rd->free_rid(level);
+		}
+		view->source_levels.clear();
 		if (view->source.is_valid()) {
 			rd->free_rid(view->source);
 		}
+		// Six levels: a screen hit can read down to 1/32 size, which covers how small reflected images get.
 		RD::TextureFormat tf;
 		tf.format = format.format;
 		tf.width = size.x;
 		tf.height = size.y;
+		tf.mipmaps = 1;
+		for (int edge = MAX(size.x, size.y); edge > 1 && tf.mipmaps < 6; edge >>= 1) {
+			tf.mipmaps++;
+		}
 		tf.usage_bits = RD::TEXTURE_USAGE_STORAGE_BIT | RD::TEXTURE_USAGE_SAMPLING_BIT;
 		view->source = rd->texture_create(tf, RD::TextureView());
+		for (uint32_t m = 0; m < tf.mipmaps; m++) {
+			view->source_levels.push_back(rd->texture_create_shared_from_slice(RD::TextureView(), view->source, 0, m));
+		}
 		view->source_size = size;
 	}
 	rd->capture_timestamp("PXTGI source");
-	RendererRD::CopyEffects::get_singleton()->copy_to_rect(color, view->source, Rect2i(Point2i(), size));
+	RendererRD::CopyEffects *copy = RendererRD::CopyEffects::get_singleton();
+	copy->copy_to_rect(color, view->source_levels[0], Rect2i(Point2i(), size));
+	Size2i level_size = size;
+	for (uint32_t m = 1; m < view->source_levels.size(); m++) {
+		level_size = Size2i(MAX(1, level_size.x >> 1), MAX(1, level_size.y >> 1));
+		copy->make_mipmap(view->source_levels[m - 1], view->source_levels[m], level_size);
+	}
 	view->source_frame = RSG::rasterizer->get_frame_number();
 }
 
@@ -1939,7 +2004,7 @@ PhysXGIEffect::~PhysXGIEffect() {
 				rd->free_rid(shaders[i]);
 			}
 		}
-		for (RID r : { linear_sampler, mip_sampler, nearest_sampler, data_buffer, primitive_buffer, node_buffer, cache_keys, cache_cells, geometry_buffer }) {
+		for (RID r : { linear_sampler, mip_sampler, nearest_sampler, data_buffer, primitive_buffer, node_buffer, cache_keys, cache_cells, geometry_buffer, blue_noise }) {
 			if (r.is_valid()) {
 				rd->free_rid(r);
 			}
@@ -1986,6 +2051,17 @@ bool PhysXGIEffect::_ensure(RenderingDevice *p_rd) {
 	nearest_sampler = p_rd->sampler_create(state);
 	data_buffer = p_rd->uniform_buffer_create(sizeof(FrameData));
 	{
+		RD::TextureFormat tf;
+		tf.format = RD::DATA_FORMAT_R8_UNORM;
+		tf.width = 64;
+		tf.height = 64;
+		tf.usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_CAN_UPDATE_BIT;
+		Vector<uint8_t> texels;
+		texels.resize(64 * 64);
+		memcpy(texels.ptrw(), PXTGI_BLUE_NOISE, 64 * 64);
+		blue_noise = p_rd->texture_create(tf, RD::TextureView(), { texels });
+	}
+	{
 		Vector<uint8_t> zeros;
 		zeros.resize(CACHE_SLOTS * sizeof(uint32_t));
 		zeros.fill(0);
@@ -2001,6 +2077,12 @@ void PhysXGIView::free_data() {
 	if (rd == nullptr) {
 		return;
 	}
+	for (const RID &level : source_levels) {
+		if (level.is_valid()) {
+			rd->free_rid(level);
+		}
+	}
+	source_levels.clear();
 	for (RID *r : { &trace, &accum[0], &accum[1], &accum_depth[0], &accum_depth[1], &moments[0], &moments[1], &variance, &filtered[0], &filtered[1], &filtered_variance[0], &filtered_variance[1], &reflect_filtered, &reflect_trace, &reflect_hit, &reflect_accum[0], &reflect_accum[1], &reflect_info[0], &reflect_info[1], &reflect_depth[0], &reflect_depth[1], &source }) {
 		if (r->is_valid()) {
 			rd->free_rid(*r);
@@ -2120,7 +2202,8 @@ void PhysXGIEffect::_render(int p_callback_type, const RenderData *p_render_data
 	v.ensure(rd, size, s.reflection_resolution_scale);
 	// Last frame's scene: as PhysXGISourceEffect copied it, before motion blur and the lens effects; else the colour
 	// buffer itself (still last frame's image: the opaque pass hasn't run yet), which holds them.
-	const RID color = v.source.is_valid() && v.source_frame + 1 == RSG::rasterizer->get_frame_number() ? v.source : buffers->get_internal_texture();
+	const bool from_source = v.source.is_valid() && v.source_frame + 1 == RSG::rasterizer->get_frame_number();
+	const RID color = from_source ? v.source : buffers->get_internal_texture();
 
 	const Transform3D cam_transform = scene->get_cam_transform();
 	// The depth/normal prepass is jittered by TAA/FSR2. Strip only the depth and raster-Y
@@ -2302,6 +2385,10 @@ void PhysXGIEffect::_render(int p_callback_type, const RenderData *p_render_data
 	data.trace_settings[1] = s.filtered_reflections ? 1.0f : 0.0f;
 	data.trace_settings[2] = v.have_history ? 1.0f : 0.0f;
 	data.trace_settings[3] = s.reflection_softness;
+	data.polish[0] = s.blue_noise ? 1.0f : 0.0f;
+	data.polish[1] = s.gi_history_clamp ? 1.0f : 0.0f;
+	data.polish[2] = s.filtered_hits && from_source ? float(v.source_levels.size()) : 0.0f;
+	data.polish[3] = float(size.x) / float(MAX(v.reflect_size.x, 1));
 	data.reflect[1] = s.reflection_cutoff;
 	data.reflect[2] = (float)s.emissive_count;
 	data.reflect[3] = s.light_changed ? 1.0f : 0.0f;
@@ -2403,7 +2490,7 @@ void PhysXGIEffect::_render(int p_callback_type, const RenderData *p_render_data
 	if (s.multi_bounce && s.primitive_count > 0) {
 		_dispatch(rd, PASS_CACHE, { sampled(0, nearest_sampler, depth), sampled(2, linear_sampler, color), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 4, primitive_buffer), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 5, node_buffer), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 6, cache_keys), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 7, cache_cells), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 10, geometry_buffer), sampled(11, linear_sampler, sky_map) }, Size2i(CACHE_ROW, CACHE_SLOTS / CACHE_ROW / 4), nullptr, 0);
 	}
-	_dispatch(rd, PASS_TRACE, { sampled(0, nearest_sampler, depth), sampled(1, nearest_sampler, normal), sampled(2, linear_sampler, color), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 3, v.trace), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 4, primitive_buffer), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 5, node_buffer), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 6, cache_keys), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 7, cache_cells), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 10, geometry_buffer), sampled(11, linear_sampler, sky_map) }, v.trace_size, nullptr, 0);
+	_dispatch(rd, PASS_TRACE, { sampled(0, nearest_sampler, depth), sampled(1, nearest_sampler, normal), sampled(2, mip_sampler, color), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 3, v.trace), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 4, primitive_buffer), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 5, node_buffer), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 6, cache_keys), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 7, cache_cells), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 10, geometry_buffer), sampled(11, linear_sampler, sky_map), sampled(14, nearest_sampler, blue_noise) }, v.trace_size, nullptr, 0);
 
 	int32_t history[4] = { v.have_history ? 1 : 0, 0, 0, 0 };
 	_dispatch(rd, PASS_TEMPORAL, { sampled(0, nearest_sampler, v.trace), sampled(1, linear_sampler, v.accum[prev]), sampled(2, nearest_sampler, v.accum_depth[prev]), sampled(3, nearest_sampler, depth), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 4, v.accum[v.current]), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 5, v.accum_depth[v.current]), sampled(6, linear_sampler, v.moments[prev]), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 7, v.moments[v.current]), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 8, v.variance) }, v.trace_size, history, sizeof(history));
@@ -2420,7 +2507,7 @@ void PhysXGIEffect::_render(int p_callback_type, const RenderData *p_render_data
 
 	{
 		int32_t size[4] = { v.reflect_size.x, v.reflect_size.y, 0, 0 };
-		_dispatch(rd, PASS_REFLECT, { sampled(0, nearest_sampler, depth), sampled(1, nearest_sampler, normal), sampled(2, linear_sampler, color), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 3, v.reflect_trace), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 4, primitive_buffer), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 5, node_buffer), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 6, cache_keys), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 7, cache_cells), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 10, geometry_buffer), sampled(11, linear_sampler, sky_map), sampled(12, linear_sampler, probe_atlas), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 13, v.reflect_hit) }, v.reflect_size, size, sizeof(size));
+		_dispatch(rd, PASS_REFLECT, { sampled(0, nearest_sampler, depth), sampled(1, nearest_sampler, normal), sampled(2, mip_sampler, color), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 3, v.reflect_trace), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 4, primitive_buffer), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 5, node_buffer), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 6, cache_keys), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 7, cache_cells), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 10, geometry_buffer), sampled(11, linear_sampler, sky_map), sampled(12, linear_sampler, probe_atlas), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 13, v.reflect_hit), sampled(14, nearest_sampler, blue_noise) }, v.reflect_size, size, sizeof(size));
 		size[2] = v.have_history ? 1 : 0;
 		_dispatch(rd, PASS_REFLECT_TEMPORAL, { sampled(0, nearest_sampler, v.reflect_trace), sampled(1, linear_sampler, v.reflect_accum[prev]), sampled(2, nearest_sampler, v.reflect_depth[prev]), sampled(3, nearest_sampler, depth), sampled(4, nearest_sampler, normal), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 5, v.reflect_accum[v.current]), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 6, v.reflect_depth[v.current]), sampled(7, nearest_sampler, v.reflect_hit), sampled(8, linear_sampler, v.reflect_info[prev]), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 10, v.reflect_info[v.current]) }, v.reflect_size, size, sizeof(size));
 	}

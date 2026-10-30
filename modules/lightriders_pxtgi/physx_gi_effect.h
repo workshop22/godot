@@ -34,6 +34,7 @@
 #include "core/math/transform_3d.h"
 #include "core/os/mutex.h"
 #include "core/templates/hash_map.h"
+#include "core/templates/local_vector.h"
 #include "scene/resources/compositor.h"
 #include "servers/rendering/renderer_rd/storage_rd/render_buffer_custom_data_rd.h"
 #include "servers/rendering/rendering_device.h"
@@ -66,6 +67,7 @@ public:
 	// Last frame's scene for the screen rays, copied before motion blur and the lens effects wrote into the colour
 	// (PhysXGISourceEffect), and the frame it was copied in.
 	RID source;
+	LocalVector<RID> source_levels; // a view of each of its mips
 	Size2i source_size;
 	uint64_t source_frame = UINT64_MAX;
 	Size2i reflect_size;
@@ -159,6 +161,9 @@ public:
 		float reflection_softness = 1.0f;
 		float reflection_resolution_scale = 1.0f;
 		int rays_per_texel = 4;
+		bool blue_noise = false; // rays sample blue noise instead of interleaved gradient noise
+		bool gi_history_clamp = false; // the GI's history clipped to this frame's neighbourhood
+		bool filtered_hits = false; // screen hits read the source copy's mips by how small the hit appears
 		// Emissive shapes sampled directly by every texel (the nearest to the camera): an oriented box each (centre and
 		// three half axes, world space) and the light its surface gives off.
 		static constexpr int MAX_EMISSIVES = 16;
@@ -203,6 +208,7 @@ private:
 	RID pipelines[PASS_MAX];
 	RID linear_sampler;
 	RID mip_sampler;
+	RID blue_noise; // 64 x 64, R8
 	RID nearest_sampler;
 	RID data_buffer; // the frame's matrices
 	RID primitive_buffer;
