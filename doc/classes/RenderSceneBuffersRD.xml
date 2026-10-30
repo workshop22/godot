@@ -108,6 +108,18 @@
 				Returns the applied 3D MSAA mode for this viewport.
 			</description>
 		</method>
+		<method name="get_output_size" qualifiers="const">
+			<return type="Vector2i" />
+			<description>
+				Returns the size of [method get_output_texture]: the target size when a temporal upscaler (FSR 2, MetalFX) writes the frame, else the internal size.
+			</description>
+		</method>
+		<method name="get_output_texture" qualifiers="const">
+			<return type="RID" />
+			<description>
+				Returns the frame as it stands after TAA or a temporal upscaler: the upscaled texture when a temporal upscaler writes it, else the internal color texture (which TAA resolves in place). [constant CompositorEffect.EFFECT_CALLBACK_TYPE_POST_UPSCALE] effects work on this.
+			</description>
+		</method>
 		<method name="get_render_target" qualifiers="const">
 			<return type="RID" />
 			<description>
