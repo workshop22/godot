@@ -45,6 +45,8 @@
 // PXTGI3D is in the tree, Godot's own GI step (which would overwrite it) runs a do-nothing shader with the same binding
 // layout instead, and SDFGI is kept to its cheapest settings (it is only the switch that makes surfaces read the
 // buffer). Hidden or gone, Godot's pipelines and the environment's own SDFGI settings are restored.
+class MeshInstance3D;
+
 class PXTGI3D : public Node3D {
 	GDCLASS(PXTGI3D, Node3D);
 
@@ -180,6 +182,7 @@ class PXTGI3D : public Node3D {
 	bool _refresh_entry(int p_index, float *r_out, AABB &r_bounds);
 	void _record_frame(int p_index, Transform3D &r_to_world, AABB &r_local) const;
 	void _set_glow(int p_index, const Color &p_glow);
+	void _append_mesh(MeshInstance3D *p_mesh, const Pair<Color, Color> &p_look);
 	void _build_tree();
 	void _update_primitives(PhysXGIEffect::Snapshot &r_snapshot);
 

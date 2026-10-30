@@ -1001,9 +1001,19 @@ void PXTGI3D::_restyle_slice(LocalVector<int> &r_changed) {
 		if (look.first == known->first && look.second == known->second) {
 			continue;
 		}
-		if ((look.second.get_luminance() > 0.0f) != (known->second.get_luminance() > 0.0f)) {
-			tracked_changed = true;
-			last_change = "glow on/off " + String(node->get_path());
+		// Starting to glow only puts a shape among the emitters (a mesh outside any body joins the tree); nothing is
+		// found again. One that goes dark stays where it is, unsampled.
+		const bool glows = look.second.get_luminance() > 0.0f;
+		if (glows && known->second.get_luminance() <= 0.0f) {
+			if (index == nullptr) {
+				if (MeshInstance3D *mesh = Object::cast_to<MeshInstance3D>(node)) {
+					*known = look;
+					_append_mesh(mesh, look);
+					continue;
+				}
+			} else if (emissive_entries.find(*index) < 0) {
+				emissive_entries.push_back(*index);
+			}
 		}
 		*known = look;
 		if (index) {
@@ -1427,6 +1437,33 @@ void PXTGI3D::_build_tree() {
 	_stage(STAGE_MOVING_TREE, since);
 }
 
+// A mesh outside any body that starts to glow: appended to the shapes and the moving part of the tree, without
+// finding every shape again.
+void PXTGI3D::_append_mesh(MeshInstance3D *p_mesh, const Pair<Color, Color> &p_look) {
+	constexpr int PF = PhysXGIEffect::PRIMITIVE_FLOATS;
+	const ObjectID id = p_mesh->get_instance_id();
+	if (entry_of.has(id) || p_mesh->get_mesh().is_null() || p_mesh->get_gi_mode() == GeometryInstance3D::GI_MODE_DISABLED) {
+		return;
+	}
+	ShapeEntry entry;
+	entry.shape_node = id;
+	entry.albedo = p_look.first;
+	entry.emission = p_look.second;
+	entry.mesh_proxy = true;
+	entry.moving = true;
+	const int i = shapes.size();
+	entry_of.insert(id, i);
+	shapes.push_back(entry);
+	proxy_entries.push_back(i);
+	emissive_entries.push_back(i);
+	moving_entries.push_back(i);
+	entry_floats.resize((i + 1) * PF);
+	entry_bounds.resize(i + 1);
+	entry_valid.resize(i + 1);
+	entry_valid[i] = _refresh_entry(i, &entry_floats[i * PF], entry_bounds[i]);
+	moving_dirty = true;
+}
+
 // Shape p_index's glow, written into its record (and its tree slot) in place: the tree doesn't change.
 void PXTGI3D::_set_glow(int p_index, const Color &p_glow) {
 	constexpr int PF = PhysXGIEffect::PRIMITIVE_FLOATS;
@@ -1462,8 +1499,7 @@ void PXTGI3D::_update_primitives(PhysXGIEffect::Snapshot &r_snapshot) {
 			const Pair<Color, Color> look = _look_of(mesh);
 			looks.insert(id, look);
 			if (look.second.get_luminance() > 0.0f) {
-				tracked_changed = true;
-				last_change = "glowing mesh " + String(mesh->get_path());
+				_append_mesh(mesh, look);
 			}
 		}
 	}
@@ -1728,7 +1764,7 @@ void PXTGI3D::_publish() {
 		LocalVector<Pair<float, int>> nearby_emitters;
 		nearby_emitters.reserve(emissive_entries.size());
 		for (int i : emissive_entries) {
-			if (shapes[i].sample_emission && entry_valid[i]) {
+			if (shapes[i].sample_emission && entry_valid[i] && shapes[i].emission.get_luminance() > 0.0f) {
 				nearby_emitters.push_back(Pair<float, int>(entry_bounds[i].get_center().distance_squared_to(eye), i));
 			}
 		}
