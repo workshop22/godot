@@ -306,6 +306,12 @@ public:
 	// Upscaled.
 	void ensure_upscaled();
 
+	// Whether the temporal upscaler wrote this frame's upscaled image (DLSS warms up over a few frames first; until then
+	// the post-process takes the internal image).
+	bool upscaler_ready = true;
+	_FORCE_INLINE_ bool get_upscaler_ready() const { return upscaler_ready; }
+	_FORCE_INLINE_ void set_upscaler_ready(bool p_ready) { upscaler_ready = p_ready; }
+
 	_FORCE_INLINE_ bool has_upscaled_texture() const {
 		return has_texture(RB_SCOPE_BUFFERS, RB_TEX_COLOR_UPSCALED);
 	}

@@ -33,6 +33,11 @@
 #include "rendering_context_driver_vulkan.h"
 
 #include "core/config/engine.h"
+#include "core/os/os.h"
+#ifdef STREAMLINE_ENABLED
+#include "drivers/streamline/streamline_context.h"
+#include <windows.h>
+#endif
 #include "core/config/project_settings.h"
 #include "core/version.h"
 #include "drivers/vulkan/rendering_device_driver_vulkan.h"
@@ -903,7 +908,26 @@ Error RenderingContextDriverVulkan::initialize() {
 	Error err;
 
 #ifdef USE_VOLK
-	if (volkInitialize() != VK_SUCCESS) {
+	bool loaded = false;
+#ifdef STREAMLINE_ENABLED
+	// With --streamline, NVIDIA Streamline (DLSS) starts first and Vulkan goes through its interposer, which adds what its
+	// plugins need to the instance and device. Without the flag or the DLLs, the loader is used as always.
+	if (OS::get_singleton()->get_cmdline_user_args().find("--streamline") != nullptr) {
+		StreamlineContext::initialize(false);
+		HMODULE interposer = GetModuleHandleA("sl.interposer.dll");
+		if (StreamlineContext::get().slInit != nullptr && interposer != nullptr) {
+			PFN_vkGetInstanceProcAddr get_instance_proc_addr = (PFN_vkGetInstanceProcAddr)(void (*)())GetProcAddress(interposer, "vkGetInstanceProcAddr");
+			if (get_instance_proc_addr != nullptr) {
+				volkInitializeCustom(get_instance_proc_addr);
+				loaded = true;
+			}
+		}
+		if (!loaded) {
+			WARN_PRINT("Streamline (DLSS) isn't available: running without it.");
+		}
+	}
+#endif
+	if (!loaded && volkInitialize() != VK_SUCCESS) {
 		return FAILED;
 	}
 #endif

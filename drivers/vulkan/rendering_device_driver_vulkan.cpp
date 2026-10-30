@@ -31,6 +31,9 @@
 #include "rendering_device_driver_vulkan.h"
 
 #include "core/config/engine.h"
+#ifdef STREAMLINE_ENABLED
+#include "drivers/streamline/streamline_context.h"
+#endif
 #include "core/config/project_settings.h"
 #include "core/os/os.h"
 #include "core/templates/fixed_vector.h"
@@ -1876,6 +1879,12 @@ Error RenderingDeviceDriverVulkan::initialize(uint32_t p_device_index, uint32_t 
 	err = _check_device_capabilities();
 	ERR_FAIL_COND_V_MSG(err != OK, err, "Couldn't initialize Vulkan device capabilities. This may be caused by an incompatible or outdated graphics driver.");
 
+#ifdef STREAMLINE_ENABLED
+	if (StreamlineContext::get().slInit != nullptr) {
+		StreamlineContext::get().streamline_capabilities = StreamlineContext::get().enumerate_support_vulkan((void *)physical_device);
+	}
+#endif
+
 	LocalVector<VkDeviceQueueCreateInfo> queue_create_info;
 	err = _add_queue_create_info(queue_create_info);
 	ERR_FAIL_COND_V_MSG(err != OK, err, "Couldn't initialize Vulkan device queue. This may be caused by an incompatible or outdated graphics driver.");
@@ -1915,6 +1924,14 @@ Error RenderingDeviceDriverVulkan::initialize(uint32_t p_device_index, uint32_t 
 
 	pipeline_statistics.file_access->store_csv_line({ "name", "hash", "stage", "spec", "glslang", "re-spirv", "time" });
 	pipeline_statistics.file_access->flush();
+#endif
+
+#ifdef STREAMLINE_ENABLED
+	// The device came through the interposer: DLSS's functions can be fetched now.
+	if (StreamlineContext::get().slInit != nullptr) {
+		StreamlineContext::get().load_functions_post_init();
+		print_verbose(vformat("Streamline: DLSS %s.", StreamlineContext::get().streamline_capabilities.dlss_available ? "available" : "not available on this GPU"));
+	}
 #endif
 
 	return OK;
@@ -3481,6 +3498,10 @@ RDD::CommandBufferID RenderingDeviceDriverVulkan::command_buffer_create(CommandP
 	command_buffer->vk_command_buffer = vk_command_buffer;
 	command_pool->command_buffers_created.push_back(command_buffer);
 	return CommandBufferID(command_buffer);
+}
+
+void *RenderingDeviceDriverVulkan::command_buffer_get_native_handle(CommandBufferID p_cmd_buffer) {
+	return (void *)((CommandBufferInfo *)(p_cmd_buffer.id))->vk_command_buffer;
 }
 
 bool RenderingDeviceDriverVulkan::command_buffer_begin(CommandBufferID p_cmd_buffer) {
@@ -7280,6 +7301,14 @@ uint64_t RenderingDeviceDriverVulkan::get_resource_native_handle(DriverResource 
 			const TextureInfo *tex_info = (const TextureInfo *)p_driver_id.id;
 			return (uint64_t)tex_info->vk_view_create_info.format;
 		}
+		case DRIVER_RESOURCE_TEXTURE_DEVICE_MEMORY: {
+			const TextureInfo *tex_info = (const TextureInfo *)p_driver_id.id;
+			return (uint64_t)tex_info->allocation.info.deviceMemory;
+		}
+		case DRIVER_RESOURCE_TEXTURE_USAGE_FLAGS: {
+			const TextureInfo *tex_info = (const TextureInfo *)p_driver_id.id;
+			return (uint64_t)tex_info->vk_create_info.usage;
+		}
 		case DRIVER_RESOURCE_SAMPLER:
 		case DRIVER_RESOURCE_UNIFORM_SET:
 		case DRIVER_RESOURCE_BUFFER:
@@ -7528,6 +7557,12 @@ RenderingDeviceDriverVulkan::RenderingDeviceDriverVulkan(RenderingContextDriverV
 }
 
 RenderingDeviceDriverVulkan::~RenderingDeviceDriverVulkan() {
+#ifdef STREAMLINE_ENABLED
+	if (StreamlineContext::get().slShutdown != nullptr) {
+		StreamlineContext::get().slShutdown();
+		StreamlineContext::get().slShutdown = nullptr;
+	}
+#endif
 #if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
 	if (breadcrumb_buffer != BufferID()) {
 		buffer_free(breadcrumb_buffer);

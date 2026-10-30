@@ -8757,7 +8757,9 @@ uint64_t RenderingDevice::get_driver_resource(DriverResource p_resource, RID p_r
 			break;
 		case DRIVER_RESOURCE_TEXTURE:
 		case DRIVER_RESOURCE_TEXTURE_VIEW:
-		case DRIVER_RESOURCE_TEXTURE_DATA_FORMAT: {
+		case DRIVER_RESOURCE_TEXTURE_DATA_FORMAT:
+		case DRIVER_RESOURCE_TEXTURE_DEVICE_MEMORY:
+		case DRIVER_RESOURCE_TEXTURE_USAGE_FLAGS: {
 			Texture *tex = texture_owner.get_or_null(p_rid);
 			ERR_FAIL_NULL_V(tex, 0);
 

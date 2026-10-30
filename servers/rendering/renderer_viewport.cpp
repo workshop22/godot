@@ -31,6 +31,9 @@
 #include "renderer_viewport.h"
 
 #include "core/config/engine.h"
+#ifdef STREAMLINE_ENABLED
+#include "drivers/streamline/streamline_context.h"
+#endif
 #include "core/config/project_settings.h"
 #include "core/math/transform_interpolator.h"
 #include "core/object/worker_thread_pool.h"
@@ -159,6 +162,17 @@ void RendererViewport::_configure_3d_render_buffers(Viewport *p_viewport) {
 				WARN_PRINT_ONCE("MetalFX and FSR upscaling are not supported in the Compatibility renderer. Falling back to bilinear scaling.");
 			}
 
+#ifdef STREAMLINE_ENABLED
+			const bool dlss_available = StreamlineContext::get().streamline_capabilities.dlss_available && StreamlineContext::get().slDLSSSetOptions != nullptr;
+#else
+			const bool dlss_available = false;
+#endif
+			if (scaling_3d_mode == RSE::VIEWPORT_SCALING_3D_MODE_DLSS && (!dlss_available || OS::get_singleton()->get_current_rendering_method() != "forward_plus")) {
+				scaling_3d_mode = RSE::VIEWPORT_SCALING_3D_MODE_FSR2;
+				scaling_type = RSE::scaling_3d_mode_type(scaling_3d_mode);
+				WARN_PRINT_ONCE("DLSS isn't available (it needs an NVIDIA RTX GPU, Forward+ and --streamline with its DLLs). Falling back to FSR 2 scaling.");
+			}
+
 			if ((scaling_3d_mode == RSE::VIEWPORT_SCALING_3D_MODE_FSR || scaling_3d_mode == RSE::VIEWPORT_SCALING_3D_MODE_FSR2 || scaling_3d_mode == RSE::VIEWPORT_SCALING_3D_MODE_METALFX_TEMPORAL) && OS::get_singleton()->get_current_rendering_method() == "mobile") {
 				scaling_3d_mode = RSE::VIEWPORT_SCALING_3D_MODE_BILINEAR;
 				scaling_type = RSE::scaling_3d_mode_type(scaling_3d_mode);
@@ -243,6 +257,7 @@ void RendererViewport::_configure_3d_render_buffers(Viewport *p_viewport) {
 				case RSE::VIEWPORT_SCALING_3D_MODE_METALFX_TEMPORAL:
 				case RSE::VIEWPORT_SCALING_3D_MODE_FSR:
 				case RSE::VIEWPORT_SCALING_3D_MODE_FSR2:
+				case RSE::VIEWPORT_SCALING_3D_MODE_DLSS:
 					target_width = p_viewport->size.width;
 					target_height = p_viewport->size.height;
 					render_width = MAX(target_width * scaling_3d_scale, 1.0); // target_width / (target_width * scaling)
@@ -1030,6 +1045,10 @@ void RendererViewport::viewport_set_scaling_3d_mode(RID p_viewport, RSE::Viewpor
 		}
 		if (p_mode == RSE::VIEWPORT_SCALING_3D_MODE_FSR2) {
 			WARN_PRINT_ONCE_ED("FSR2 3D scaling is only available when using the Forward+ renderer.");
+			return;
+		}
+		if (p_mode == RSE::VIEWPORT_SCALING_3D_MODE_DLSS) {
+			WARN_PRINT_ONCE_ED("DLSS 3D scaling is only available when using the Forward+ renderer.");
 			return;
 		}
 		if (p_mode == RSE::VIEWPORT_SCALING_3D_MODE_METALFX_TEMPORAL) {

@@ -31,6 +31,9 @@
 #include "renderer_compositor_rd.h"
 
 #include "core/config/engine.h"
+#ifdef STREAMLINE_ENABLED
+#include "drivers/streamline/streamline_context.h"
+#endif
 #include "core/config/project_settings.h"
 #include "core/io/dir_access.h"
 #include "core/os/os.h"
@@ -122,6 +125,12 @@ void RendererCompositorRD::blit_render_targets_to_screen(DisplayServerEnums::Win
 
 void RendererCompositorRD::begin_frame(double frame_step) {
 	frame++;
+#ifdef STREAMLINE_ENABLED
+	// One Streamline frame token a rendered frame, taken on the thread that renders it: DLSS evaluates against it.
+	if (StreamlineContext::get().slGetNewFrameToken != nullptr) {
+		StreamlineContext::get().get_new_frame_token();
+	}
+#endif
 	delta = frame_step;
 	time += frame_step;
 

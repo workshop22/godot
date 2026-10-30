@@ -199,6 +199,7 @@ opts.Add(BoolVariable("opengl3", "Enable the OpenGL/GLES3 rendering driver", Tru
 opts.Add(BoolVariable("d3d12", "Enable the Direct3D 12 rendering driver on supported platforms", False))
 opts.Add(BoolVariable("metal", "Enable the Metal rendering driver on supported platforms (Apple arm64 only)", False))
 opts.Add(BoolVariable("use_volk", "Use the volk library to load the Vulkan loader dynamically", True))
+opts.Add(BoolVariable("use_streamline", "Build NVIDIA Streamline (DLSS) support; it loads only with --streamline", False))
 opts.Add(BoolVariable("accesskit", "Enable the AccessKit driver for screen reader support", True))
 opts.Add(BoolVariable("angle", "Enable the ANGLE rendering driver for OpenGL ES 3.0 on supported platforms", True))
 opts.Add(BoolVariable("sdl", "Enable the SDL3 input driver", True))
@@ -1225,6 +1226,13 @@ if "cpp_compiler_launcher" in env:
 
 # Build subdirs, the build order is dependent on link order.
 Export("env")
+
+if env["use_streamline"]:
+    if env["platform"] == "windows" and env["vulkan"]:
+        # The Vulkan path only; every unit sees the same StreamlineContext layout.
+        env.AppendUnique(CPPDEFINES=["STREAMLINE_ENABLED", ("STREAMLINE_ENABLED_VULKAN", 1)])
+    else:
+        env["use_streamline"] = False
 
 SConscript("core/SCsub")
 SConscript("servers/SCsub")

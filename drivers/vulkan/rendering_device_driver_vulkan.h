@@ -413,6 +413,7 @@ private:
 
 public:
 	virtual CommandBufferID command_buffer_create(CommandPoolID p_cmd_pool) override final;
+	virtual void *command_buffer_get_native_handle(CommandBufferID p_cmd_buffer) override final;
 	virtual bool command_buffer_begin(CommandBufferID p_cmd_buffer) override final;
 	virtual bool command_buffer_begin_secondary(CommandBufferID p_cmd_buffer, RenderPassID p_render_pass, uint32_t p_subpass, FramebufferID p_framebuffer) override final;
 	virtual void command_buffer_end(CommandBufferID p_cmd_buffer) override final;
