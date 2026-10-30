@@ -44,6 +44,7 @@
 #include "servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.h"
 #include "servers/rendering/renderer_rd/storage_rd/render_scene_data_rd.h"
 #include "servers/rendering/renderer_rd/storage_rd/texture_storage.h"
+#include "servers/rendering/renderer_rd/uniform_set_cache_rd.h"
 #include "servers/rendering/rendering_device_binds.h"
 #include "servers/rendering/rendering_server.h"
 #include "servers/rendering/rendering_server_globals.h"
@@ -1919,9 +1920,15 @@ void PhysXGIView::ensure(RenderingDevice *p_rd, const Size2i &p_frame, float p_r
 }
 
 void PhysXGIEffect::_dispatch(RenderingDevice *p_rd, int p_pass, const Vector<RD::Uniform> &p_uniforms, const Size2i &p_size, const void *p_push, uint32_t p_push_size) {
-	Vector<RD::Uniform> uniforms = p_uniforms;
+	// The cache keeps a set per distinct binding list (the history textures alternate, so two a pass) and drops it
+	// with the textures it names: no set is made and freed every frame.
+	LocalVector<RD::Uniform> uniforms;
+	uniforms.reserve(p_uniforms.size() + 1);
+	for (const RD::Uniform &u : p_uniforms) {
+		uniforms.push_back(u);
+	}
 	uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_UNIFORM_BUFFER, 9, data_buffer));
-	const RID set = p_rd->uniform_set_create(uniforms, shaders[p_pass], 0);
+	const RID set = UniformSetCacheRD::get_singleton()->get_cache_vec(shaders[p_pass], 0, uniforms);
 	ERR_FAIL_COND(!set.is_valid());
 	// GPU timestamps per pass (the visual profiler shows them).
 	p_rd->capture_timestamp(String("PXTGI ") + PASS_NAMES[p_pass]);
@@ -1933,7 +1940,6 @@ void PhysXGIEffect::_dispatch(RenderingDevice *p_rd, int p_pass, const Vector<RD
 	}
 	p_rd->compute_list_dispatch(list, (p_size.x + 7) / 8, (p_size.y + 7) / 8, 1);
 	p_rd->compute_list_end();
-	p_rd->free_rid(set);
 }
 
 void PhysXGIEffect::_render(int p_callback_type, const RenderData *p_render_data) {
