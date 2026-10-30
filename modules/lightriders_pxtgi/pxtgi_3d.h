@@ -73,6 +73,11 @@ class PXTGI3D : public Node3D {
 		bool mesh_proxy = false;
 		bool fixed = false; // a static body's shape (not animatable): a reflection probe's capture of it stays true
 		ObjectID shape_resource; // a collision shape's Shape3D when found: another one means finding the shapes again
+		bool sample_emission = true; // its body lets the trace sample it as a box light (pxtgi_sample_emission)
+		// In the moving part of the tree (rebuilt whenever one of its shapes changes), else the static part (built when
+		// the static shapes change): bodies that can move, emissive meshes, and a static shape found to have moved.
+		bool moving = false;
+		bool driven = false; // its glow is set by update_emitter_group, not read from its look
 		// Hulls and meshes: their type (4, 5), where their geometry starts in the geometry buffer, their local bounds.
 		int geometry_type = 0;
 		int geometry_a = 0;
@@ -146,22 +151,33 @@ class PXTGI3D : public Node3D {
 	LocalVector<int> dynamic_entries; // moving presentation bodies, excluding explicitly notified ribbons
 	LocalVector<int> proxy_entries; // emissive meshes outside any body: checked every frame
 	LocalVector<int> emissive_entries; // shapes that give off light: sampled directly
-	LocalVector<float> ordered_floats; // the records in the tree's leaf order
+	LocalVector<int> moving_entries; // the shapes in the moving part of the tree
+	// The tree's records in leaf order and its nodes: the static part first, then the moving part, joined under one
+	// root node when both have shapes. Rebuilding the moving part rewrites only what follows the static part.
+	LocalVector<float> ordered_floats;
 	LocalVector<float> tree_nodes;
 	LocalVector<int> leaf_order; // leaf slot -> shape
 	LocalVector<int> entry_slot; // shape -> leaf slot (-1: not in the tree)
+	uint32_t static_node_floats = 0;
+	uint32_t static_record_floats = 0;
+	uint32_t static_leaves = 0;
+	bool static_rooted = false; // the static part was built under a shared root
+	bool static_dirty = true;
+	bool moving_dirty = true;
+	bool radiance_dirty = false; // only glow changed: the records in place, not the tree
 	Vector<float> published_primitives;
 	Vector<float> published_nodes;
 	int published_count = 0;
 	uint64_t primitives_version = 0;
-	int moves_since_build = 0;
 
 	void _rescan();
+	void _keep_records(const LocalVector<ShapeEntry> &p_was, const HashMap<ObjectID, int> &p_was_index, const LocalVector<float> &p_was_floats, const LocalVector<AABB> &p_was_bounds, const LocalVector<uint8_t> &p_was_valid);
 	bool _shape_frame(int p_index, Transform3D &r_to_world, float &r_type, Vector3 &r_extents) const;
 	void _pack_entry(int p_index, const Transform3D &p_to_world, float p_type, const Vector3 &p_extents, float *r_out, AABB &r_bounds) const;
-	bool _write_entry(int p_index, float *r_out, AABB &r_bounds) const;
 	bool _refresh_entry(int p_index, float *r_out, AABB &r_bounds);
-	bool _entry_frame(int p_index, Transform3D &r_to_world, AABB &r_local) const;
+	void _record_frame(int p_index, Transform3D &r_to_world, AABB &r_local) const;
+	void _set_glow(int p_index, const Color &p_glow);
+	void _build_tree();
 	void _update_primitives(PhysXGIEffect::Snapshot &r_snapshot);
 
 	static void _install();
@@ -174,8 +190,8 @@ class PXTGI3D : public Node3D {
 		STAGE_EMITTERS, // update_emitter_group
 		STAGE_RESCAN,
 		STAGE_RECORDS, // shapes' records read again from their nodes
-		STAGE_BUILD,
-		STAGE_REFIT,
+		STAGE_STATIC_TREE, // the static part of the tree built
+		STAGE_MOVING_TREE, // the moving part rebuilt
 		STAGE_SELECT, // the directly sampled emitters chosen
 		STAGE_COPY, // records and tree handed to the renderer
 		STAGE_MAX,

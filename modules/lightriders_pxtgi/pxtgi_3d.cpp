@@ -405,6 +405,21 @@ const StringName &meta_emission() {
 	return name;
 }
 
+const StringName &meta_ignore() {
+	static const StringName name = "pxtgi_ignore";
+	return name;
+}
+
+const StringName &meta_sample_emission() {
+	static const StringName name = "pxtgi_sample_emission";
+	return name;
+}
+
+const StringName &meta_manual_updates() {
+	static const StringName name = "pxtgi_manual_updates";
+	return name;
+}
+
 // The light a material gives off (linear; emission times its energy, in the units Godot adds it to the frame; an
 // emission texture by its average). A material Godot can't read the glow of (a ShaderMaterial) can say it with a
 // "pxtgi_emission" Color in its metadata.
@@ -523,7 +538,7 @@ void body_look(Node *p_body, Color &r_albedo, Color &r_emission) {
 // volumes, not surfaces: they neither block nor bounce light) or a mesh outside any body (which gives off light as its
 // bounding box when it's emissive).
 bool is_tracked(const Node *p_node) {
-	if (bool(p_node->get_meta("pxtgi_ignore", false))) {
+	if (bool(p_node->get_meta(meta_ignore(), false))) {
 		return false;
 	}
 	if (Object::cast_to<Light3D>(p_node) || Object::cast_to<ReflectionProbe>(p_node)) {
@@ -939,8 +954,11 @@ void PXTGI3D::_restyle_slice(LocalVector<int> &r_changed) {
 		if (node == nullptr || known == nullptr) {
 			continue;
 		}
-		const Pair<Color, Color> look = _look_of(node);
+		Pair<Color, Color> look = _look_of(node);
 		const int *index = entry_of.getptr(id);
+		if (index && shapes[*index].driven) {
+			look.second = known->second; // its glow comes from update_emitter_group
+		}
 		if (index) {
 			const CollisionShape3D *cs = Object::cast_to<CollisionShape3D>(node);
 			if (cs && (cs->get_shape().is_valid() ? cs->get_shape()->get_instance_id() : ObjectID()) != shapes[*index].shape_resource) {
@@ -1012,9 +1030,12 @@ void PXTGI3D::_rescan() {
 				continue;
 			}
 			entry.mesh_proxy = true;
+			entry.moving = true;
 		} else {
 			CollisionShape3D *cs = Object::cast_to<CollisionShape3D>(n);
 			entry.fixed = Object::cast_to<StaticBody3D>(cs->get_parent()) && !Object::cast_to<AnimatableBody3D>(cs->get_parent());
+			entry.sample_emission = bool(cs->get_parent()->get_meta(meta_sample_emission(), true));
+			entry.moving = !entry.fixed;
 			if (cs->get_shape().is_valid()) {
 				entry.shape_resource = cs->get_shape()->get_instance_id();
 				if (const GeometryBlock *block = _geometry_for(cs->get_shape())) {
@@ -1043,7 +1064,7 @@ void PXTGI3D::_rescan() {
 			proxy_entries.push_back(i);
 		} else if (CollisionShape3D *cs = Object::cast_to<CollisionShape3D>(node)) {
 			body_entries[cs->get_parent()->get_instance_id()].push_back(i);
-			if (!shapes[i].fixed && !bool(cs->get_parent()->get_meta("pxtgi_manual_updates", false))) {
+			if (!shapes[i].fixed && !bool(cs->get_parent()->get_meta(meta_manual_updates(), false))) {
 				dynamic_entries.push_back(i);
 			}
 			shape_signature = hash_murmur3_one_64(cs->get_shape().is_valid() ? uint64_t(cs->get_shape()->get_instance_id()) : 0, shape_signature);
@@ -1102,30 +1123,23 @@ void PXTGI3D::_rescan() {
 	}
 }
 
-// Where shape p_index is and its local bounds (an emissive's box); false when it can't be traced.
-bool PXTGI3D::_entry_frame(int p_index, Transform3D &r_to_world, AABB &r_local) const {
-	float record[PhysXGIEffect::PRIMITIVE_FLOATS];
-	AABB world;
-	if (!_write_entry(p_index, record, world)) {
-		return false;
-	}
-	// The record holds world-to-local rows: their inverse is the shape's frame; its local box from the world one.
+// Where shape p_index is and its local bounds (an emissive's box), from its record.
+void PXTGI3D::_record_frame(int p_index, Transform3D &r_to_world, AABB &r_local) const {
+	const float *record = &entry_floats[p_index * PhysXGIEffect::PRIMITIVE_FLOATS];
+	// The record holds world-to-local rows: their inverse is the shape's frame.
 	Transform3D to_local;
 	for (int r = 0; r < 3; r++) {
 		to_local.basis.rows[r] = Vector3(record[r * 4 + 0], record[r * 4 + 1], record[r * 4 + 2]);
 		to_local.origin[r] = record[r * 4 + 3];
 	}
 	r_to_world = to_local.affine_inverse();
-	r_local = to_local.xform(world);
 	const ShapeEntry &entry = shapes[p_index];
 	if (entry.geometry_type) {
 		r_local = entry.local_bounds;
 	} else {
-		const float type = record[12];
 		const Vector3 e(record[13], record[14], record[15]);
-		r_local = type == 1.0f ? AABB(-Vector3(e.x, e.x, e.x), Vector3(2, 2, 2) * e.x) : AABB(-e, e * 2.0f);
+		r_local = record[12] == 1.0f ? AABB(-Vector3(e.x, e.x, e.x), Vector3(2, 2, 2) * e.x) : AABB(-e, e * 2.0f);
 	}
-	return true;
 }
 
 // Where shape p_index is and what it is (type, extents), from its node; false when it can't be traced (gone, hidden,
@@ -1206,19 +1220,8 @@ void PXTGI3D::_pack_entry(int p_index, const Transform3D &p_to_world, float p_ty
 	p[23] = entry.fixed ? 1.0f : 0.0f;
 }
 
-// Shape p_index's GPU record and world bounds, from its node; false when it can't be traced.
-bool PXTGI3D::_write_entry(int p_index, float *r_out, AABB &r_bounds) const {
-	Transform3D to_world;
-	float type;
-	Vector3 extents;
-	if (!_shape_frame(p_index, to_world, type, extents)) {
-		return false;
-	}
-	_pack_entry(p_index, to_world, type, extents, r_out, r_bounds);
-	return true;
-}
-
-// As _write_entry, also noting where the shape sits on its body, for the frames its body moves.
+// Shape p_index's GPU record and world bounds, from its node (false when it can't be traced), also noting where the
+// shape sits on its body, for the frames its body moves.
 bool PXTGI3D::_refresh_entry(int p_index, float *r_out, AABB &r_bounds) {
 	ShapeEntry &entry = shapes[p_index];
 	entry.posed = false;
@@ -1237,177 +1240,306 @@ bool PXTGI3D::_refresh_entry(int p_index, float *r_out, AABB &r_bounds) {
 	return true;
 }
 
-// The shapes' records and their tree, refreshed for what changed: a rescan that finds different shapes rebuilds the
-// tree; otherwise only the shapes on bodies PhysX moved are rewritten, placed from the bodies' poses (and a slice of
-// every shape each frame from its node, to catch bodies moved outside the simulation and shapes edited, hidden or
-// disabled) and the tree is refit around them, rebuilt after a while of motion to stay tight.
+// After a rescan: each shape still there (the same Shape3D) keeps its record, pose and tree slot from before, with its
+// look and geometry offsets rewritten; only new shapes are read from their nodes. The static part of the tree is kept
+// when it holds the same shapes, so a ribbon or a streamed cell coming and going doesn't rebuild the whole scene.
+void PXTGI3D::_keep_records(const LocalVector<ShapeEntry> &p_was, const HashMap<ObjectID, int> &p_was_index, const LocalVector<float> &p_was_floats, const LocalVector<AABB> &p_was_bounds, const LocalVector<uint8_t> &p_was_valid) {
+	constexpr int PF = PhysXGIEffect::PRIMITIVE_FLOATS;
+	const int n = shapes.size();
+	entry_floats.resize(n * PF);
+	entry_bounds.resize(n);
+	entry_valid.resize(n);
+	LocalVector<int> now_index; // a former shape's index now, or -1
+	now_index.resize(p_was.size());
+	for (uint32_t i = 0; i < p_was.size(); i++) {
+		now_index[i] = -1;
+	}
+	for (int i = 0; i < n; i++) {
+		ShapeEntry &entry = shapes[i];
+		const int *was = p_was_index.getptr(entry.shape_node);
+		if (was == nullptr || p_was[*was].shape_resource != entry.shape_resource || p_was[*was].mesh_proxy != entry.mesh_proxy) {
+			entry_valid[i] = _refresh_entry(i, &entry_floats[i * PF], entry_bounds[i]);
+			continue;
+		}
+		const ShapeEntry &before = p_was[*was];
+		now_index[*was] = i;
+		entry.posed = before.posed;
+		entry.in_body = before.in_body;
+		entry.type = before.type;
+		entry.extents = before.extents;
+		entry.moving = entry.moving || before.moving;
+		entry.driven = before.driven;
+		if (entry.driven) {
+			entry.emission = before.emission;
+		}
+		float *record = &entry_floats[i * PF];
+		memcpy(record, &p_was_floats[*was * PF], PF * sizeof(float));
+		if (entry.geometry_type) {
+			store_int(&record[13], entry.geometry_a);
+			store_int(&record[14], entry.geometry_b);
+		}
+		record[16] = entry.albedo.r;
+		record[17] = entry.albedo.g;
+		record[18] = entry.albedo.b;
+		record[20] = entry.emission.r;
+		record[21] = entry.emission.g;
+		record[22] = entry.emission.b;
+		entry_bounds[i] = p_was_bounds[*was];
+		entry_valid[i] = p_was_valid[*was];
+	}
+	// The static part stays when every static shape in it is still there and still static, and no other static shape
+	// is waiting to join it; its leaves then point at the shapes' new indices and take their rewritten records.
+	uint32_t static_count = 0;
+	for (int i = 0; i < n; i++) {
+		static_count += (!shapes[i].moving && entry_valid[i]) ? 1 : 0;
+	}
+	if (static_count != static_leaves) {
+		static_dirty = true;
+	}
+	for (uint32_t k = 0; k < static_leaves && !static_dirty; k++) {
+		const int i = now_index[leaf_order[k]];
+		if (i < 0 || shapes[i].moving || !entry_valid[i]) {
+			static_dirty = true;
+			break;
+		}
+		leaf_order[k] = i;
+		memcpy(&ordered_floats[k * PF], &entry_floats[i * PF], PF * sizeof(float));
+	}
+	leaf_order.resize(static_leaves);
+	// Slots for the kept static leaves; the moving part's come with its rebuild this frame.
+	entry_slot.resize(n);
+	for (int i = 0; i < n; i++) {
+		entry_slot[i] = -1;
+	}
+	for (uint32_t k = 0; k < static_leaves && !static_dirty; k++) {
+		entry_slot[leaf_order[k]] = k;
+	}
+	moving_dirty = true;
+}
+
+// The tree for the shapes as they are: the static part rebuilt only when it changed (or the root joining it to the
+// moving part comes or goes), the moving part every time.
+void PXTGI3D::_build_tree() {
+	constexpr int NF = PhysXGIEffect::NODE_FLOATS;
+	const int n = shapes.size();
+	LocalVector<BuildItem> moving_items;
+	for (int i : moving_entries) {
+		if (entry_valid[i]) {
+			const AABB &b = entry_bounds[i];
+			moving_items.push_back({ b, b.get_center(), i, b.position, b.position + b.size });
+		}
+	}
+	LocalVector<BuildItem> static_items;
+	auto collect_static = [&]() {
+		for (int i = 0; i < n; i++) {
+			if (!shapes[i].moving && entry_valid[i]) {
+				const AABB &b = entry_bounds[i];
+				static_items.push_back({ b, b.get_center(), i, b.position, b.position + b.size });
+			}
+		}
+	};
+	if (static_dirty) {
+		collect_static();
+	}
+	const bool rooted = !moving_items.is_empty() && (static_dirty ? !static_items.is_empty() : static_leaves > 0);
+	if (static_dirty || rooted != static_rooted) {
+		const uint64_t since = OS::get_singleton()->get_ticks_usec();
+		if (!static_dirty) {
+			collect_static(); // the same shapes, laid out with or without the shared root
+		}
+		tree_nodes.clear();
+		ordered_floats.clear();
+		leaf_order.clear();
+		if (rooted) {
+			tree_nodes.resize(NF);
+		}
+		if (!static_items.is_empty()) {
+			build_bvh(static_items, 0, static_items.size(), entry_floats.ptr(), tree_nodes, ordered_floats, leaf_order, rooted ? 1 : 0);
+		}
+		static_node_floats = tree_nodes.size();
+		static_record_floats = ordered_floats.size();
+		static_leaves = leaf_order.size();
+		static_rooted = rooted;
+		static_dirty = false;
+		_stage(STAGE_STATIC_TREE, since);
+	}
+	const uint64_t since = OS::get_singleton()->get_ticks_usec();
+	tree_nodes.resize(static_node_floats);
+	ordered_floats.resize(static_record_floats);
+	leaf_order.resize(static_leaves);
+	if (!moving_items.is_empty()) {
+		const int moving_root = build_bvh(moving_items, 0, moving_items.size(), entry_floats.ptr(), tree_nodes, ordered_floats, leaf_order, rooted ? 1 : 0);
+		if (rooted) {
+			// The root: both parts' bounds; its left child (the static part) follows it, its right is the moving part.
+			float *root = tree_nodes.ptr();
+			const float *a = &tree_nodes[NF];
+			const float *b = &tree_nodes[moving_root * NF];
+			for (int k = 0; k < 3; k++) {
+				root[k] = MIN(a[k], b[k]);
+				root[4 + k] = MAX(a[4 + k], b[4 + k]);
+			}
+			store_int(&root[3], moving_root);
+			store_int(&root[7], 0);
+		}
+	}
+	entry_slot.resize(n);
+	for (int i = 0; i < n; i++) {
+		entry_slot[i] = -1;
+	}
+	for (uint32_t k = 0; k < leaf_order.size(); k++) {
+		entry_slot[leaf_order[k]] = k;
+	}
+	moving_dirty = false;
+	_stage(STAGE_MOVING_TREE, since);
+}
+
+// Shape p_index's glow, written into its record (and its tree slot) in place: the tree doesn't change.
+void PXTGI3D::_set_glow(int p_index, const Color &p_glow) {
+	constexpr int PF = PhysXGIEffect::PRIMITIVE_FLOATS;
+	ShapeEntry &entry = shapes[p_index];
+	if (entry.emission == p_glow) {
+		return;
+	}
+	entry.emission = p_glow;
+	if (Pair<Color, Color> *look = looks.getptr(entry.shape_node)) {
+		look->second = p_glow;
+	}
+	if (uint32_t(p_index) < entry_valid.size()) {
+		float *record = &entry_floats[p_index * PF];
+		record[20] = p_glow.r;
+		record[21] = p_glow.g;
+		record[22] = p_glow.b;
+		if (uint32_t(p_index) < entry_slot.size() && entry_slot[p_index] >= 0) {
+			memcpy(&ordered_floats[entry_slot[p_index] * PF + 20], &record[20], 3 * sizeof(float));
+		}
+		radiance_dirty = true;
+	}
+}
+
+// The shapes' records and their tree, refreshed for what changed. Shapes found again (when tracked nodes came or
+// went) keep their records; otherwise only the moving shapes, those whose look changed and a slice of every shape each
+// frame (to catch shapes edited, hidden or disabled) are read from their nodes. A record whose pose or shape changed
+// rebuilds its part of the tree (a static shape that moves joins the moving part); a look alone is rewritten in place.
 void PXTGI3D::_update_primitives(PhysXGIEffect::Snapshot &r_snapshot) {
 	constexpr int PF = PhysXGIEffect::PRIMITIVE_FLOATS;
-	bool rebuild = false;
 	// The shapes found again when tracked nodes came or went, at most every 10 frames (a stream of spawned debris
-	// doesn't rebuild the tree every frame).
+	// doesn't rescan every frame).
 	if (tracked_root.is_null() || (tracked_changed && ++frames_since_rescan >= 10)) {
 		const uint64_t since = OS::get_singleton()->get_ticks_usec();
-		const uint32_t before = shape_signature;
+		const LocalVector<ShapeEntry> was(shapes);
+		const HashMap<ObjectID, int> was_index(entry_of);
+		const LocalVector<float> was_floats(entry_floats);
+		const LocalVector<AABB> was_bounds(entry_bounds);
+		const LocalVector<uint8_t> was_valid(entry_valid);
 		_rescan();
-		rebuild = shape_signature != before;
+		_keep_records(was, was_index, was_floats, was_bounds, was_valid);
 		_stage(STAGE_RESCAN, since);
 	}
 	const int n = shapes.size();
-	LocalVector<int> changed;
-	const uint64_t records_since = OS::get_singleton()->get_ticks_usec();
-	if (rebuild || entry_floats.size() != uint32_t(n * PF)) {
-		entry_floats.resize(n * PF);
-		entry_bounds.resize(n);
-		entry_valid.resize(n);
-		for (int i = 0; i < n; i++) {
-			entry_valid[i] = _refresh_entry(i, &entry_floats[i * PF], entry_bounds[i]);
+	moving_entries.clear();
+	for (int i = 0; i < n; i++) {
+		if (shapes[i].moving) {
+			moving_entries.push_back(i);
 		}
-		rebuild = true;
-	} else {
-		// Each candidate with the pose of the PhysX body that moved it (its shapes placed from it), or none (read from
-		// its node).
-		LocalVector<Pair<int, const Transform3D *>> candidates;
-		LocalVector<int> restyled;
-		_restyle_slice(restyled);
-		for (int i : restyled) {
-			candidates.push_back({ i, nullptr });
-		}
-		// Presentation-driven movers are checked every frame. Static geometry stays cached;
-		// explicit notifications refresh manually maintained shapes (ribbons), while an
-		// amortized verification catches authoring edits and parent visibility changes.
-		for (int i : dynamic_entries) {
-			candidates.push_back({ i, nullptr });
-		}
-		for (int i : proxy_entries) {
-			candidates.push_back({ i, nullptr });
-		}
-		for (const KeyValue<ObjectID, Transform3D> &moved : moved_poses) {
-			if (const LocalVector<int> *entries = body_entries.getptr(moved.key)) {
-				for (int i : *entries) {
-					if (Node *node = ObjectDB::get_instance<Node>(shapes[i].shape_node)) {
-						const Pair<Color, Color> look = _look_of(node);
-						shapes[i].albedo = look.first;
-						shapes[i].emission = look.second;
-						looks.insert(shapes[i].shape_node, look);
-					}
-					candidates.push_back({ i, nullptr });
-				}
-			}
-		}
-		for (int k = 0; k < n / 60 + 1 && n > 0; k++) {
-			candidates.push_back({ int(verify_cursor++ % n), nullptr });
-		}
+	}
 
-		float scratch[PF];
-		AABB bounds;
-		for (const Pair<int, const Transform3D *> &c : candidates) {
-			const int i = c.first;
-			const ShapeEntry &entry = shapes[i];
-			bool valid;
-			if (c.second && entry.posed && entry_valid[i]) {
-				_pack_entry(i, *c.second * entry.in_body, entry.type, entry.extents, scratch, bounds);
-				valid = true;
-			} else {
-				valid = _refresh_entry(i, scratch, bounds);
-			}
-			if (valid != bool(entry_valid[i])) {
-				rebuild = true;
-			}
-			entry_valid[i] = valid;
-			if (valid && memcmp(scratch, &entry_floats[i * PF], sizeof(scratch)) != 0) {
-				memcpy(&entry_floats[i * PF], scratch, sizeof(scratch));
-				entry_bounds[i] = bounds;
-				changed.push_back(i);
+	const uint64_t records_since = OS::get_singleton()->get_ticks_usec();
+	// Each candidate with the pose of the body that moved it (its shapes placed from it), or none (read from its node).
+	LocalVector<Pair<int, const Transform3D *>> candidates;
+	LocalVector<int> restyled;
+	_restyle_slice(restyled);
+	for (int i : restyled) {
+		candidates.push_back({ i, nullptr });
+	}
+	// Presentation-driven movers are checked every frame. Static geometry stays cached; explicit notifications refresh
+	// manually maintained shapes (ribbons), while an amortized verification catches authoring edits and parent
+	// visibility changes.
+	for (int i : dynamic_entries) {
+		candidates.push_back({ i, nullptr });
+	}
+	for (int i : proxy_entries) {
+		candidates.push_back({ i, nullptr });
+	}
+	for (const KeyValue<ObjectID, Transform3D> &moved : moved_poses) {
+		if (const LocalVector<int> *entries = body_entries.getptr(moved.key)) {
+			for (int i : *entries) {
+				if (Node *node = ObjectDB::get_instance<Node>(shapes[i].shape_node)) {
+					Pair<Color, Color> look = _look_of(node);
+					if (shapes[i].driven) {
+						look.second = shapes[i].emission;
+					}
+					shapes[i].albedo = look.first;
+					shapes[i].emission = look.second;
+					looks.insert(shapes[i].shape_node, look);
+				}
+				candidates.push_back({ i, nullptr });
 			}
 		}
-		if (rebuild) {
-			for (int i = 0; i < n; i++) {
-				entry_valid[i] = _refresh_entry(i, &entry_floats[i * PF], entry_bounds[i]);
+	}
+	for (int k = 0; k < n / 60 + 1 && n > 0; k++) {
+		candidates.push_back({ int(verify_cursor++ % n), nullptr });
+	}
+	float scratch[PF];
+	AABB bounds;
+	for (const Pair<int, const Transform3D *> &c : candidates) {
+		const int i = c.first;
+		ShapeEntry &entry = shapes[i];
+		bool valid;
+		if (c.second && entry.posed && entry_valid[i]) {
+			_pack_entry(i, *c.second * entry.in_body, entry.type, entry.extents, scratch, bounds);
+			valid = true;
+		} else {
+			valid = _refresh_entry(i, scratch, bounds);
+		}
+		float *record = &entry_floats[i * PF];
+		if (valid != bool(entry_valid[i])) {
+			entry_valid[i] = valid;
+			if (valid) {
+				memcpy(record, scratch, sizeof(scratch));
+				entry_bounds[i] = bounds;
+			}
+			(entry.moving ? moving_dirty : static_dirty) = true;
+			records_changed++;
+		} else if (valid && memcmp(scratch, record, sizeof(scratch)) != 0) {
+			// The first 16 floats are its pose and shape; the rest its look.
+			const bool placed = memcmp(scratch, record, 16 * sizeof(float)) != 0;
+			memcpy(record, scratch, sizeof(scratch));
+			entry_bounds[i] = bounds;
+			records_changed++;
+			if (placed) {
+				if (!entry.moving) {
+					entry.moving = true;
+					moving_entries.push_back(i);
+					static_dirty = true;
+				}
+				moving_dirty = true;
+			} else if (uint32_t(i) < entry_slot.size() && entry_slot[i] >= 0) {
+				memcpy(&ordered_floats[entry_slot[i] * PF], record, sizeof(scratch));
+				radiance_dirty = true;
 			}
 		}
 	}
 	_stage(STAGE_RECORDS, records_since);
-	records_changed += changed.size();
-	// A refit keeps the grouping of the last build: as a pile tumbles, its boxes loosen and overlap and every ray walks
-	// more of the tree (a collapsing pile doubled the trace). Rebuilt every quarter second of motion.
-	if (!changed.is_empty() && ++moves_since_build > 15) {
-		rebuild = true;
-	}
 
-	const uint64_t tree_since = OS::get_singleton()->get_ticks_usec();
-	if (rebuild) {
-		LocalVector<BuildItem> items;
-		for (int i = 0; i < n; i++) {
-			if (entry_valid[i]) {
-				const AABB &b = entry_bounds[i];
-				items.push_back({ b, b.get_center(), i, b.position, b.position + b.size });
-			}
-		}
-		ordered_floats.clear();
-		tree_nodes.clear();
-		leaf_order.clear();
-		if (!items.is_empty()) {
-			build_bvh(items, 0, items.size(), entry_floats.ptr(), tree_nodes, ordered_floats, leaf_order);
-		}
-		entry_slot.resize(n);
-		for (int i = 0; i < n; i++) {
-			entry_slot[i] = -1;
-		}
-		for (uint32_t k = 0; k < leaf_order.size(); k++) {
-			entry_slot[leaf_order[k]] = k;
-		}
-		moves_since_build = 0;
-		_stage(STAGE_BUILD, tree_since);
-	} else if (!changed.is_empty()) {
-		// Refit: the moved records into their leaf slots, then every node's box from its children, bottom up (a
-		// node's children come after it).
-		for (int i : changed) {
-			if (entry_slot[i] >= 0) {
-				memcpy(&ordered_floats[entry_slot[i] * PF], &entry_floats[i * PF], PF * sizeof(float));
-			}
-		}
-		auto node_box = [&](int p_node) {
-			const float *o = &tree_nodes[p_node * PhysXGIEffect::NODE_FLOATS];
-			return AABB(Vector3(o[0], o[1], o[2]), Vector3(o[4] - o[0], o[5] - o[1], o[6] - o[2]));
-		};
-		for (int node = int(tree_nodes.size() / PhysXGIEffect::NODE_FLOATS) - 1; node >= 0; node--) {
-			float *o = &tree_nodes[node * PhysXGIEffect::NODE_FLOATS];
-			int a;
-			int count;
-			memcpy(&a, &o[3], sizeof(int));
-			memcpy(&count, &o[7], sizeof(int));
-			AABB box;
-			if (count > 0) {
-				box = entry_bounds[leaf_order[a]];
-				for (int k = 1; k < count; k++) {
-					box.merge_with(entry_bounds[leaf_order[a + k]]);
-				}
-			} else {
-				box = node_box(node + 1).merge(node_box(a));
-			}
-			o[0] = box.position.x;
-			o[1] = box.position.y;
-			o[2] = box.position.z;
-			o[4] = box.position.x + box.size.x;
-			o[5] = box.position.y + box.size.y;
-			o[6] = box.position.z + box.size.z;
-		}
-		_stage(STAGE_REFIT, tree_since);
+	const bool rebuilt = static_dirty || moving_dirty || entry_slot.size() != uint32_t(n);
+	if (rebuilt) {
+		_build_tree();
 	}
-
-	if (rebuild || !changed.is_empty()) {
+	if (rebuilt || radiance_dirty) {
 		const uint64_t copy_since = OS::get_singleton()->get_ticks_usec();
 		published_primitives.resize(ordered_floats.size());
 		if (ordered_floats.size()) {
 			memcpy(published_primitives.ptrw(), ordered_floats.ptr(), ordered_floats.size() * sizeof(float));
 		}
-		published_nodes.resize(tree_nodes.size());
-		if (tree_nodes.size()) {
-			memcpy(published_nodes.ptrw(), tree_nodes.ptr(), tree_nodes.size() * sizeof(float));
+		if (rebuilt) {
+			published_nodes.resize(tree_nodes.size());
+			if (tree_nodes.size()) {
+				memcpy(published_nodes.ptrw(), tree_nodes.ptr(), tree_nodes.size() * sizeof(float));
+			}
 		}
 		published_count = leaf_order.size();
 		primitives_version++;
+		radiance_dirty = false;
 		_stage(STAGE_COPY, copy_since);
 	}
 	r_snapshot.primitives = published_primitives;
@@ -1423,8 +1555,9 @@ void PXTGI3D::notify_body_changed(Node3D *p_body) {
 	moved_poses.insert(p_body->get_instance_id(), p_body->get_global_transform());
 }
 
-// Batched bridge for the underground pulse material. Parameters are shared by a
-// group; geometry is retained and only changed radiance is published.
+// Batched bridge for the underground pulse material. Parameters are shared by a group; each body's glow is written
+// into its shapes' records in place (geometry and the tree stay as they are). A body no scan has found yet takes it
+// through its metadata, as any look.
 void PXTGI3D::update_emitter_group(const PackedInt64Array &p_bodies, const PackedFloat32Array &p_stations, const Dictionary &p_values, double p_time) {
 	ERR_FAIL_COND(p_bodies.size() != p_stations.size());
 	const uint64_t since = OS::get_singleton()->get_ticks_usec();
@@ -1443,30 +1576,35 @@ void PXTGI3D::update_emitter_group(const PackedInt64Array &p_bodies, const Packe
 	const float width = p_values["width"];
 	const float speed = p_values["speed"];
 	const float fade = age >= 0.0f ? 1.0f - Math::smoothstep(life * 0.5f, life, age) : 0.0f;
-	const Color uniform_emission = (colour * (energy * presence)).linear_to_srgb();
 	for (int i = 0; i < p_bodies.size(); i++) {
-		Node3D *body = ObjectDB::get_instance<Node3D>(ObjectID(uint64_t(p_bodies[i])));
-		if (body == nullptr) {
+		const ObjectID id(uint64_t(p_bodies[i]));
+		const LocalVector<int> *entries = body_entries.getptr(id);
+		const bool found = entries != nullptr && !entries->is_empty() && uint32_t((*entries)[0]) < entry_bounds.size();
+		Node3D *body = found ? nullptr : ObjectDB::get_instance<Node3D>(id);
+		if (!found && body == nullptr) {
 			continue;
 		}
-		Color emission = uniform_emission;
-		if (chase > 0.0f || fade > 0.0f) {
-			float pulse = 0.0f;
-			if (chase > 0.0f) {
-				const float ahead = Math::fposmod(p_stations[i] - float(p_time) * speed, wavelength);
-				const float d = MIN(ahead, wavelength - ahead);
-				pulse = chase * Math::exp(-d * d / (width * width));
-			}
-			float wave = 0.0f;
-			if (fade > 0.0f) {
-				const float front = body->get_global_position().distance_to(origin) - age * wave_speed;
-				wave = (front > 0.0f ? Math::exp(-front * front / (wave_width * wave_width)) : Math::exp(front / (wave_width * 4.0f)) * 0.5f) * fade;
-			}
-			emission = (colour * (energy * (presence + chase_gain * pulse + wave_gain * wave))).linear_to_srgb();
+		float gain = presence;
+		if (chase > 0.0f) {
+			const float ahead = Math::fposmod(p_stations[i] - float(p_time) * speed, wavelength);
+			const float d = MIN(ahead, wavelength - ahead);
+			gain += chase_gain * chase * Math::exp(-d * d / (width * width));
 		}
-		if (!Color(body->get_meta(meta_emission())).is_equal_approx(emission)) {
-			body->set_meta(meta_emission(), emission);
-			notify_body_changed(body);
+		if (fade > 0.0f) {
+			// An emitter box is centred on its body.
+			const Vector3 at = found ? entry_bounds[(*entries)[0]].get_center() : body->get_global_position();
+			const float front = at.distance_to(origin) - age * wave_speed;
+			gain += wave_gain * (front > 0.0f ? Math::exp(-front * front / (wave_width * wave_width)) : Math::exp(front / (wave_width * 4.0f)) * 0.5f) * fade;
+		}
+		Color glow = colour * (energy * gain);
+		glow.a = 1.0f;
+		if (!found) {
+			body->set_meta(meta_emission(), glow.linear_to_srgb());
+			continue;
+		}
+		for (int e : *entries) {
+			shapes[e].driven = true;
+			_set_glow(e, glow);
 		}
 	}
 	_stage(STAGE_EMITTERS, since);
@@ -1483,7 +1621,7 @@ void PXTGI3D::_stage(Stage p_stage, uint64_t p_since) {
 // Each stage's time since the last reset: total and worst microseconds, and calls (frames for the whole update); the
 // shapes, emitters and moving records it keeps.
 Dictionary PXTGI3D::get_stats(bool p_reset) {
-	static const char *names[STAGE_MAX] = { "publish", "emitters", "rescan", "records", "build", "refit", "select", "copy" };
+	static const char *names[STAGE_MAX] = { "publish", "emitters", "rescan", "records", "static_tree", "moving_tree", "select", "copy" };
 	Dictionary stats;
 	for (int i = 0; i < STAGE_MAX; i++) {
 		Dictionary stage;
@@ -1496,6 +1634,8 @@ Dictionary PXTGI3D::get_stats(bool p_reset) {
 	stats["shapes"] = int64_t(shapes.size());
 	stats["emissive"] = int64_t(emissive_entries.size());
 	stats["dynamic"] = int64_t(dynamic_entries.size());
+	stats["moving"] = int64_t(moving_entries.size());
+	stats["static_leaves"] = int64_t(static_leaves);
 	stats["mesh_proxies"] = int64_t(proxy_entries.size());
 	if (p_reset) {
 		for (StageTime &t : stage_times) {
@@ -1531,27 +1671,24 @@ void PXTGI3D::_publish() {
 	const Vector3 eye = camera ? camera->get_global_position() : get_global_position();
 	{
 		const uint64_t select_since = OS::get_singleton()->get_ticks_usec();
+		// The nearest by their records' bounds (a box's world bounds share its centre): no node is read.
 		LocalVector<Pair<float, int>> nearby_emitters;
+		nearby_emitters.reserve(emissive_entries.size());
 		for (int i : emissive_entries) {
-			CollisionShape3D *shape = ObjectDB::get_instance<CollisionShape3D>(shapes[i].shape_node);
-			if (shape && shape->get_parent() && !bool(shape->get_parent()->get_meta("pxtgi_sample_emission", true))) {
-				continue;
-			}
-			Transform3D frame;
-			AABB local;
-			if (_entry_frame(i, frame, local)) {
-				nearby_emitters.push_back(Pair<float, int>(frame.xform(local.get_center()).distance_squared_to(eye), i));
+			if (shapes[i].sample_emission && entry_valid[i]) {
+				nearby_emitters.push_back(Pair<float, int>(entry_bounds[i].get_center().distance_squared_to(eye), i));
 			}
 		}
-		nearby_emitters.sort_custom<PairSort<float, int>>();
+		const uint32_t chosen = MIN(nearby_emitters.size(), uint32_t(PhysXGIEffect::Snapshot::MAX_EMISSIVES));
+		std::partial_sort(nearby_emitters.ptr(), nearby_emitters.ptr() + chosen, nearby_emitters.ptr() + nearby_emitters.size(), [](const Pair<float, int> &a, const Pair<float, int> &b) {
+			return a.first < b.first;
+		});
 		s.emissive_count = 0;
-		for (const Pair<float, int> &e : nearby_emitters) {
-			if (s.emissive_count == PhysXGIEffect::Snapshot::MAX_EMISSIVES) {
-				break;
-			}
+		for (uint32_t c = 0; c < chosen; c++) {
+			const Pair<float, int> &e = nearby_emitters[c];
 			Transform3D frame;
 			AABB local;
-			_entry_frame(e.second, frame, local);
+			_record_frame(e.second, frame, local);
 			const int k = s.emissive_count++;
 			s.emissive_primitive[k] = entry_slot[e.second];
 			const Vector3 half = local.size * 0.5f;
