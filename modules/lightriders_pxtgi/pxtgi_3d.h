@@ -167,10 +167,33 @@ class PXTGI3D : public Node3D {
 	static void _install();
 	static void _uninstall();
 
+	// Main-thread cost of keeping the GI's scene up to date, by stage (get_stats): microseconds in all, the worst
+	// call, and how many calls.
+	enum Stage {
+		STAGE_PUBLISH, // the whole frame's update
+		STAGE_EMITTERS, // update_emitter_group
+		STAGE_RESCAN,
+		STAGE_RECORDS, // shapes' records read again from their nodes
+		STAGE_BUILD,
+		STAGE_REFIT,
+		STAGE_SELECT, // the directly sampled emitters chosen
+		STAGE_COPY, // records and tree handed to the renderer
+		STAGE_MAX,
+	};
+	struct StageTime {
+		uint64_t total = 0;
+		uint64_t worst = 0;
+		uint32_t calls = 0;
+	};
+	StageTime stage_times[STAGE_MAX];
+	uint64_t records_changed = 0;
+	void _stage(Stage p_stage, uint64_t p_since);
+
 public:
 	static void free_shared();
 	void notify_body_changed(Node3D *p_body);
 	void update_emitter_group(const PackedInt64Array &p_bodies, const PackedFloat32Array &p_stations, const Dictionary &p_values, double p_time);
+	Dictionary get_stats(bool p_reset = true);
 
 private:
 	bool active = false; // in the world and visible: delivering the GI

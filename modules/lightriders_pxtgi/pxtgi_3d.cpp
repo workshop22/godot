@@ -37,6 +37,7 @@
 #include "core/config/project_settings.h"
 #include "core/math/convex_hull.h"
 #include "core/object/callable_mp.h"
+#include "core/os/os.h"
 #include "core/templates/hashfuncs.h"
 #include "scene/3d/camera_3d.h"
 #include "scene/3d/light_3d.h"
@@ -1246,12 +1247,15 @@ void PXTGI3D::_update_primitives(PhysXGIEffect::Snapshot &r_snapshot) {
 	// The shapes found again when tracked nodes came or went, at most every 10 frames (a stream of spawned debris
 	// doesn't rebuild the tree every frame).
 	if (tracked_root.is_null() || (tracked_changed && ++frames_since_rescan >= 10)) {
+		const uint64_t since = OS::get_singleton()->get_ticks_usec();
 		const uint32_t before = shape_signature;
 		_rescan();
 		rebuild = shape_signature != before;
+		_stage(STAGE_RESCAN, since);
 	}
 	const int n = shapes.size();
 	LocalVector<int> changed;
+	const uint64_t records_since = OS::get_singleton()->get_ticks_usec();
 	if (rebuild || entry_floats.size() != uint32_t(n * PF)) {
 		entry_floats.resize(n * PF);
 		entry_bounds.resize(n);
@@ -1323,12 +1327,15 @@ void PXTGI3D::_update_primitives(PhysXGIEffect::Snapshot &r_snapshot) {
 			}
 		}
 	}
+	_stage(STAGE_RECORDS, records_since);
+	records_changed += changed.size();
 	// A refit keeps the grouping of the last build: as a pile tumbles, its boxes loosen and overlap and every ray walks
 	// more of the tree (a collapsing pile doubled the trace). Rebuilt every quarter second of motion.
 	if (!changed.is_empty() && ++moves_since_build > 15) {
 		rebuild = true;
 	}
 
+	const uint64_t tree_since = OS::get_singleton()->get_ticks_usec();
 	if (rebuild) {
 		LocalVector<BuildItem> items;
 		for (int i = 0; i < n; i++) {
@@ -1351,6 +1358,7 @@ void PXTGI3D::_update_primitives(PhysXGIEffect::Snapshot &r_snapshot) {
 			entry_slot[leaf_order[k]] = k;
 		}
 		moves_since_build = 0;
+		_stage(STAGE_BUILD, tree_since);
 	} else if (!changed.is_empty()) {
 		// Refit: the moved records into their leaf slots, then every node's box from its children, bottom up (a
 		// node's children come after it).
@@ -1385,9 +1393,11 @@ void PXTGI3D::_update_primitives(PhysXGIEffect::Snapshot &r_snapshot) {
 			o[5] = box.position.y + box.size.y;
 			o[6] = box.position.z + box.size.z;
 		}
+		_stage(STAGE_REFIT, tree_since);
 	}
 
 	if (rebuild || !changed.is_empty()) {
+		const uint64_t copy_since = OS::get_singleton()->get_ticks_usec();
 		published_primitives.resize(ordered_floats.size());
 		if (ordered_floats.size()) {
 			memcpy(published_primitives.ptrw(), ordered_floats.ptr(), ordered_floats.size() * sizeof(float));
@@ -1398,6 +1408,7 @@ void PXTGI3D::_update_primitives(PhysXGIEffect::Snapshot &r_snapshot) {
 		}
 		published_count = leaf_order.size();
 		primitives_version++;
+		_stage(STAGE_COPY, copy_since);
 	}
 	r_snapshot.primitives = published_primitives;
 	r_snapshot.primitive_count = published_count;
@@ -1416,6 +1427,7 @@ void PXTGI3D::notify_body_changed(Node3D *p_body) {
 // group; geometry is retained and only changed radiance is published.
 void PXTGI3D::update_emitter_group(const PackedInt64Array &p_bodies, const PackedFloat32Array &p_stations, const Dictionary &p_values, double p_time) {
 	ERR_FAIL_COND(p_bodies.size() != p_stations.size());
+	const uint64_t since = OS::get_singleton()->get_ticks_usec();
 	const Color colour = Color(p_values["colour"]).srgb_to_linear();
 	const float energy = p_values["energy"];
 	const float presence = 1.0f + float(p_values["presence_gain"]) * float(p_values["presence"]);
@@ -1457,6 +1469,41 @@ void PXTGI3D::update_emitter_group(const PackedInt64Array &p_bodies, const Packe
 			notify_body_changed(body);
 		}
 	}
+	_stage(STAGE_EMITTERS, since);
+}
+
+void PXTGI3D::_stage(Stage p_stage, uint64_t p_since) {
+	const uint64_t spent = OS::get_singleton()->get_ticks_usec() - p_since;
+	StageTime &t = stage_times[p_stage];
+	t.total += spent;
+	t.worst = MAX(t.worst, spent);
+	t.calls++;
+}
+
+// Each stage's time since the last reset: total and worst microseconds, and calls (frames for the whole update); the
+// shapes, emitters and moving records it keeps.
+Dictionary PXTGI3D::get_stats(bool p_reset) {
+	static const char *names[STAGE_MAX] = { "publish", "emitters", "rescan", "records", "build", "refit", "select", "copy" };
+	Dictionary stats;
+	for (int i = 0; i < STAGE_MAX; i++) {
+		Dictionary stage;
+		stage["total_us"] = int64_t(stage_times[i].total);
+		stage["worst_us"] = int64_t(stage_times[i].worst);
+		stage["calls"] = int64_t(stage_times[i].calls);
+		stats[names[i]] = stage;
+	}
+	stats["records_changed"] = int64_t(records_changed);
+	stats["shapes"] = int64_t(shapes.size());
+	stats["emissive"] = int64_t(emissive_entries.size());
+	stats["dynamic"] = int64_t(dynamic_entries.size());
+	stats["mesh_proxies"] = int64_t(proxy_entries.size());
+	if (p_reset) {
+		for (StageTime &t : stage_times) {
+			t = StageTime();
+		}
+		records_changed = 0;
+	}
+	return stats;
 }
 
 void PXTGI3D::_publish() {
@@ -1464,6 +1511,7 @@ void PXTGI3D::_publish() {
 		PhysXGIEffect::remove_settings(get_instance_id());
 		return;
 	}
+	const uint64_t publish_since = OS::get_singleton()->get_ticks_usec();
 	PhysXGIEffect::Snapshot s;
 	s.intensity = intensity;
 	s.max_distance = max_distance;
@@ -1482,6 +1530,7 @@ void PXTGI3D::_publish() {
 	const Camera3D *camera = get_viewport() ? get_viewport()->get_camera_3d() : nullptr;
 	const Vector3 eye = camera ? camera->get_global_position() : get_global_position();
 	{
+		const uint64_t select_since = OS::get_singleton()->get_ticks_usec();
 		LocalVector<Pair<float, int>> nearby_emitters;
 		for (int i : emissive_entries) {
 			CollisionShape3D *shape = ObjectDB::get_instance<CollisionShape3D>(shapes[i].shape_node);
@@ -1514,6 +1563,7 @@ void PXTGI3D::_publish() {
 			}
 			s.emissive_color[k] = shapes[e.second].emission;
 		}
+		_stage(STAGE_SELECT, select_since);
 	}
 	s.geometry = geometry;
 	s.geometry_version = geometry_version;
@@ -1628,6 +1678,7 @@ void PXTGI3D::_publish() {
 	} else if (fresh_frames > 0) {
 		fresh_frames--;
 	}
+	_stage(STAGE_PUBLISH, publish_since);
 }
 
 void PXTGI3D::_notification(int p_what) {
@@ -1678,6 +1729,7 @@ PackedStringArray PXTGI3D::get_configuration_warnings() const {
 void PXTGI3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("notify_body_changed", "body"), &PXTGI3D::notify_body_changed);
 	ClassDB::bind_method(D_METHOD("update_emitter_group", "bodies", "stations", "values", "time"), &PXTGI3D::update_emitter_group);
+	ClassDB::bind_method(D_METHOD("get_stats", "reset"), &PXTGI3D::get_stats, DEFVAL(true));
 	ClassDB::bind_method(D_METHOD("set_intensity", "intensity"), &PXTGI3D::set_intensity);
 	ClassDB::bind_method(D_METHOD("get_intensity"), &PXTGI3D::get_intensity);
 	ClassDB::bind_method(D_METHOD("set_max_distance", "distance"), &PXTGI3D::set_max_distance);
