@@ -45,6 +45,7 @@ public:
 		RID velocity;
 		RID reactive;
 		RID exposure;
+		float exposure_value = 0.0f; // The tonemapper's exposure when Godot's auto exposure is off; 0 lets DLSS estimate it.
 		RID output;
 		float z_near = 0.0f;
 		float z_far = 0.0f;
@@ -69,6 +70,8 @@ public:
 		RID dlss_rr_specular_hit_dist; // Specular hit distance (R16F, -1 = sky)
 	} last_parameters;
 	DLSSEffect *last_effect = nullptr;
+	RID exposure_texture; // 1x1 R32F holding exposure_value, tagged as DLSS's exposure input.
+	float exposure_texture_value = -1.0f;
 	bool is_d3d12 = false;
 	int delay = 4; // Warmup frames before DLSS evaluates (Vulkan stability workaround).
 
@@ -82,6 +85,13 @@ public:
 		RID mvec_decode_version;
 		RID mvec_decode_pipeline;
 	} shaders;
+
+	// Development overrides from the command line (--dlss-preset=K, --dlss-exposure=auto|<scale>,
+	// --dlss-mvec=x,y), for comparing inputs without a rebuild.
+	char preset_override = '?';
+	bool force_auto_exposure = false;
+	float exposure_scale = 1.0f;
+	Vector2 mvec_scale = Vector2(1.0f, 1.0f);
 
 	DLSSEffect();
 	~DLSSEffect();

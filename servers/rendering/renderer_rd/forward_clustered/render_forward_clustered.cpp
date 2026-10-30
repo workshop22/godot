@@ -2535,7 +2535,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			for (uint32_t v = 0; v < rb->get_view_count(); v++) {
 				real_t fov = p_render_data->scene_data->cam_projection.get_fov();
 				real_t aspect = p_render_data->scene_data->cam_projection.get_aspect();
-				real_t fovy = p_render_data->scene_data->cam_projection.get_fovy(fov, aspect);
+				real_t fovy = p_render_data->scene_data->cam_projection.get_fovy(fov, 1.0 / aspect);
 				RendererRD::DLSSContext::Parameters params;
 				params.context = rb_data->get_dlss_context();
 				params.internal_size = rb->get_internal_size();
@@ -2544,6 +2544,9 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 				params.velocity = rb->get_velocity_buffer(false, v);
 				params.reactive = rb->get_internal_texture_reactive(v);
 				params.exposure = exposure;
+				if (exposure.is_null() && p_render_data->environment.is_valid()) {
+					params.exposure_value = environment_get_exposure(p_render_data->environment);
+				}
 				params.output = rb->get_upscaled_texture(v);
 				params.z_near = p_render_data->scene_data->z_near;
 				params.z_far = p_render_data->scene_data->z_far;

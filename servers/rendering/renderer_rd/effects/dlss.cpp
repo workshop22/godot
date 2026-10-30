@@ -35,6 +35,7 @@
 #endif
 
 #ifdef ENABLE_DLSS
+#include "core/os/os.h"
 #include "drivers/streamline/streamline_context.h"
 #include "servers/rendering/renderer_rd/storage_rd/material_storage.h"
 #include "servers/rendering/renderer_rd/uniform_set_cache_rd.h"
@@ -147,6 +148,9 @@ static unsigned int g_dlss_viewportIndex = 1;
 
 DLSSContextInner::~DLSSContextInner() {
 	g_dlss_freeViewportIndices.push_back((unsigned int)viewport);
+	if (exposure_texture.is_valid()) {
+		RD::get_singleton()->free_rid(exposure_texture);
+	}
 }
 
 DLSSContextInner::DLSSContextInner() {
@@ -164,6 +168,21 @@ DLSSEffect::DLSSEffect() {
 	shaders.mvec_decode_shader.initialize(modes, "");
 	shaders.mvec_decode_version = shaders.mvec_decode_shader.version_create();
 	shaders.mvec_decode_pipeline = RD::get_singleton()->compute_pipeline_create(shaders.mvec_decode_shader.version_get_shader(shaders.mvec_decode_version, 0));
+
+	for (const String &arg : OS::get_singleton()->get_cmdline_user_args()) {
+		if (arg.begins_with("--dlss-preset=") && arg.length() > 14) {
+			preset_override = (char)arg[14];
+		} else if (arg == "--dlss-exposure=auto") {
+			force_auto_exposure = true;
+		} else if (arg.begins_with("--dlss-exposure=")) {
+			exposure_scale = arg.trim_prefix("--dlss-exposure=").to_float();
+		} else if (arg.begins_with("--dlss-mvec=")) {
+			Vector<double> scale = arg.trim_prefix("--dlss-mvec=").split_floats(",");
+			if (scale.size() == 2) {
+				mvec_scale = Vector2(scale[0], scale[1]);
+			}
+		}
+	}
 }
 
 DLSSEffect::~DLSSEffect() {
@@ -265,13 +284,37 @@ void DLSSEffect::upscale(const DLSSContext::Parameters &p_params) {
 		RD::get_singleton()->draw_command_end_label();
 	}
 
+	// Exposure: DLSS reads colour * exposure as its tonemapper input. Without it, it estimates
+	// exposure from a dark frame lit by thin neon and weighs history and edges wrongly.
+	if (p_params.exposure_value > 0.0f && !force_auto_exposure) {
+		float value = p_params.exposure_value * exposure_scale;
+		if (context->exposure_texture.is_null()) {
+			RD::TextureFormat tf;
+			tf.format = RD::DATA_FORMAT_R32_SFLOAT;
+			tf.width = 1;
+			tf.height = 1;
+			tf.usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_CAN_UPDATE_BIT;
+			context->exposure_texture = RD::get_singleton()->texture_create(tf, RD::TextureView());
+		}
+		if (value != context->exposure_texture_value) {
+			Vector<uint8_t> data;
+			data.resize(sizeof(float));
+			memcpy(data.ptrw(), &value, sizeof(float));
+			RD::get_singleton()->texture_update(context->exposure_texture, 0, data);
+			context->exposure_texture_value = value;
+		}
+	}
+
 	// Inject DLSS into the render graph
-	RD::CallbackResource res[8]; // Increased for DLSS-RR buffers
+	RD::CallbackResource res[9]; // Increased for DLSS-RR buffers
 	int num_resources = 0;
 	res[num_resources++].rid = p_params.color;
 	res[num_resources++].rid = p_params.output;
 	res[num_resources++].rid = p_params.depth;
 	res[num_resources++].rid = p_params.velocity;
+	if (context->exposure_texture.is_valid()) {
+		res[num_resources++].rid = context->exposure_texture;
+	}
 
 	// Add DLSS-RR buffers if provided
 	if (p_params.dlss_rr) {
@@ -381,14 +424,11 @@ void DLSSEffect::_upscale_internal(RDD::CommandBufferID cmdid, const DLSSContext
 		}
 	} else if (StreamlineContext::get().slDLSSSetOptions != nullptr && StreamlineContext::get().streamline_capabilities.dlss_available) {
 		// Set regular DLSS options
-		if (p_params.exposure.is_null() || !p_params.exposure.is_valid()) {
-			context->currentDlssOptions.useAutoExposure = sl::Boolean::eTrue;
-		} else {
-			context->currentDlssOptions.useAutoExposure = sl::Boolean::eFalse;
-		}
+		bool tag_exposure = context->exposure_texture.is_valid() && p_params.exposure_value > 0.0f && !force_auto_exposure;
+		context->currentDlssOptions.useAutoExposure = tag_exposure ? sl::Boolean::eFalse : sl::Boolean::eTrue;
 
 		context->currentDlssOptions.colorBuffersHDR = sl::Boolean::eTrue;
-		char dlssPreset = p_params.preset;
+		char dlssPreset = preset_override != '?' ? preset_override : p_params.preset;
 		if (dlssPreset == '?') {
 			dlssPreset = StreamlineContext::get().dlss_default_preset;
 		}
@@ -440,8 +480,8 @@ void DLSSEffect::_upscale_internal(RDD::CommandBufferID cmdid, const DLSSContext
 		context->constants.motionVectorsDilated = sl::Boolean::eFalse;
 		context->constants.motionVectorsJittered = sl::Boolean::eFalse;
 		context->constants.jitterOffset = sl::float2(p_params.jitter.x, p_params.jitter.y);
-		// Godot's motion vectors run the other way from DLSS's: with a scale of 1 history trails moving edges.
-		context->constants.mvecScale = sl::float2(-1.0f, -1.0f);
+		// Godot's velocity is previous minus current position in UV units, which is what DLSS reads at a scale of 1.
+		context->constants.mvecScale = sl::float2(mvec_scale.x, mvec_scale.y);
 		context->constants.orthographicProjection = sl::Boolean::eFalse;
 		context->constants.reset = p_params.reset_accumulation ? sl::Boolean::eTrue : sl::Boolean::eFalse;
 		sl::Result result = StreamlineContext::get().slSetConstants(context->constants, *StreamlineContext::get().last_token, context->viewport);
@@ -460,6 +500,9 @@ void DLSSEffect::_upscale_internal(RDD::CommandBufferID cmdid, const DLSSContext
 		assignResource(resources, resourceTags, numResources, p_params.output, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eValidUntilPresent);
 		assignResource(resources, resourceTags, numResources, p_params.depth, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent);
 		assignResource(resources, resourceTags, numResources, p_params.velocity, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent);
+		if (!use_dlss_rr && context->currentDlssOptions.useAutoExposure == sl::Boolean::eFalse) {
+			assignResource(resources, resourceTags, numResources, context->exposure_texture, sl::kBufferTypeExposure, sl::ResourceLifecycle::eValidUntilPresent);
+		}
 
 		// Tag DLSS-RR specific buffers if enabled
 		if (use_dlss_rr) {
