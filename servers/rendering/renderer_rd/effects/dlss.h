@@ -90,7 +90,10 @@ public:
 	// --dlss-mvec=x,y), for comparing inputs without a rebuild.
 	char preset_override = '?';
 	bool force_auto_exposure = false;
-	float exposure_scale = 1.0f;
+	// DLSS compresses colour above its white (colour x exposure = 1); the neon cores sit far above
+	// it, and a full exposure cost about a tenth of the far-end bloom against TAA. A quarter keeps
+	// the bloom within a few percent and the lines as crisp (measured 2026-10-30, underpass, 4K).
+	float exposure_scale = 0.25f;
 	Vector2 mvec_scale = Vector2(1.0f, 1.0f);
 
 	DLSSEffect();
