@@ -470,7 +470,7 @@ void RendererSceneRenderRD::_render_buffers_post_process_and_tonemap(const Rende
 	bool can_use_storage = _render_buffers_can_be_storage();
 
 	RSE::ViewportScaling3DMode scale_mode = rb->get_scaling_3d_mode();
-	bool use_upscaled_texture = rb->has_upscaled_texture() && (scale_mode == RSE::VIEWPORT_SCALING_3D_MODE_FSR2 || scale_mode == RSE::VIEWPORT_SCALING_3D_MODE_METALFX_TEMPORAL);
+	bool use_upscaled_texture = rb->is_output_upscaled();
 	SpatialUpscaler *spatial_upscaler = nullptr;
 	if (can_use_effects) {
 		if (scale_mode == RSE::VIEWPORT_SCALING_3D_MODE_FSR) {
@@ -607,7 +607,7 @@ void RendererSceneRenderRD::_render_buffers_post_process_and_tonemap(const Rende
 			for (uint32_t l = 0; l < rb->get_view_count(); l++) {
 				Size2i vp_size = rb->get_texture_slice_size(RB_SCOPE_BUFFERS, RB_TEX_BLUR_1, 0);
 				// Glow from the anti-aliased image. TAA writes its result back into the internal
-				// texture; FSR2 and DLSS write theirs to the upscaled one, and glow taken from the
+				// texture; FSR2 and MetalFX write theirs to the upscaled one, and glow taken from the
 				// internal texture then blooms the jittered, aliased frame and crawls.
 				RID source = use_upscaled_texture ? rb->get_upscaled_texture(l) : rb->get_internal_texture(l);
 				RID dest = rb->get_texture_slice(RB_SCOPE_BUFFERS, RB_TEX_BLUR_1, l, 0);
