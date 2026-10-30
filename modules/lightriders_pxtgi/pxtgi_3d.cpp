@@ -334,6 +334,7 @@ void PXTGI3D::_deactivate() {
 	get_tree()->disconnect("node_removed", callable_mp(this, &PXTGI3D::_node_removed));
 	tracked.clear();
 	looks.clear();
+	pending_meshes.clear();
 	tracked_root = ObjectID();
 	_detach();
 	if (--users == 0) {
@@ -920,14 +921,42 @@ void PXTGI3D::_node_added(Node *p_node) {
 	if (root == nullptr || (root != get_tree()->get_root() && !root->is_ancestor_of(p_node))) {
 		return;
 	}
-	tracked.insert(p_node->get_instance_id());
-	tracked_changed = true;
+	const ObjectID id = p_node->get_instance_id();
+	tracked.insert(id);
+	// Lights and probes join their lists (which are used are chosen each frame; a node moved to another parent comes
+	// back, once); a mesh waits for its look. Only a collision shape means finding the shapes again straight away.
+	if (Object::cast_to<DirectionalLight3D>(p_node)) {
+		if (suns.find(id) < 0) {
+			suns.push_back(id);
+		}
+	} else if (Object::cast_to<OmniLight3D>(p_node)) {
+		if (omnis.find(id) < 0) {
+			omnis.push_back(id);
+		}
+	} else if (Object::cast_to<SpotLight3D>(p_node)) {
+		if (spots.find(id) < 0) {
+			spots.push_back(id);
+		}
+	} else if (Object::cast_to<ReflectionProbe>(p_node)) {
+		if (probes.find(id) < 0) {
+			probes.push_back(id);
+		}
+	} else if (Object::cast_to<MeshInstance3D>(p_node)) {
+		pending_meshes.push_back(id);
+	} else if (!Object::cast_to<Light3D>(p_node)) {
+		tracked_changed = true;
+	}
 }
 
+// A light or probe gone is skipped where it's used (no longer an object) until the next rescan drops it; only a shape
+// the tree holds means finding the shapes again.
 void PXTGI3D::_node_removed(Node *p_node) {
-	if (tracked.erase(p_node->get_instance_id())) {
-		looks.erase(p_node->get_instance_id());
-		tracked_changed = true;
+	const ObjectID id = p_node->get_instance_id();
+	if (tracked.erase(id)) {
+		looks.erase(id);
+		if (entry_of.has(id)) {
+			tracked_changed = true;
+		}
 	}
 }
 
@@ -1422,6 +1451,15 @@ void PXTGI3D::_set_glow(int p_index, const Color &p_glow) {
 // rebuilds its part of the tree (a static shape that moves joins the moving part); a look alone is rewritten in place.
 void PXTGI3D::_update_primitives(PhysXGIEffect::Snapshot &r_snapshot) {
 	constexpr int PF = PhysXGIEffect::PRIMITIVE_FLOATS;
+	for (const ObjectID &id : pending_meshes) {
+		MeshInstance3D *mesh = ObjectDB::get_instance<MeshInstance3D>(id);
+		if (mesh && tracked.has(id) && mesh->get_mesh().is_valid() && mesh->get_gi_mode() != GeometryInstance3D::GI_MODE_DISABLED) {
+			const Pair<Color, Color> look = _look_of(mesh);
+			looks.insert(id, look);
+			tracked_changed = tracked_changed || look.second.get_luminance() > 0.0f;
+		}
+	}
+	pending_meshes.clear();
 	// The shapes found again when tracked nodes came or went, at most every 10 frames (a stream of spawned debris
 	// doesn't rescan every frame).
 	if (tracked_root.is_null() || (tracked_changed && ++frames_since_rescan >= 10)) {

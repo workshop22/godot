@@ -123,6 +123,9 @@ class PXTGI3D : public Node3D {
 	HashSet<ObjectID> tracked;
 	ObjectID tracked_root; // the node they were found under (the edited scene in the editor); none: walk again
 	bool tracked_changed = true; // a tracked node came or went (or a look or shape changed): find the shapes again
+	// Meshes outside any body that came since the last update: only one that glows means finding the shapes again
+	// (effects add and drop plain meshes all the time).
+	LocalVector<ObjectID> pending_meshes;
 	int frames_since_rescan = 0;
 	// Each tracked shape's and mesh's look (albedo, emission), worked out once and then a slice of them each frame
 	// (all in about a second), so a changed material reaches the GI without a pause.
