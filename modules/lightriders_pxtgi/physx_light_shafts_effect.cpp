@@ -106,7 +106,8 @@ void main() {
 	float open = 1.0;
 	for (int i = 0; i < 4; i++) {
 		ivec2 q = min(f + ivec2(i & 1, i >> 1), p.size.zw - 1);
-		float z = texelFetch(depth_tex, q, 0).r;
+		// Depth stays at the internal size when an upscaler wrote the frame.
+		float z = texelFetch(depth_tex, ivec2((vec2(q) + 0.5) * vec2(textureSize(depth_tex, 0)) / vec2(p.size.zw)), 0).r;
 		// Reverse Z: 0 is the far plane (the sky). Geometry counts as more
 		// open the further away it is, out to the depth range.
 		vec2 ndc = (vec2(q) + 0.5) / vec2(p.size.zw) * 2.0 - 1.0;
@@ -189,7 +190,7 @@ void main() {
 	// occluder's own surface isn't (a wall in front of the sun is no darker for
 	// it).
 	ivec2 q = min(ivec2(gl_FragCoord.xy), p.size.zw - 1);
-	float z = texelFetch(depth_tex, q, 0).r;
+	float z = texelFetch(depth_tex, ivec2((vec2(q) + 0.5) * vec2(textureSize(depth_tex, 0)) / vec2(p.size.zw)), 0).r;
 	vec2 ndc = (vec2(q) + 0.5) / vec2(p.size.zw) * 2.0 - 1.0;
 	vec4 v = p.inv_proj * vec4(ndc, z, 1.0);
 	float air = z <= 0.0 ? 1.0 : clamp(length(v.xyz / v.w) / max(p.misc.w, 1e-3), 0.0, 1.0);
@@ -283,10 +284,10 @@ void PhysXLightShaftsEffect::free_shared() {
 }
 
 PhysXLightShaftsEffect::PhysXLightShaftsEffect() {
-	set_effect_callback_type(EFFECT_CALLBACK_TYPE_POST_TRANSPARENT);
+	set_effect_callback_type(EFFECT_CALLBACK_TYPE_POST_UPSCALE);
 	set_access_resolved_color(true);
 	set_access_resolved_depth(true);
-	RenderingServer::get_singleton()->compositor_effect_set_callback(get_rid(), RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_POST_TRANSPARENT, callable_mp(this, &PhysXLightShaftsEffect::_render));
+	RenderingServer::get_singleton()->compositor_effect_set_callback(get_rid(), RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_POST_UPSCALE, callable_mp(this, &PhysXLightShaftsEffect::_render));
 }
 
 PhysXLightShaftsEffect::~PhysXLightShaftsEffect() {
@@ -415,8 +416,9 @@ void PhysXLightShaftsEffect::_render(int p_callback_type, const RenderData *p_re
 	if (buffers == nullptr || scene == nullptr || rd == nullptr || !_ensure(rd)) {
 		return;
 	}
-	const Size2i frame = buffers->get_internal_size();
-	const RID color = buffers->get_internal_texture();
+	// After TAA or the temporal upscaler, on the anti-aliased frame at its output size.
+	const Size2i frame = buffers->get_output_size();
+	const RID color = buffers->get_output_texture();
 	const RID depth = buffers->get_depth_texture();
 	if (frame.x <= 0 || frame.y <= 0 || !color.is_valid() || !depth.is_valid()) {
 		return;

@@ -244,6 +244,7 @@ public:
 		bool uses_alpha_clip = false;
 		bool uses_alpha_antialiasing = false;
 		bool uses_depth_prepass_alpha = false;
+		bool uses_transparent_motion_vectors = false;
 		bool uses_discard = false;
 		bool uses_roughness = false;
 		bool uses_normal = false;

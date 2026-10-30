@@ -217,9 +217,9 @@ void PhysXLensDirtEffect::free_shared() {
 }
 
 PhysXLensDirtEffect::PhysXLensDirtEffect() {
-	set_effect_callback_type(EFFECT_CALLBACK_TYPE_POST_TRANSPARENT);
+	set_effect_callback_type(EFFECT_CALLBACK_TYPE_POST_UPSCALE);
 	set_access_resolved_color(true);
-	RenderingServer::get_singleton()->compositor_effect_set_callback(get_rid(), RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_POST_TRANSPARENT, callable_mp(this, &PhysXLensDirtEffect::_render));
+	RenderingServer::get_singleton()->compositor_effect_set_callback(get_rid(), RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_POST_UPSCALE, callable_mp(this, &PhysXLensDirtEffect::_render));
 }
 
 PhysXLensDirtEffect::~PhysXLensDirtEffect() {
@@ -386,8 +386,9 @@ void PhysXLensDirtEffect::_render(int p_callback_type, const RenderData *p_rende
 	if (buffers == nullptr || rd == nullptr || !_ensure(rd)) {
 		return;
 	}
-	const Size2i frame = buffers->get_internal_size();
-	const RID color = buffers->get_internal_texture();
+	// After TAA or the temporal upscaler, on the anti-aliased frame at its output size.
+	const Size2i frame = buffers->get_output_size();
+	const RID color = buffers->get_output_texture();
 	// The dirt as the GPU has it (its sRGB view, so it reads linear like the frame).
 	const RID dirt = RendererRD::TextureStorage::get_singleton()->texture_get_rd_texture(s.dirt_texture, true);
 	if (frame.x < 8 || frame.y < 8 || !color.is_valid() || !dirt.is_valid()) {

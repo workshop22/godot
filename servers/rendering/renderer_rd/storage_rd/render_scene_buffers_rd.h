@@ -322,6 +322,22 @@ public:
 		return get_texture_slice(RB_SCOPE_BUFFERS, RB_TEX_COLOR_UPSCALED, p_layer, 0);
 	}
 
+	// The frame after TAA or a temporal upscaler (FSR2, DLSS, MetalFX): the upscaled image once the
+	// upscaler wrote it, else the internal one (TAA resolves in place). Post Upscale effects and the
+	// post-process work on this.
+	_FORCE_INLINE_ bool is_output_upscaled() const {
+		return upscaler_ready && RSE::scaling_3d_mode_type(scaling_3d_mode) == RSE::VIEWPORT_SCALING_3D_TYPE_TEMPORAL && has_upscaled_texture();
+	}
+	_FORCE_INLINE_ RID get_output_texture() const {
+		return is_output_upscaled() ? get_upscaled_texture() : get_internal_texture();
+	}
+	_FORCE_INLINE_ RID get_output_texture(const uint32_t p_layer) {
+		return is_output_upscaled() ? get_upscaled_texture(p_layer) : get_internal_texture(p_layer);
+	}
+	_FORCE_INLINE_ Size2i get_output_size() const {
+		return is_output_upscaled() ? target_size : internal_size;
+	}
+
 	// Velocity, currently only used by TAA (Clustered) but we'll be using this in other places soon too.
 
 	void ensure_velocity();

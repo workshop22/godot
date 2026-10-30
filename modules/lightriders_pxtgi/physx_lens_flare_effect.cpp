@@ -282,9 +282,9 @@ void PhysXLensFlareEffect::free_shared() {
 }
 
 PhysXLensFlareEffect::PhysXLensFlareEffect() {
-	set_effect_callback_type(EFFECT_CALLBACK_TYPE_POST_TRANSPARENT);
+	set_effect_callback_type(EFFECT_CALLBACK_TYPE_POST_UPSCALE);
 	set_access_resolved_color(true);
-	RenderingServer::get_singleton()->compositor_effect_set_callback(get_rid(), RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_POST_TRANSPARENT, callable_mp(this, &PhysXLensFlareEffect::_render));
+	RenderingServer::get_singleton()->compositor_effect_set_callback(get_rid(), RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_POST_UPSCALE, callable_mp(this, &PhysXLensFlareEffect::_render));
 }
 
 PhysXLensFlareEffect::~PhysXLensFlareEffect() {
@@ -454,8 +454,9 @@ void PhysXLensFlareEffect::_render(int p_callback_type, const RenderData *p_rend
 	if (buffers == nullptr || rd == nullptr || !_ensure(rd)) {
 		return;
 	}
-	const Size2i frame = buffers->get_internal_size();
-	const RID color = buffers->get_internal_texture();
+	// After TAA or the temporal upscaler, on the anti-aliased frame at its output size.
+	const Size2i frame = buffers->get_output_size();
+	const RID color = buffers->get_output_texture();
 	if (frame.x < 8 || frame.y < 8 || !color.is_valid()) {
 		return;
 	}
