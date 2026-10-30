@@ -5698,6 +5698,9 @@
 		<constant name="COMPOSITOR_EFFECT_CALLBACK_TYPE_POST_TRANSPARENT" value="4" enum="CompositorEffectCallbackType">
 			The callback is called after our transparent rendering pass, but before any built-in post-processing effects and output to our render target.
 		</constant>
+		<constant name="COMPOSITOR_EFFECT_CALLBACK_TYPE_POST_UPSCALE" value="5" enum="CompositorEffectCallbackType">
+			The callback is called after TAA or a temporal upscaler has resolved the frame, before depth of field, glow and tonemapping.
+		</constant>
 		<constant name="COMPOSITOR_EFFECT_CALLBACK_TYPE_ANY" value="-1" enum="CompositorEffectCallbackType">
 		</constant>
 		<constant name="ENV_BG_CLEAR_COLOR" value="0" enum="EnvironmentBG">

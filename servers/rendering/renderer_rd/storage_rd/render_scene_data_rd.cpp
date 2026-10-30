@@ -47,6 +47,18 @@ Projection RenderSceneDataRD::get_cam_projection() const {
 	return correction * cam_projection;
 }
 
+Transform3D RenderSceneDataRD::get_prev_cam_transform() const {
+	return prev_cam_transform;
+}
+
+Projection RenderSceneDataRD::get_prev_cam_projection() const {
+	Projection correction;
+	correction.set_depth_correction(flip_y);
+	correction.add_jitter_offset(prev_taa_jitter);
+
+	return correction * prev_cam_projection;
+}
+
 uint32_t RenderSceneDataRD::get_view_count() const {
 	return view_count;
 }

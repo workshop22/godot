@@ -24,6 +24,18 @@
 				[b]Note:[/b] If more than one view is rendered, this will return a centered transform.
 			</description>
 		</method>
+		<method name="get_prev_cam_projection" qualifiers="const">
+			<return type="Projection" />
+			<description>
+				Returns the previous frame's camera projection, in the same convention as [method get_cam_projection].
+			</description>
+		</method>
+		<method name="get_prev_cam_transform" qualifiers="const">
+			<return type="Transform3D" />
+			<description>
+				Returns the previous frame's camera transform, in the same convention as [method get_cam_transform].
+			</description>
+		</method>
 		<method name="get_uniform_buffer" qualifiers="const">
 			<return type="RID" />
 			<description>

@@ -64,6 +64,7 @@ void SceneShaderForwardClustered::ShaderData::set_code(const String &p_code) {
 	uses_alpha_antialiasing = false;
 	uses_blend_alpha = false;
 	uses_depth_prepass_alpha = false;
+	uses_transparent_motion_vectors = false;
 	uses_discard = false;
 	uses_roughness = false;
 	uses_normal = false;
@@ -128,6 +129,7 @@ void SceneShaderForwardClustered::ShaderData::set_code(const String &p_code) {
 	actions.usage_flag_pointers["ALPHA_ANTIALIASING_EDGE"] = &uses_alpha_antialiasing;
 	actions.usage_flag_pointers["ALPHA_TEXTURE_COORDINATE"] = &uses_alpha_antialiasing;
 	actions.render_mode_flags["depth_prepass_alpha"] = &uses_depth_prepass_alpha;
+	actions.render_mode_flags["transparent_motion_vectors"] = &uses_transparent_motion_vectors;
 
 	actions.usage_flag_pointers["SSS_STRENGTH"] = &uses_sss;
 	actions.usage_flag_pointers["SSS_TRANSMITTANCE_DEPTH"] = &uses_transmittance;
@@ -442,6 +444,12 @@ void SceneShaderForwardClustered::ShaderData::_create_pipeline(PipelineKey p_pip
 			}
 
 			blend_state = blend_state_color_blend;
+			if (!uses_transparent_motion_vectors) {
+				// The transparent pass binds motion vectors only for materials that write them
+				// (render_mode transparent_motion_vectors); the rest leave the surface behind them.
+				RD::PipelineColorBlendState::Attachment &motion = blend_state.attachments.write[2];
+				motion.write_r = motion.write_g = motion.write_b = motion.write_a = false;
+			}
 
 			if (depth_draw == DEPTH_DRAW_OPAQUE) {
 				depth_stencil_state.enable_depth_write = false; //alpha does not draw depth
