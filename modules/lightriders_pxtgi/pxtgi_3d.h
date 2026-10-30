@@ -206,6 +206,8 @@ class PXTGI3D : public Node3D {
 	};
 	StageTime stage_times[STAGE_MAX];
 	uint64_t records_changed = 0;
+	String last_change; // what last made the shapes need finding again
+	PackedStringArray rescan_causes; // since the stats were last read
 	void _stage(Stage p_stage, uint64_t p_since);
 
 public:

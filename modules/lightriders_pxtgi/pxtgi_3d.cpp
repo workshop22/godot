@@ -945,6 +945,7 @@ void PXTGI3D::_node_added(Node *p_node) {
 		pending_meshes.push_back(id);
 	} else if (!Object::cast_to<Light3D>(p_node)) {
 		tracked_changed = true;
+		last_change = "added " + String(p_node->get_path());
 	}
 }
 
@@ -956,6 +957,7 @@ void PXTGI3D::_node_removed(Node *p_node) {
 		looks.erase(id);
 		if (entry_of.has(id)) {
 			tracked_changed = true;
+			last_change = "removed " + String(p_node->get_path());
 		}
 	}
 }
@@ -976,7 +978,8 @@ Pair<Color, Color> PXTGI3D::_look_of(Node *p_node) const {
 // the shapes again.
 void PXTGI3D::_restyle_slice(LocalVector<int> &r_changed) {
 	const uint32_t count = look_order.size();
-	for (uint32_t k = 0; k < count / 60 + 1 && count > 0; k++) {
+	// About a second for all of them, but never more than 48 a frame however many there are.
+	for (uint32_t k = 0; k < MIN(count / 60 + 1, 48u) && count > 0; k++) {
 		const ObjectID id = look_order[look_cursor++ % count];
 		Node *node = ObjectDB::get_instance<Node>(id);
 		Pair<Color, Color> *known = looks.getptr(id);
@@ -992,6 +995,7 @@ void PXTGI3D::_restyle_slice(LocalVector<int> &r_changed) {
 			const CollisionShape3D *cs = Object::cast_to<CollisionShape3D>(node);
 			if (cs && (cs->get_shape().is_valid() ? cs->get_shape()->get_instance_id() : ObjectID()) != shapes[*index].shape_resource) {
 				tracked_changed = true;
+				last_change = "new shape " + String(node->get_path());
 			}
 		}
 		if (look.first == known->first && look.second == known->second) {
@@ -999,6 +1003,7 @@ void PXTGI3D::_restyle_slice(LocalVector<int> &r_changed) {
 		}
 		if ((look.second.get_luminance() > 0.0f) != (known->second.get_luminance() > 0.0f)) {
 			tracked_changed = true;
+			last_change = "glow on/off " + String(node->get_path());
 		}
 		*known = look;
 		if (index) {
@@ -1456,7 +1461,10 @@ void PXTGI3D::_update_primitives(PhysXGIEffect::Snapshot &r_snapshot) {
 		if (mesh && tracked.has(id) && mesh->get_mesh().is_valid() && mesh->get_gi_mode() != GeometryInstance3D::GI_MODE_DISABLED) {
 			const Pair<Color, Color> look = _look_of(mesh);
 			looks.insert(id, look);
-			tracked_changed = tracked_changed || look.second.get_luminance() > 0.0f;
+			if (look.second.get_luminance() > 0.0f) {
+				tracked_changed = true;
+				last_change = "glowing mesh " + String(mesh->get_path());
+			}
 		}
 	}
 	pending_meshes.clear();
@@ -1472,6 +1480,10 @@ void PXTGI3D::_update_primitives(PhysXGIEffect::Snapshot &r_snapshot) {
 		_rescan();
 		_keep_records(was, was_index, was_floats, was_bounds, was_valid);
 		_stage(STAGE_RESCAN, since);
+		if (!last_change.is_empty()) {
+			rescan_causes.push_back(last_change);
+			last_change = String();
+		}
 	}
 	const int n = shapes.size();
 	moving_entries.clear();
@@ -1514,7 +1526,7 @@ void PXTGI3D::_update_primitives(PhysXGIEffect::Snapshot &r_snapshot) {
 			}
 		}
 	}
-	for (int k = 0; k < n / 60 + 1 && n > 0; k++) {
+	for (int k = 0; k < MIN(n / 60 + 1, 48) && n > 0; k++) {
 		candidates.push_back({ int(verify_cursor++ % n), nullptr });
 	}
 	float scratch[PF];
@@ -1675,12 +1687,14 @@ Dictionary PXTGI3D::get_stats(bool p_reset) {
 	stats["moving"] = int64_t(moving_entries.size());
 	stats["static_leaves"] = int64_t(static_leaves);
 	stats["geometry_floats"] = int64_t(geometry.size());
+	stats["rescan_causes"] = rescan_causes;
 	stats["mesh_proxies"] = int64_t(proxy_entries.size());
 	if (p_reset) {
 		for (StageTime &t : stage_times) {
 			t = StageTime();
 		}
 		records_changed = 0;
+		rescan_causes.clear();
 	}
 	return stats;
 }
