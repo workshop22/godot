@@ -969,7 +969,7 @@ void main() {
 		bool found = false;
 		float last = 0.0;
 		// Debug mode 3: only the collision shapes' light, to see what the world trace adds.
-		for (int s = 0; s < (int(f.misc.w) >= 3 || f.trace_settings.z < 0.5 ? 0 : STEPS); s++) {
+		for (int s = 0; s < ((int(f.misc.w) >= 3 && int(f.misc.w) <= 5) || f.trace_settings.z < 0.5 ? 0 : STEPS); s++) {
 			float along = f.misc.y * pow((float(s) + jitter) / float(STEPS), 2.0);
 			float in_front = last;
 			last = along;
@@ -1010,7 +1010,8 @@ void main() {
 				break;
 			}
 		}
-		if (!found && f.counts.x > 0) {
+		// Debug mode 6: only the screen, to see what the world trace costs and adds.
+		if (!found && f.counts.x > 0 && int(f.misc.w) != 6) {
 			// Off the screen, or past what it shows: the collision shapes.
 			vec3 world_dir = mat3(f.view_to_world) * dir;
 			float t = f.ambient.w;
@@ -1539,7 +1540,13 @@ void main() {
 	ivec2 px = ivec2(gl_GlobalInvocationID.xy);
 	if (any(greaterThanEqual(px, pc.size_axis.xy))) return;
 	float depth = texelFetch(depth_tex, px, 0).r;
-	vec3 normal = normalize(texelFetch(normal_tex, frame_pixel(px, pc.size_axis.xy), 0).xyz * 2.0 - 1.0);
+	vec4 nr = texelFetch(normal_tex, frame_pixel(px, pc.size_axis.xy), 0);
+	// The sky and surfaces too rough to take reflection rays: nothing to soften (the resolve leaves them to Godot).
+	if (depth <= 0.0 || decode_roughness(nr.w) > f.reflect.y) {
+		imageStore(dst, px, vec4(0.0));
+		return;
+	}
+	vec3 normal = normalize(nr.xyz * 2.0 - 1.0);
 	float sigma = max(f.trace_settings.w, 1.0);
 	vec4 sum = vec4(0.0);
 	float weights = 0.0;

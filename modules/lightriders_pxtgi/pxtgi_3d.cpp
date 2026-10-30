@@ -1674,6 +1674,7 @@ Dictionary PXTGI3D::get_stats(bool p_reset) {
 	stats["dynamic"] = int64_t(dynamic_entries.size());
 	stats["moving"] = int64_t(moving_entries.size());
 	stats["static_leaves"] = int64_t(static_leaves);
+	stats["geometry_floats"] = int64_t(geometry.size());
 	stats["mesh_proxies"] = int64_t(proxy_entries.size());
 	if (p_reset) {
 		for (StageTime &t : stage_times) {
@@ -1940,5 +1941,5 @@ void PXTGI3D::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "multi_bounce"), "set_multi_bounce", "get_multi_bounce");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "reflection_mode", PROPERTY_HINT_ENUM, "Godot,Screen Space,Traced,Traced + Probes"), "set_reflection_mode", "get_reflection_mode");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "reflection_roughness_cutoff", PROPERTY_HINT_RANGE, "0,1,0.01"), "set_reflection_roughness_cutoff", "get_reflection_roughness_cutoff");
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "debug", PROPERTY_HINT_ENUM, "Off,Last Frame,Round Trip,World Only,World Hits,World Position"), "set_debug", "get_debug");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "debug", PROPERTY_HINT_ENUM, "Off,Last Frame,Round Trip,World Only,World Hits,World Position,Screen Only"), "set_debug", "get_debug");
 }
