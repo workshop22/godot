@@ -1216,6 +1216,9 @@ void RenderingDeviceGraph::_run_render_commands(int32_t p_level, const RecordedC
 			case RecordedCommand::TYPE_CAPTURE_TIMESTAMP: {
 				const RecordedCaptureTimestampCommand *texture_capture_timestamp_command = reinterpret_cast<const RecordedCaptureTimestampCommand *>(command);
 				driver->command_timestamp_write(r_command_buffer, texture_capture_timestamp_command->pool, texture_capture_timestamp_command->index);
+				// Diagnostic: a breadcrumb at every render timestamp, so a device loss names the renderer section the GPU
+				// last reached (DEBUG_PASS, user data = the frame's timestamp index; TIMESTAMP_INDEX lines name them).
+				driver->command_insert_breadcrumb(r_command_buffer, RDD::BreadcrumbMarker::DEBUG_PASS | (texture_capture_timestamp_command->index & 0xFFFF));
 			} break;
 			default: {
 				DEV_ASSERT(false && "Unknown recorded command type.");
