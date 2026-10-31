@@ -31,7 +31,8 @@
 #include "main.h"
 
 #ifdef WINDOWS_ENABLED
-#include "platform/windows/crash_handler_windows.h"
+// Keep Win32 macros out of platform-neutral headers.
+extern void windows_prepare_crash_dump();
 #endif
 
 #include "core/config/engine.h"
@@ -2264,7 +2265,7 @@ Error Main::setup(const char *execpath, int argc, char *argv[], bool p_second_ph
 	// Initialize user data dir.
 	OS::get_singleton()->ensure_user_data_dir();
 #ifdef WINDOWS_ENABLED
-	CrashHandler::prepare_dump_path();
+	windows_prepare_crash_dump();
 #endif
 
 	OS::get_singleton()->set_low_processor_usage_mode(GLOBAL_DEF("application/run/low_processor_mode", false));

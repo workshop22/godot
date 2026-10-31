@@ -323,3 +323,7 @@ static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep) {
 void CrashHandler::initialize() {
 	SetUnhandledExceptionFilter(crash_filter);
 }
+
+void windows_prepare_crash_dump() {
+	CrashHandler::prepare_dump_path();
+}
