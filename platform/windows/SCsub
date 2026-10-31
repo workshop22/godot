@@ -34,6 +34,8 @@ else:
     common_win += ["libgodot_windows.cpp"]
 
 common_win += ["crash_handler_windows_seh.cpp"]
+# Shipped templates use the same SEH/dump path as debug builds.
+env.AppendUnique(LIBS=["psapi", "dbghelp"])
 
 common_win_wrap = [
     "console_wrapper_windows.cpp",
