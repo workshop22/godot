@@ -158,9 +158,6 @@ DWORD CrashHandlerException(EXCEPTION_POINTERS *ep) {
 	HANDLE hThread = GetCurrentThread();
 	DWORD offset_from_symbol = 0;
 	IMAGEHLP_LINE64 line = {};
-	std::vector<module_data> modules;
-	DWORD cbNeeded;
-	std::vector<HMODULE> module_handles(1);
 
 	if (OS::get_singleton() == nullptr || OS::get_singleton()->is_disable_crash_handler() || IsDebuggerPresent()) {
 		return EXCEPTION_CONTINUE_SEARCH;
@@ -193,6 +190,11 @@ DWORD CrashHandlerException(EXCEPTION_POINTERS *ep) {
 	}
 	print_error(vformat("Dumping the backtrace. %s", msg));
 
+	// Backtrace allocations start only after the dump has been flushed.
+	std::vector<module_data> modules;
+	DWORD cbNeeded;
+	std::vector<HMODULE> module_handles(1);
+
 	// Load the symbols:
 	if (!SymInitialize(process, nullptr, false)) {
 		return EXCEPTION_CONTINUE_SEARCH;
@@ -209,7 +211,7 @@ DWORD CrashHandlerException(EXCEPTION_POINTERS *ep) {
 
 	// Setup stuff:
 	CONTEXT *context = ep->ContextRecord;
-	STACKFRAME64 frame;
+	STACKFRAME64 frame = {};
 	bool skip_first = false;
 
 	frame.AddrPC.Mode = AddrModeFlat;
