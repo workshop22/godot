@@ -7063,6 +7063,10 @@ void RenderingDeviceDriverVulkan::on_device_lost() const {
 	_err_print_error(FUNCTION_STR, __FILE__, __LINE__, context_driver->get_driver_and_device_memory_report());
 }
 
+#if defined(DEBUG_ENABLED)
+String rendering_device_graph_label_breadcrumb_name(uint32_t p_id);
+#endif
+
 void RenderingDeviceDriverVulkan::print_lost_device_info() {
 #if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
 	{
@@ -7165,6 +7169,11 @@ void RenderingDeviceDriverVulkan::print_lost_device_info() {
 			if (user_data != 0) {
 				error_msg += " | User data: " + itos(user_data);
 			}
+#if defined(DEBUG_ENABLED)
+			if (phase == BreadcrumbMarker::DEBUG_PASS && (user_data & 0x8000)) {
+				error_msg += " | Label: " + rendering_device_graph_label_breadcrumb_name(user_data);
+			}
+#endif
 
 			_err_print_error_asap(error_msg);
 

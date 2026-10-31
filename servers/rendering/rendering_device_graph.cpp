@@ -30,6 +30,16 @@
 
 #include "rendering_device_graph.h"
 
+#ifdef DEBUG_ENABLED
+// Diagnostic: the debug-label name behind each label breadcrumb (DEBUG_PASS | 0x8000 | id), read by the device-loss
+// report. Labels are recorded only with Vulkan debug utils (--verbose).
+static String rdg_label_breadcrumbs[0x8000];
+static uint32_t rdg_label_breadcrumb_next = 0;
+String rendering_device_graph_label_breadcrumb_name(uint32_t p_id) {
+	return rdg_label_breadcrumbs[p_id & 0x7FFF];
+}
+#endif
+
 #define PRINT_RENDER_GRAPH 0
 #define FORCE_FULL_ACCESS_BITS 0
 #define PRINT_RESOURCE_TRACKER_TOTAL 0
@@ -1323,6 +1333,13 @@ void RenderingDeviceGraph::_run_label_command_change(RDD::CommandBufferID p_comm
 		// Start the new label.
 		CharString label_name_utf8 = label_name.utf8();
 		driver->command_begin_label(p_command_buffer, label_name_utf8.get_data(), label_color);
+#ifdef DEBUG_ENABLED
+		{
+			const uint32_t id = rdg_label_breadcrumb_next++ & 0x7FFF;
+			rdg_label_breadcrumbs[id] = label_name;
+			driver->command_insert_breadcrumb(p_command_buffer, RDD::BreadcrumbMarker::DEBUG_PASS | 0x8000 | id);
+		}
+#endif
 
 		r_current_label_index = p_new_label_index;
 		r_current_label_level = p_new_level;
