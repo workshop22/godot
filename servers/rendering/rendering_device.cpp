@@ -8736,6 +8736,18 @@ void RenderingDevice::capture_timestamp(const String &p_name) {
 	draw_graph.add_capture_timestamp(frames[frame].timestamp_pool, frames[frame].timestamp_count);
 
 	frames[frame].timestamp_names[frames[frame].timestamp_count] = p_name;
+#ifdef DEBUG_ENABLED
+	{
+		// Diagnostic: name each timestamp index once per change, to read the device-loss breadcrumbs by.
+		static HashMap<uint32_t, String> named;
+		const uint32_t index = frames[frame].timestamp_count;
+		const String *was = named.getptr(index);
+		if (was == nullptr || *was != p_name) {
+			named[index] = p_name;
+			print_line(vformat("TIMESTAMP_INDEX %d %s", index, p_name));
+		}
+	}
+#endif
 	frames[frame].timestamp_cpu_values[frames[frame].timestamp_count] = OS::get_singleton()->get_ticks_usec();
 	frames[frame].timestamp_count++;
 }
