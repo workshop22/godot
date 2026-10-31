@@ -99,7 +99,9 @@ void Resolve::resolve_gi(RID p_source_depth, RID p_source_normal_roughness, RID 
 	RD::get_singleton()->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader, 0, u_source_depth, u_source_normal_roughness), 0);
 	RD::get_singleton()->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader, 1, u_dest_depth, u_dest_normal_roughness), 1);
 	if (p_source_voxel_gi.is_valid()) {
-		RD::Uniform u_source_voxel_gi(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ default_sampler, p_source_voxel_gi }));
+		// The VoxelGI buffer is RG8_UINT, which has no linear filtering: read with texelFetch, bound with a nearest sampler.
+		RID nearest_sampler = material_storage->sampler_rd_get_default(RSE::CANVAS_ITEM_TEXTURE_FILTER_NEAREST, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
+		RD::Uniform u_source_voxel_gi(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ nearest_sampler, p_source_voxel_gi }));
 		RD::Uniform u_dest_voxel_gi(RD::UNIFORM_TYPE_IMAGE, 0, p_dest_voxel_gi);
 
 		RD::get_singleton()->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader, 2, u_source_voxel_gi), 2);
