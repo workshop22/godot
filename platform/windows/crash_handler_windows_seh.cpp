@@ -31,6 +31,7 @@
 #include "crash_handler_windows.h"
 
 #include "core/config/project_settings.h"
+#include "core/io/dir_access.h"
 #include "core/object/script_language.h"
 #include "core/os/main_loop.h"
 #include "core/os/os.h"
@@ -114,6 +115,44 @@ public:
 	}
 };
 
+// Constructed once after project/override settings select user://, before renderer startup.
+// The fault path uses fixed storage and Win32 APIs before any backtrace allocation.
+static WCHAR minidump_path[32768] = {};
+static LONG dumping = 0;
+
+void CrashHandler::prepare_dump_path() {
+	String directory = OS::get_singleton()->get_user_data_dir().path_join("crashes");
+	if (DirAccess::make_dir_recursive_absolute(directory) != OK) {
+		return;
+	}
+	FILETIME now;
+	GetSystemTimeAsFileTime(&now);
+	ULARGE_INTEGER ticks;
+	ticks.LowPart = now.dwLowDateTime;
+	ticks.HighPart = now.dwHighDateTime;
+	uint64_t unix_seconds = (ticks.QuadPart - 116444736000000000ULL) / 10000000ULL;
+	String path = directory.path_join(vformat("%d-%d.dmp", unix_seconds, GetCurrentProcessId())).replace_char('/', '\\');
+	Char16String wide = path.utf16();
+	if (wide.length() < 32768) {
+		memcpy(minidump_path, wide.get_data(), (wide.length() + 1) * sizeof(WCHAR));
+	}
+}
+
+static void write_minidump(EXCEPTION_POINTERS *ep) {
+	if (!minidump_path[0] || InterlockedCompareExchange(&dumping, 1, 0)) {
+		return;
+	}
+	HANDLE file = CreateFileW(minidump_path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+	if (file != INVALID_HANDLE_VALUE) {
+		MINIDUMP_EXCEPTION_INFORMATION exception = { GetCurrentThreadId(), ep, FALSE };
+		MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), file,
+				static_cast<MINIDUMP_TYPE>(MiniDumpNormal | MiniDumpWithThreadInfo | MiniDumpWithUnloadedModules | MiniDumpFilterModulePaths),
+				&exception, nullptr, nullptr);
+		FlushFileBuffers(file);
+		CloseHandle(file);
+	}
+}
+
 DWORD CrashHandlerException(EXCEPTION_POINTERS *ep) {
 	HANDLE process = GetCurrentProcess();
 	HANDLE hThread = GetCurrentThread();
@@ -126,6 +165,8 @@ DWORD CrashHandlerException(EXCEPTION_POINTERS *ep) {
 	if (OS::get_singleton() == nullptr || OS::get_singleton()->is_disable_crash_handler() || IsDebuggerPresent()) {
 		return EXCEPTION_CONTINUE_SEARCH;
 	}
+
+	write_minidump(ep);
 
 	if (OS::get_singleton()->is_crash_handler_silent()) {
 		std::_Exit(0);
@@ -175,11 +216,11 @@ DWORD CrashHandlerException(EXCEPTION_POINTERS *ep) {
 	frame.AddrStack.Mode = AddrModeFlat;
 	frame.AddrFrame.Mode = AddrModeFlat;
 
-#if defined(_M_X64)
+#if defined(_M_X64) || defined(__x86_64__)
 	frame.AddrPC.Offset = context->Rip;
 	frame.AddrStack.Offset = context->Rsp;
 	frame.AddrFrame.Offset = context->Rbp;
-#elif defined(_M_ARM64) || defined(_M_ARM64EC)
+#elif defined(_M_ARM64) || defined(_M_ARM64EC) || defined(__aarch64__)
 	frame.AddrPC.Offset = context->Pc;
 	frame.AddrStack.Offset = context->Sp;
 	frame.AddrFrame.Offset = context->Fp;
@@ -256,7 +297,7 @@ DWORD CrashHandlerException(EXCEPTION_POINTERS *ep) {
 	}
 
 	// Pass the exception to the OS
-	return EXCEPTION_CONTINUE_SEARCH;
+	return EXCEPTION_EXECUTE_HANDLER;
 }
 #endif
 
@@ -275,5 +316,10 @@ void CrashHandler::disable() {
 	disabled = true;
 }
 
+static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep) {
+	return CrashHandlerException(ep);
+}
+
 void CrashHandler::initialize() {
+	SetUnhandledExceptionFilter(crash_filter);
 }

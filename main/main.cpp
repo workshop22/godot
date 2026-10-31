@@ -30,6 +30,10 @@
 
 #include "main.h"
 
+#ifdef WINDOWS_ENABLED
+#include "platform/windows/crash_handler_windows.h"
+#endif
+
 #include "core/config/engine.h"
 #include "core/config/project_settings.h"
 #include "core/core_globals.h"
@@ -2259,6 +2263,9 @@ Error Main::setup(const char *execpath, int argc, char *argv[], bool p_second_ph
 
 	// Initialize user data dir.
 	OS::get_singleton()->ensure_user_data_dir();
+#ifdef WINDOWS_ENABLED
+	CrashHandler::prepare_dump_path();
+#endif
 
 	OS::get_singleton()->set_low_processor_usage_mode(GLOBAL_DEF("application/run/low_processor_mode", false));
 	OS::get_singleton()->set_low_processor_usage_mode_sleep_usec(
