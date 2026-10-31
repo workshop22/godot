@@ -7007,13 +7007,17 @@ void RenderingDeviceDriverVulkan::on_device_lost() const {
 			fault_counts.addressInfoCount
 			? (VkDeviceFaultAddressInfoEXT *)memalloc(fault_counts.addressInfoCount * sizeof(VkDeviceFaultAddressInfoEXT))
 			: nullptr;
+	const uint64_t vendor_binary_size = fault_counts.vendorBinarySize;
 	fault_counts.vendorBinarySize = 0;
 	vkres = device_functions.GetDeviceFaultInfoEXT(vk_device, &fault_counts, &fault_info);
-	if (vkres != VK_SUCCESS) {
+	// The vendor binary is not requested, so drivers that have one return VK_INCOMPLETE; the description and the
+	// vendor and address infos, sized from the count query above, are still complete.
+	if (vkres != VK_SUCCESS && vkres != VK_INCOMPLETE) {
 		_err_print_error(FUNCTION_STR, __FILE__, __LINE__, "vkGetDeviceFaultInfoEXT returned " + itos(vkres) + " when getting fault info, skipping VK_EXT_device_fault report...");
 	} else {
 		err_msg += "** Report from VK_EXT_device_fault **";
 		err_msg += "\nDescription: " + String(fault_info.description);
+		err_msg += "\nVendor binary: " + itos(vendor_binary_size) + " bytes (not requested)";
 		err_msg += "\nVendor infos:";
 		for (uint32_t vd = 0; vd < fault_counts.vendorInfoCount; ++vd) {
 			const VkDeviceFaultVendorInfoEXT *vendor_info = &fault_info.pVendorInfos[vd];
