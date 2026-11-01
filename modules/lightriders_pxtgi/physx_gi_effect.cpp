@@ -2335,8 +2335,10 @@ bool PhysXGIEffect::_hw_update(RenderingDevice *p_rd, const Snapshot &p_snapshot
 		if (hw_moving_tlas.is_valid()) {
 			p_rd->free_rid(hw_moving_tlas);
 		}
-		hw_moving_capacity = MAX(1024u, Math::next_power_of_2(uint32_t(instances.size() * 2)));
-		hw_moving_tlas = p_rd->tlas_create(hw_moving_capacity, RD::ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT);
+		// Sized once for an Arena round's walls (about 2,050) and the bikes: growing it in play stalled the render
+		// thread for 130 ms on the Ring.
+		hw_moving_capacity = MAX(8192u, Math::next_power_of_2(uint32_t(instances.size() * 2)));
+		hw_moving_tlas = p_rd->tlas_create(hw_moving_capacity, RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT);
 		ERR_FAIL_COND_V(!hw_moving_tlas.is_valid(), false);
 	}
 	ERR_FAIL_COND_V(p_rd->tlas_build(hw_moving_tlas, Span<RD::AccelerationStructureInstance>(instances.ptr(), instances.size())) != OK, false);
