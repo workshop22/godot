@@ -4861,7 +4861,10 @@ static RDTransferMark rd_transfer_marks[RD_TRANSFER_RING];
 static uint32_t rd_transfer_next = 1;
 static Mutex rd_transfer_mutex;
 static void rd_transfer_mark(RDD::CommandBufferID p_cmd, uint32_t p_worker, uint64_t p_target, uint32_t p_bytes, bool p_texture, bool p_end, uint32_t p_width, uint32_t p_height) {
-	if (!rdd_vulkan_checkpoints) {
+	// LIGHTRIDERS_NO_TRANSFER_MARKERS=1 keeps the graph's markers but leaves the transfer queue unmarked (A/B: the resets
+	// stopped once uploads carried markers).
+	static const bool transfer_markers_off = OS::get_singleton()->has_environment("LIGHTRIDERS_NO_TRANSFER_MARKERS");
+	if (!rdd_vulkan_checkpoints || transfer_markers_off) {
 		return;
 	}
 	uint32_t marker;
