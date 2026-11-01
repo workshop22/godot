@@ -31,6 +31,8 @@
 #include "rendering_device_graph.h"
 
 #include "core/os/mutex.h"
+#include "core/os/os.h"
+#include "core/os/thread.h"
 #include "core/templates/hash_map.h"
 
 #ifdef DEBUG_ENABLED
@@ -58,6 +60,7 @@ struct RDGCheckpoint {
 	uint32_t timestamp = UINT32_MAX; // The renderer section (last render timestamp index).
 	uint32_t width = 0; // Draw-list render area.
 	uint32_t height = 0;
+	uint64_t usec = 0; // When it was recorded.
 };
 static constexpr uint32_t RDG_CHECKPOINT_RING = 1 << 18;
 static RDGCheckpoint rdg_checkpoints[RDG_CHECKPOINT_RING];
@@ -67,12 +70,21 @@ static uint64_t rdg_checkpoint_pipeline = 0;
 static uint32_t rdg_checkpoint_index = 0;
 static uint32_t rdg_checkpoint_width = 0;
 static uint32_t rdg_checkpoint_height = 0;
+struct RDGPipelineName {
+	String name;
+	uint64_t usec = 0; // Creation time.
+	uint64_t thread = 0;
+};
 static Mutex rdg_pipeline_names_mutex;
-static HashMap<uint64_t, String> rdg_pipeline_names;
+static HashMap<uint64_t, RDGPipelineName> rdg_pipeline_names;
 
 void rendering_device_graph_name_pipeline(uint64_t p_driver_pipeline, const String &p_name) {
+	RDGPipelineName entry;
+	entry.name = p_name;
+	entry.usec = OS::get_singleton()->get_ticks_usec();
+	entry.thread = Thread::get_caller_id();
 	MutexLock lock(rdg_pipeline_names_mutex);
-	rdg_pipeline_names[p_driver_pipeline] = p_name;
+	rdg_pipeline_names[p_driver_pipeline] = entry;
 }
 
 static void rdg_checkpoint(RDD::CommandBufferID p_command_buffer, uint32_t p_kind, uint32_t p_a = 0, uint32_t p_b = 0) {
@@ -89,6 +101,7 @@ static void rdg_checkpoint(RDD::CommandBufferID p_command_buffer, uint32_t p_kin
 	c.timestamp = rdg_checkpoint_timestamp;
 	c.width = rdg_checkpoint_width;
 	c.height = rdg_checkpoint_height;
+	c.usec = OS::get_singleton()->get_ticks_usec();
 	rendering_device_driver_vulkan_checkpoint(p_command_buffer.id, marker);
 }
 
@@ -121,8 +134,13 @@ String rendering_device_graph_checkpoint_describe(uint64_t p_marker) {
 	String pipeline;
 	if (c.kind >= 2000 && c.pipeline != 0) {
 		MutexLock lock(rdg_pipeline_names_mutex);
-		const String *name = rdg_pipeline_names.getptr(c.pipeline);
-		pipeline = vformat(" | pipeline 0x%x %s", c.pipeline, name ? *name : String("?"));
+		const RDGPipelineName *name = rdg_pipeline_names.getptr(c.pipeline);
+		if (name) {
+			// Age at recording, and whether a worker (not the recording thread's main/render id 1) made it.
+			pipeline = vformat(" | pipeline 0x%x %s | made %.1f ms before, thread %d", c.pipeline, name->name, double(int64_t(c.usec) - int64_t(name->usec)) / 1000.0, name->thread);
+		} else {
+			pipeline = vformat(" | pipeline 0x%x ?", c.pipeline);
+		}
 	}
 	const String section = c.timestamp == UINT32_MAX ? String("-") : vformat("%d %s", c.timestamp, rendering_device_timestamp_name(c.timestamp));
 	return kind + pipeline + " | section " + section;

@@ -4964,7 +4964,11 @@ RID RenderingDevice::render_pipeline_create(RID p_shader, FramebufferFormatID p_
 
 #if defined(VULKAN_ENABLED)
 	if (pipeline.driver_id) {
-		rendering_device_graph_name_pipeline(pipeline.driver_id.id, shader->name);
+		String sc;
+		for (const PipelineSpecializationConstant &c : p_specialization_constants) {
+			sc += vformat(" %d=0x%x", c.constant_id, c.int_value);
+		}
+		rendering_device_graph_name_pipeline(pipeline.driver_id.id, vformat("%s fb%d vf%d sc{%s }", shader->name, int64_t(p_framebuffer_format), int64_t(p_vertex_format), sc));
 	}
 #endif
 	// Don't print error when it's expected.
