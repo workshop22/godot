@@ -8504,6 +8504,12 @@ Error RenderingDevice::initialize(RenderingContextDriver *p_context, DisplayServ
 	ERR_FAIL_COND_V(!main_queue, FAILED);
 
 	transfer_queue_family = driver->command_queue_family_get(RDD::COMMAND_QUEUE_FAMILY_TRANSFER_BIT);
+	// Diagnostic (engine-pin lane): LIGHTRIDERS_TRANSFER_ON_MAIN_FAMILY=1 records uploads for the main queue family (the
+	// graphics engine), so no resource is written by one queue family and used by another without an ownership transfer.
+	if (OS::get_singleton()->has_environment("LIGHTRIDERS_TRANSFER_ON_MAIN_FAMILY")) {
+		transfer_queue_family = RDD::CommandQueueFamilyID();
+		print_line("TRANSFER_ON_MAIN_FAMILY");
+	}
 	if (!transfer_queue_family) {
 		// Use main queue family if transfer queue family is not supported.
 		transfer_queue_family = main_queue_family;
