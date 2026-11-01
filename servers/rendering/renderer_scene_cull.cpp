@@ -39,6 +39,8 @@
 #include "servers/rendering/rendering_server.h"
 #include "servers/rendering/rendering_server_default.h"
 
+#include "core/os/os.h"
+
 #ifndef XR_DISABLED
 #include "servers/xr/xr_interface.h"
 #include "servers/xr/xr_server.h"
