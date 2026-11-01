@@ -74,6 +74,20 @@
 // pipeline worker thread; many variants never get one. One lock guards the deferred parse.
 static Mutex respv_parse_mutex;
 
+#if defined(VULKAN_ENABLED)
+// Diagnostic (engine-pin lane): with LIGHTRIDERS_NV_CHECKPOINTS set, VK_NV_device_diagnostic_checkpoints marks every
+// recorded command and draw (rendering_device_graph.cpp numbers them); a device loss prints, per queue, the last marker
+// each pipeline stage reached, so the faulting work lies between the bottom- and top-of-pipe markers.
+static PFN_vkCmdSetCheckpointNV rdd_vk_cmd_set_checkpoint = nullptr;
+static PFN_vkGetQueueCheckpointDataNV rdd_vk_get_queue_checkpoint_data = nullptr;
+bool rdd_vulkan_checkpoints = false;
+void rendering_device_driver_vulkan_checkpoint(uint64_t p_cmd_buffer_id, uint64_t p_marker) {
+	// CommandBufferInfo begins with its VkCommandBuffer.
+	rdd_vk_cmd_set_checkpoint(*reinterpret_cast<VkCommandBuffer *>(p_cmd_buffer_id), reinterpret_cast<void *>(uintptr_t(p_marker)));
+}
+String rendering_device_graph_checkpoint_describe(uint64_t p_marker);
+#endif
+
 // Record numerous statistics about pipeline creation such as time and shader sizes. When combined with enabling
 // and disabling re-spirv, this can be used to measure its effects.
 #define RECORD_PIPELINE_STATISTICS 0
@@ -607,6 +621,11 @@ Error RenderingDeviceDriverVulkan::_initialize_device_extensions() {
 	}
 #endif
 	_register_requested_device_extension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME, false);
+#if defined(VULKAN_ENABLED)
+	if (OS::get_singleton()->has_environment("LIGHTRIDERS_NV_CHECKPOINTS")) {
+		_register_requested_device_extension(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME, false);
+	}
+#endif
 
 	{
 		// Debug marker extensions.
@@ -1565,6 +1584,14 @@ Error RenderingDeviceDriverVulkan::_initialize_device(const LocalVector<VkDevice
 		if (device_fault_support) {
 			device_functions.GetDeviceFaultInfoEXT = (PFN_vkGetDeviceFaultInfoEXT)functions.GetDeviceProcAddr(vk_device, "vkGetDeviceFaultInfoEXT");
 		}
+#if defined(VULKAN_ENABLED)
+		if (enabled_device_extension_names.has(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME)) {
+			rdd_vk_cmd_set_checkpoint = (PFN_vkCmdSetCheckpointNV)functions.GetDeviceProcAddr(vk_device, "vkCmdSetCheckpointNV");
+			rdd_vk_get_queue_checkpoint_data = (PFN_vkGetQueueCheckpointDataNV)functions.GetDeviceProcAddr(vk_device, "vkGetQueueCheckpointDataNV");
+			rdd_vulkan_checkpoints = rdd_vk_cmd_set_checkpoint != nullptr && rdd_vk_get_queue_checkpoint_data != nullptr;
+			print_line(vformat("NV_CHECKPOINTS %s", rdd_vulkan_checkpoints ? "enabled" : "unavailable"));
+		}
+#endif
 
 		// Device raytracing extensions.
 		if (enabled_device_extension_names.has(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME)) {
@@ -7068,6 +7095,48 @@ String rendering_device_graph_label_breadcrumb_name(uint32_t p_id);
 #endif
 
 void RenderingDeviceDriverVulkan::print_lost_device_info() {
+#if defined(VULKAN_ENABLED)
+	if (rdd_vulkan_checkpoints) {
+		for (uint32_t family = 0; family < queue_families.size(); family++) {
+			for (uint32_t index = 0; index < queue_families[family].size(); index++) {
+				uint32_t count = 0;
+				rdd_vk_get_queue_checkpoint_data(queue_families[family][index].queue, &count, nullptr);
+				LocalVector<VkCheckpointDataNV> data;
+				data.resize(count);
+				for (VkCheckpointDataNV &d : data) {
+					d = {};
+					d.sType = VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV;
+				}
+				if (count > 0) {
+					rdd_vk_get_queue_checkpoint_data(queue_families[family][index].queue, &count, data.ptr());
+				}
+				String msg = vformat("NV checkpoints, queue family %d index %d: %d stage(s)", family, index, count);
+				uint64_t low = UINT64_MAX;
+				uint64_t high = 0;
+				for (uint32_t k = 0; k < count; k++) {
+					const uint64_t marker = uint64_t(uintptr_t(data[k].pCheckpointMarker));
+					msg += vformat("\n   stage 0x%x: #%d %s", uint64_t(data[k].stage), marker, rendering_device_graph_checkpoint_describe(marker));
+					if (marker != 0) {
+						low = MIN(low, marker);
+						high = MAX(high, marker);
+					}
+				}
+				if (high > 0) {
+					// The work between the stages: what had entered the pipe but not left it (both ends when long).
+					msg += vformat("\n   in flight #%d..#%d:", low, high);
+					for (uint64_t m = low; m <= high; m++) {
+						if (high - low > 128 && m == low + 80) {
+							msg += vformat("\n      ... %d more ...", high - 40 - m);
+							m = high - 40;
+						}
+						msg += vformat("\n      #%d %s", m, rendering_device_graph_checkpoint_describe(m));
+					}
+				}
+				_err_print_error_asap(msg);
+			}
+		}
+	}
+#endif
 #if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
 	{
 		String error_msg = "Printing last known breadcrumbs in reverse order (last executed first).";

@@ -4820,6 +4820,15 @@ bool RenderingDevice::uniform_sets_have_linear_pools() const {
 /**** PIPELINES ****/
 /*******************/
 
+#if defined(VULKAN_ENABLED)
+// Diagnostic (engine-pin lane): checkpoint reports name pipelines by their shader; render timestamps by their name.
+void rendering_device_graph_name_pipeline(uint64_t p_driver_pipeline, const String &p_name);
+static String rd_timestamp_names[4096];
+String rendering_device_timestamp_name(uint32_t p_index) {
+	return p_index < std_size(rd_timestamp_names) ? rd_timestamp_names[p_index] : String();
+}
+#endif
+
 RID RenderingDevice::render_pipeline_create(RID p_shader, FramebufferFormatID p_framebuffer_format, VertexFormatID p_vertex_format, RenderPrimitive p_render_primitive, const PipelineRasterizationState &p_rasterization_state, const PipelineMultisampleState &p_multisample_state, const PipelineDepthStencilState &p_depth_stencil_state, const PipelineColorBlendState &p_blend_state, BitField<PipelineDynamicStateFlags> p_dynamic_state_flags, uint32_t p_for_render_pass, const Vector<PipelineSpecializationConstant> &p_specialization_constants) {
 	// Needs a shader.
 	Shader *shader = shader_owner.get_or_null(p_shader);
@@ -4953,6 +4962,11 @@ RID RenderingDevice::render_pipeline_create(RID p_shader, FramebufferFormatID p_
 			p_for_render_pass,
 			p_specialization_constants);
 
+#if defined(VULKAN_ENABLED)
+	if (pipeline.driver_id) {
+		rendering_device_graph_name_pipeline(pipeline.driver_id.id, shader->name);
+	}
+#endif
 	// Don't print error when it's expected.
 	if (unlikely(!pipeline.driver_id && driver->get_driver_workarounds().dont_print_on_render_pipeline_creation_failure)) {
 		return RID();
@@ -5047,6 +5061,9 @@ RID RenderingDevice::compute_pipeline_create(RID p_shader, const Vector<Pipeline
 	ComputePipeline pipeline;
 	pipeline.driver_id = driver->compute_pipeline_create(shader->driver_id, p_specialization_constants);
 	ERR_FAIL_COND_V(!pipeline.driver_id, RID());
+#if defined(VULKAN_ENABLED)
+	rendering_device_graph_name_pipeline(pipeline.driver_id.id, shader->name);
+#endif
 
 	if (pipeline_cache_enabled) {
 		update_pipeline_cache();
@@ -8746,6 +8763,11 @@ void RenderingDevice::capture_timestamp(const String &p_name) {
 			named[index] = p_name;
 			print_line(vformat("TIMESTAMP_INDEX %d %s", index, p_name));
 		}
+	}
+#endif
+#if defined(VULKAN_ENABLED)
+	if (frames[frame].timestamp_count < std_size(rd_timestamp_names) && rd_timestamp_names[frames[frame].timestamp_count] != p_name) {
+		rd_timestamp_names[frames[frame].timestamp_count] = p_name;
 	}
 #endif
 	frames[frame].timestamp_cpu_values[frames[frame].timestamp_count] = OS::get_singleton()->get_ticks_usec();

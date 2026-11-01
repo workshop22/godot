@@ -30,6 +30,9 @@
 
 #include "rendering_device_graph.h"
 
+#include "core/os/mutex.h"
+#include "core/templates/hash_map.h"
+
 #ifdef DEBUG_ENABLED
 // Diagnostic: the debug-label name behind each label breadcrumb (DEBUG_PASS | 0x8000 | id), read by the device-loss
 // report. Labels are recorded only with Vulkan debug utils (--verbose).
@@ -37,6 +40,88 @@ static String rdg_label_breadcrumbs[0x8000];
 static uint32_t rdg_label_breadcrumb_next = 0;
 String rendering_device_graph_label_breadcrumb_name(uint32_t p_id) {
 	return rdg_label_breadcrumbs[p_id & 0x7FFF];
+}
+#endif
+
+#if defined(VULKAN_ENABLED)
+// Diagnostic (engine-pin lane): NVIDIA checkpoints (LIGHTRIDERS_NV_CHECKPOINTS). Every recorded command, draw and
+// dispatch gets a sequence number as its checkpoint marker; this ring keeps what each number was, for the report.
+extern bool rdd_vulkan_checkpoints;
+void rendering_device_driver_vulkan_checkpoint(uint64_t p_cmd_buffer_id, uint64_t p_marker);
+String rendering_device_timestamp_name(uint32_t p_index);
+struct RDGCheckpoint {
+	uint64_t pipeline = 0;
+	uint32_t kind = 0; // 1000 + recorded command type, 2000 + draw-list instruction, 3000 + compute-list instruction.
+	uint32_t index = 0; // Draw or dispatch number inside its list.
+	uint32_t a = 0; // Vertex/index count or x groups.
+	uint32_t b = 0; // Instance count or y groups.
+	uint32_t timestamp = UINT32_MAX; // The renderer section (last render timestamp index).
+	uint32_t width = 0; // Draw-list render area.
+	uint32_t height = 0;
+};
+static constexpr uint32_t RDG_CHECKPOINT_RING = 1 << 18;
+static RDGCheckpoint rdg_checkpoints[RDG_CHECKPOINT_RING];
+static uint64_t rdg_checkpoint_next = 1;
+static uint32_t rdg_checkpoint_timestamp = UINT32_MAX;
+static uint64_t rdg_checkpoint_pipeline = 0;
+static uint32_t rdg_checkpoint_index = 0;
+static uint32_t rdg_checkpoint_width = 0;
+static uint32_t rdg_checkpoint_height = 0;
+static Mutex rdg_pipeline_names_mutex;
+static HashMap<uint64_t, String> rdg_pipeline_names;
+
+void rendering_device_graph_name_pipeline(uint64_t p_driver_pipeline, const String &p_name) {
+	MutexLock lock(rdg_pipeline_names_mutex);
+	rdg_pipeline_names[p_driver_pipeline] = p_name;
+}
+
+static void rdg_checkpoint(RDD::CommandBufferID p_command_buffer, uint32_t p_kind, uint32_t p_a = 0, uint32_t p_b = 0) {
+	if (!rdd_vulkan_checkpoints) {
+		return;
+	}
+	const uint64_t marker = rdg_checkpoint_next++;
+	RDGCheckpoint &c = rdg_checkpoints[marker & (RDG_CHECKPOINT_RING - 1)];
+	c.pipeline = rdg_checkpoint_pipeline;
+	c.kind = p_kind;
+	c.index = rdg_checkpoint_index;
+	c.a = p_a;
+	c.b = p_b;
+	c.timestamp = rdg_checkpoint_timestamp;
+	c.width = rdg_checkpoint_width;
+	c.height = rdg_checkpoint_height;
+	rendering_device_driver_vulkan_checkpoint(p_command_buffer.id, marker);
+}
+
+String rendering_device_graph_checkpoint_describe(uint64_t p_marker) {
+	if (p_marker == 0 || p_marker >= rdg_checkpoint_next || rdg_checkpoint_next - p_marker > RDG_CHECKPOINT_RING) {
+		return "(not in the ring)";
+	}
+	// Same order as the enums in rendering_device_graph.h.
+	static const char *commands[] = { "none", "blas build", "tlas build", "buffer clear", "buffer copy", "buffer get data", "buffer update", "compute list", "raytracing list", "draw list", "texture clear color", "texture clear depth/stencil", "texture copy", "texture get data", "texture resolve", "texture update", "timestamp", "driver callback" };
+	static const char *draws[] = { "none", "bind index buffer", "bind pipeline", "bind uniform sets", "bind vertex buffers", "clear attachments", "draw", "draw indexed", "draw indirect", "draw indexed indirect", "execute commands", "next subpass", "set blend constants", "set line width", "set push constant", "set scissor", "set viewport", "uniform set prepare" };
+	static const char *dispatches[] = { "none", "bind pipeline", "bind uniform sets", "dispatch", "dispatch indirect", "set push constant", "uniform set prepare" };
+	const RDGCheckpoint &c = rdg_checkpoints[p_marker & (RDG_CHECKPOINT_RING - 1)];
+	String kind;
+	if (c.kind >= 3000) {
+		kind = (c.kind - 3000) < std_size(dispatches) ? dispatches[c.kind - 3000] : "compute ?";
+		kind = vformat("compute %s #%d (%d x %d groups)", kind, c.index, c.a, c.b);
+	} else if (c.kind >= 2000) {
+		kind = (c.kind - 2000) < std_size(draws) ? draws[c.kind - 2000] : "draw ?";
+		kind = vformat("%s #%d (%d x %d) area %dx%d", kind, c.index, c.a, c.b, c.width, c.height);
+	} else {
+		kind = (c.kind - 1000) < std_size(commands) ? commands[c.kind - 1000] : "command ?";
+		if (c.kind == 1000 + RecordedCommand::TYPE_DRAW_LIST) {
+			kind += vformat(" area %dx%d", c.width, c.height);
+		}
+	}
+	String pipeline;
+	if (c.kind >= 2000 && c.pipeline != 0) {
+		MutexLock lock(rdg_pipeline_names_mutex);
+		const String *name = rdg_pipeline_names.getptr(c.pipeline);
+		pipeline = vformat(" | pipeline 0x%x %s", c.pipeline, name ? *name : String("?"));
+	}
+	const String section = c.timestamp == UINT32_MAX ? String("-") : vformat("%d %s", c.timestamp, rendering_device_timestamp_name(c.timestamp));
+	return kind + pipeline + " | section " + section;
 }
 #endif
 
@@ -855,6 +940,9 @@ void RenderingDeviceGraph::_run_compute_list_command(RDD::CommandBufferID p_comm
 			case ComputeListInstruction::TYPE_BIND_PIPELINE: {
 				const ComputeListBindPipelineInstruction *bind_pipeline_instruction = reinterpret_cast<const ComputeListBindPipelineInstruction *>(instruction);
 				driver->command_bind_compute_pipeline(p_command_buffer, bind_pipeline_instruction->pipeline);
+#if defined(VULKAN_ENABLED)
+				rdg_checkpoint_pipeline = bind_pipeline_instruction->pipeline.id;
+#endif
 				instruction_data_cursor += sizeof(ComputeListBindPipelineInstruction);
 			} break;
 			case ComputeListInstruction::TYPE_BIND_UNIFORM_SETS: {
@@ -864,11 +952,19 @@ void RenderingDeviceGraph::_run_compute_list_command(RDD::CommandBufferID p_comm
 			} break;
 			case ComputeListInstruction::TYPE_DISPATCH: {
 				const ComputeListDispatchInstruction *dispatch_instruction = reinterpret_cast<const ComputeListDispatchInstruction *>(instruction);
+#if defined(VULKAN_ENABLED)
+				rdg_checkpoint(p_command_buffer, 3000 + ComputeListInstruction::TYPE_DISPATCH, dispatch_instruction->x_groups, dispatch_instruction->y_groups);
+				rdg_checkpoint_index++;
+#endif
 				driver->command_compute_dispatch(p_command_buffer, dispatch_instruction->x_groups, dispatch_instruction->y_groups, dispatch_instruction->z_groups);
 				instruction_data_cursor += sizeof(ComputeListDispatchInstruction);
 			} break;
 			case ComputeListInstruction::TYPE_DISPATCH_INDIRECT: {
 				const ComputeListDispatchIndirectInstruction *dispatch_indirect_instruction = reinterpret_cast<const ComputeListDispatchIndirectInstruction *>(instruction);
+#if defined(VULKAN_ENABLED)
+				rdg_checkpoint(p_command_buffer, 3000 + ComputeListInstruction::TYPE_DISPATCH_INDIRECT);
+				rdg_checkpoint_index++;
+#endif
 				driver->command_compute_dispatch_indirect(p_command_buffer, dispatch_indirect_instruction->buffer, dispatch_indirect_instruction->offset);
 				instruction_data_cursor += sizeof(ComputeListDispatchIndirectInstruction);
 			} break;
@@ -948,6 +1044,9 @@ void RenderingDeviceGraph::_run_draw_list_command(RDD::CommandBufferID p_command
 			case DrawListInstruction::TYPE_BIND_PIPELINE: {
 				const DrawListBindPipelineInstruction *bind_pipeline_instruction = reinterpret_cast<const DrawListBindPipelineInstruction *>(instruction);
 				driver->command_bind_render_pipeline(p_command_buffer, bind_pipeline_instruction->pipeline);
+#if defined(VULKAN_ENABLED)
+				rdg_checkpoint_pipeline = bind_pipeline_instruction->pipeline.id;
+#endif
 				instruction_data_cursor += sizeof(DrawListBindPipelineInstruction);
 			} break;
 			case DrawListInstruction::TYPE_BIND_UNIFORM_SETS: {
@@ -966,6 +1065,10 @@ void RenderingDeviceGraph::_run_draw_list_command(RDD::CommandBufferID p_command
 				const DrawListClearAttachmentsInstruction *clear_attachments_instruction = reinterpret_cast<const DrawListClearAttachmentsInstruction *>(instruction);
 				const VectorView attachments_clear_view(clear_attachments_instruction->attachments_clear(), clear_attachments_instruction->attachments_clear_count);
 				const VectorView attachments_clear_rect_view(clear_attachments_instruction->attachments_clear_rect(), clear_attachments_instruction->attachments_clear_rect_count);
+#if defined(VULKAN_ENABLED)
+				rdg_checkpoint(p_command_buffer, 2000 + DrawListInstruction::TYPE_CLEAR_ATTACHMENTS, 0, 0);
+				rdg_checkpoint_index++;
+#endif
 				driver->command_render_clear_attachments(p_command_buffer, attachments_clear_view, attachments_clear_rect_view);
 				instruction_data_cursor += sizeof(DrawListClearAttachmentsInstruction);
 				instruction_data_cursor += sizeof(RDD::AttachmentClear) * clear_attachments_instruction->attachments_clear_count;
@@ -973,21 +1076,37 @@ void RenderingDeviceGraph::_run_draw_list_command(RDD::CommandBufferID p_command
 			} break;
 			case DrawListInstruction::TYPE_DRAW: {
 				const DrawListDrawInstruction *draw_instruction = reinterpret_cast<const DrawListDrawInstruction *>(instruction);
+#if defined(VULKAN_ENABLED)
+				rdg_checkpoint(p_command_buffer, 2000 + DrawListInstruction::TYPE_DRAW, draw_instruction->vertex_count, draw_instruction->instance_count);
+				rdg_checkpoint_index++;
+#endif
 				driver->command_render_draw(p_command_buffer, draw_instruction->vertex_count, draw_instruction->instance_count, 0, 0);
 				instruction_data_cursor += sizeof(DrawListDrawInstruction);
 			} break;
 			case DrawListInstruction::TYPE_DRAW_INDEXED: {
 				const DrawListDrawIndexedInstruction *draw_indexed_instruction = reinterpret_cast<const DrawListDrawIndexedInstruction *>(instruction);
+#if defined(VULKAN_ENABLED)
+				rdg_checkpoint(p_command_buffer, 2000 + DrawListInstruction::TYPE_DRAW_INDEXED, draw_indexed_instruction->index_count, draw_indexed_instruction->instance_count);
+				rdg_checkpoint_index++;
+#endif
 				driver->command_render_draw_indexed(p_command_buffer, draw_indexed_instruction->index_count, draw_indexed_instruction->instance_count, draw_indexed_instruction->first_index, 0, 0);
 				instruction_data_cursor += sizeof(DrawListDrawIndexedInstruction);
 			} break;
 			case DrawListInstruction::TYPE_DRAW_INDIRECT: {
 				const DrawListDrawIndirectInstruction *draw_indirect_instruction = reinterpret_cast<const DrawListDrawIndirectInstruction *>(instruction);
+#if defined(VULKAN_ENABLED)
+				rdg_checkpoint(p_command_buffer, 2000 + DrawListInstruction::TYPE_DRAW_INDIRECT, draw_indirect_instruction->draw_count, 0);
+				rdg_checkpoint_index++;
+#endif
 				driver->command_render_draw_indirect(p_command_buffer, draw_indirect_instruction->buffer, draw_indirect_instruction->offset, draw_indirect_instruction->draw_count, draw_indirect_instruction->stride);
 				instruction_data_cursor += sizeof(DrawListDrawIndirectInstruction);
 			} break;
 			case DrawListInstruction::TYPE_DRAW_INDEXED_INDIRECT: {
 				const DrawListDrawIndexedIndirectInstruction *draw_indexed_indirect_instruction = reinterpret_cast<const DrawListDrawIndexedIndirectInstruction *>(instruction);
+#if defined(VULKAN_ENABLED)
+				rdg_checkpoint(p_command_buffer, 2000 + DrawListInstruction::TYPE_DRAW_INDEXED_INDIRECT, draw_indexed_indirect_instruction->draw_count, 0);
+				rdg_checkpoint_index++;
+#endif
 				driver->command_render_draw_indexed_indirect(p_command_buffer, draw_indexed_indirect_instruction->buffer, draw_indexed_indirect_instruction->offset, draw_indexed_indirect_instruction->draw_count, draw_indexed_indirect_instruction->stride);
 				instruction_data_cursor += sizeof(DrawListDrawIndexedIndirectInstruction);
 			} break;
@@ -1089,6 +1208,21 @@ void RenderingDeviceGraph::_run_render_commands(int32_t p_level, const RecordedC
 		const uint32_t command_data_offset = command_data_offsets[command_index];
 		const RecordedCommand *command = reinterpret_cast<const RecordedCommand *>(&command_data[command_data_offset]);
 		_run_label_command_change(r_command_buffer, command->label_index, p_level, false, true, &p_sorted_commands[i], p_sorted_commands_count - i, r_current_label_index, r_current_label_level);
+#if defined(VULKAN_ENABLED)
+		rdg_checkpoint_index = 0;
+		rdg_checkpoint_pipeline = 0;
+		if (command->type == RecordedCommand::TYPE_DRAW_LIST) {
+			const Rect2i region = reinterpret_cast<const RecordedDrawListCommand *>(command)->region;
+			rdg_checkpoint_width = region.size.width;
+			rdg_checkpoint_height = region.size.height;
+		} else if (command->type == RecordedCommand::TYPE_CAPTURE_TIMESTAMP) {
+			rdg_checkpoint_timestamp = reinterpret_cast<const RecordedCaptureTimestampCommand *>(command)->index;
+		}
+		if (command->type != RecordedCommand::TYPE_DRAW_LIST) {
+			// A draw list is marked after its command buffer split and render pass begin, below.
+			rdg_checkpoint(r_command_buffer, 1000 + command->type);
+		}
+#endif
 
 		switch (command->type) {
 			case RecordedCommand::TYPE_BOTTOM_LEVEL_ACCELERATION_STRUCTURE_BUILD: {
@@ -1189,6 +1323,9 @@ void RenderingDeviceGraph::_run_render_commands(int32_t p_level, const RecordedC
 				}
 
 				if (framebuffer && render_pass) {
+#if defined(VULKAN_ENABLED)
+					rdg_checkpoint(r_command_buffer, 1000 + RecordedCommand::TYPE_DRAW_LIST);
+#endif
 					driver->command_begin_render_pass(r_command_buffer, render_pass, framebuffer, draw_list_command->command_buffer_type, draw_list_command->region, clear_values);
 					_run_draw_list_command(r_command_buffer, draw_list_command->instruction_data(), draw_list_command->instruction_data_size);
 					driver->command_end_render_pass(r_command_buffer);
