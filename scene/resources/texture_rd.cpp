@@ -166,8 +166,15 @@ bool TextureLayeredRD::has_mipmaps() const {
 
 RID TextureLayeredRD::get_rid() const {
 	if (texture_rid.is_null()) {
-		// We are in trouble, create something temporary.
-		texture_rid = RenderingServer::get_singleton()->texture_2d_placeholder_create();
+		// We are in trouble, create something temporary, of this texture's own type: a 2D placeholder bound
+		// where the shader declares an array or cube sampler is an image view type mismatch.
+		RSE::TextureLayeredType rs_layer_type = RSE::TEXTURE_LAYERED_2D_ARRAY;
+		if (layer_type == LAYERED_TYPE_CUBEMAP) {
+			rs_layer_type = RSE::TEXTURE_LAYERED_CUBEMAP;
+		} else if (layer_type == LAYERED_TYPE_CUBEMAP_ARRAY) {
+			rs_layer_type = RSE::TEXTURE_LAYERED_CUBEMAP_ARRAY;
+		}
+		texture_rid = RenderingServer::get_singleton()->texture_2d_layered_placeholder_create(rs_layer_type);
 	}
 
 	return texture_rid;
@@ -293,8 +300,8 @@ bool Texture3DRD::has_mipmaps() const {
 
 RID Texture3DRD::get_rid() const {
 	if (texture_rid.is_null()) {
-		// We are in trouble, create something temporary.
-		texture_rid = RenderingServer::get_singleton()->texture_2d_placeholder_create();
+		// We are in trouble, create something temporary: a 3D placeholder, as a sampler3D expects.
+		texture_rid = RenderingServer::get_singleton()->texture_3d_placeholder_create();
 	}
 
 	return texture_rid;
