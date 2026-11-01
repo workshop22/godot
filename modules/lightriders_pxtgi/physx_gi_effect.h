@@ -247,6 +247,13 @@ private:
 	bool hw_active = false; // the hardware variants run this frame
 	bool hw_guarded = false; // this session wrote the crash guard
 	bool _hw_compile(RenderingDevice *p_rd);
+	bool _hw_self_test(RenderingDevice *p_rd);
+	// Render-thread timing (PXTGI_RT_TIMING=1): this effect's recording, its hardware update and the time between frames.
+	uint64_t rt_last_us = 0;
+	uint64_t hw_static_us = 0;
+	uint64_t hw_moving_us = 0;
+	uint64_t hw_update_us = 0;
+	void _render_frame(int p_callback_type, const RenderData *p_render_data);
 	bool _hw_update(RenderingDevice *p_rd, const Snapshot &p_snapshot);
 	bool _hw_instance(const Snapshot &p_snapshot, int p_slot, RD::AccelerationStructureInstance &r_instance) const;
 	void _hw_free(RenderingDevice *p_rd);

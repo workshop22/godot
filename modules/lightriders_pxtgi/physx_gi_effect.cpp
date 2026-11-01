@@ -2142,6 +2142,69 @@ void PhysXGIEffect::_hw_free(RenderingDevice *p_rd) {
 	}
 }
 
+// One ray against one box, read back once on the way in: the query must hit the box (custom index 7) four units away.
+bool PhysXGIEffect::_hw_self_test(RenderingDevice *p_rd) {
+	static const char *TEST = R"(
+#[compute]
+#version 460
+#extension GL_EXT_ray_query : require
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0) uniform accelerationStructureEXT scene;
+layout(std430, set = 0, binding = 1) restrict writeonly buffer Result {
+	vec4 v;
+}
+result;
+void main() {
+	rayQueryEXT q;
+	rayQueryInitializeEXT(q, scene, gl_RayFlagsOpaqueEXT, 0xFF, vec3(0.0, 0.0, -5.0), 0.0, vec3(0.0, 0.0, 1.0), 100.0);
+	while (rayQueryProceedEXT(q)) {
+	}
+	bool hit = rayQueryGetIntersectionTypeEXT(q, true) == gl_RayQueryCommittedIntersectionTriangleEXT;
+	result.v = vec4(hit ? rayQueryGetIntersectionTEXT(q, true) : -1.0, hit ? float(rayQueryGetIntersectionInstanceCustomIndexEXT(q, true)) : -1.0, 0.0, 1.0);
+}
+)";
+	Ref<RDShaderFile> file;
+	file.instantiate();
+	file->parse_versions_from_text(TEST);
+	Ref<RDShaderSPIRV> spirv = file->get_spirv();
+	ERR_FAIL_COND_V(spirv.is_null() || !spirv->get_stage_compile_error(RD::SHADER_STAGE_COMPUTE).is_empty(), false);
+	const RID shader = p_rd->shader_create_from_spirv(file->get_spirv_stages());
+	ERR_FAIL_COND_V(!shader.is_valid(), false);
+	const RID pipeline = p_rd->compute_pipeline_create(shader);
+	const RID tlas = p_rd->tlas_create(1, RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT);
+	RD::AccelerationStructureInstance instance;
+	instance.blas = hw_box_blas;
+	instance.id = 7;
+	instance.hit_sbt_range = RD::HitShaderBindingTableRange(uint64_t(1) << 32);
+	instance.flags = RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT | RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT;
+	const RID out = p_rd->storage_buffer_create(16);
+	bool passed = false;
+	if (pipeline.is_valid() && tlas.is_valid() && out.is_valid() && p_rd->tlas_build(tlas, Span<RD::AccelerationStructureInstance>(&instance, 1)) == OK) {
+		Vector<RD::Uniform> uniforms = { RD::Uniform(RD::UNIFORM_TYPE_ACCELERATION_STRUCTURE, 0, tlas), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 1, out) };
+		const RID set = p_rd->uniform_set_create(uniforms, shader, 0);
+		if (set.is_valid()) {
+			const RD::ComputeListID list = p_rd->compute_list_begin();
+			p_rd->compute_list_bind_compute_pipeline(list, pipeline);
+			p_rd->compute_list_bind_uniform_set(list, set, 0);
+			p_rd->compute_list_dispatch(list, 1, 1, 1);
+			p_rd->compute_list_end();
+			const Vector<uint8_t> bytes = p_rd->buffer_get_data(out);
+			if (bytes.size() >= 16) {
+				const float *v = (const float *)bytes.ptr();
+				passed = Math::abs(v[0] - 4.0f) < 0.01f && int(v[1] + 0.5f) == 7;
+				print_line(vformat("PXTGI: hardware trace self-test %s (t %.3f, instance %d).", passed ? "passed" : "FAILED", v[0], int(v[1] + 0.5f)));
+			}
+			p_rd->free_rid(set);
+		}
+	}
+	for (RID r : { out, tlas, pipeline, shader }) {
+		if (r.is_valid()) {
+			p_rd->free_rid(r);
+		}
+	}
+	return passed;
+}
+
 // The passes that trace the world, compiled again with ray queries.
 bool PhysXGIEffect::_hw_compile(RenderingDevice *p_rd) {
 	const String defines = RendererSceneRenderRD::get_singleton()->is_using_radiance_octmap_array() ? "#define SKY_OCTMAP_ARRAY\n" : "";
@@ -2246,6 +2309,15 @@ bool PhysXGIEffect::_hw_update(RenderingDevice *p_rd, const Snapshot &p_snapshot
 		geometry.vertex_format = RD::DATA_FORMAT_R32G32B32_SFLOAT;
 		hw_box_blas = p_rd->blas_create(Span<RD::AccelerationStructureGeometry>(&geometry, 1), RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT);
 		ERR_FAIL_COND_V(!hw_box_blas.is_valid() || p_rd->blas_build(hw_box_blas) != OK, false);
+		if (!_hw_self_test(p_rd)) {
+			print_line("PXTGI: the hardware trace self-test failed; tracing stays in software.");
+			return false;
+		}
+		if (OS::get_singleton()->has_environment("PXTGI_HW_FAIL_TEST")) {
+			// Proves the fallback: a build failure after everything above succeeded.
+			print_line("PXTGI: hardware structure failure (PXTGI_HW_FAIL_TEST); tracing stays in software.");
+			return false;
+		}
 		print_line(vformat("PXTGI: hardware tracing on (%s).", p_rd->get_device_name()));
 	}
 	// A structure for each mesh not seen before (its triangles as laid out in its geometry block: 16 bytes a corner).
@@ -2281,6 +2353,7 @@ bool PhysXGIEffect::_hw_update(RenderingDevice *p_rd, const Snapshot &p_snapshot
 	}
 	// The static shapes: their structure is rebuilt only when they really changed (the static part of the tree can be
 	// laid out again with the same shapes).
+	const uint64_t static_since = OS::get_singleton()->get_ticks_usec();
 	if (p_snapshot.static_version != hw_static_version || hw_static_tlas.is_null()) {
 		hw_static_version = p_snapshot.static_version;
 		const int count = p_snapshot.static_count;
@@ -2321,7 +2394,9 @@ bool PhysXGIEffect::_hw_update(RenderingDevice *p_rd, const Snapshot &p_snapshot
 			print_line(vformat("PXTGI: static structure, %d shapes in %.2f ms (frame %d).", count, (OS::get_singleton()->get_ticks_usec() - since) / 1000.0, int64_t(Engine::get_singleton()->get_frames_drawn())));
 		}
 	}
+	hw_static_us = OS::get_singleton()->get_ticks_usec() - static_since;
 	// The moving shapes, every frame (bikes, riders' walls).
+	const uint64_t moving_since = OS::get_singleton()->get_ticks_usec();
 	const int moving = p_snapshot.primitive_count - p_snapshot.static_count;
 	LocalVector<RD::AccelerationStructureInstance> instances;
 	instances.resize(MAX(moving, 1));
@@ -2347,6 +2422,7 @@ bool PhysXGIEffect::_hw_update(RenderingDevice *p_rd, const Snapshot &p_snapshot
 		ERR_FAIL_COND_V(!hw_moving_tlas.is_valid(), false);
 	}
 	ERR_FAIL_COND_V(p_rd->tlas_build(hw_moving_tlas, Span<RD::AccelerationStructureInstance>(instances.ptr(), instances.size())) != OK, false);
+	hw_moving_us = OS::get_singleton()->get_ticks_usec() - moving_since;
 	hw_failed = false;
 	return true;
 }
@@ -2505,7 +2581,28 @@ void PhysXGIEffect::_dispatch(RenderingDevice *p_rd, int p_pass, const Vector<RD
 	p_rd->compute_list_end();
 }
 
+static bool rt_timing() {
+	static const bool on = OS::get_singleton()->has_environment("PXTGI_RT_TIMING");
+	return on;
+}
+
+// The frame's recording, timed: with PXTGI_RT_TIMING set, a slow one (or a long gap since the last frame, which is the
+// render thread busy elsewhere) is printed with its parts.
 void PhysXGIEffect::_render(int p_callback_type, const RenderData *p_render_data) {
+	const uint64_t since = OS::get_singleton()->get_ticks_usec();
+	const uint64_t gap = rt_last_us > 0 ? since - rt_last_us : 0;
+	hw_static_us = 0;
+	hw_moving_us = 0;
+	hw_update_us = 0;
+	_render_frame(p_callback_type, p_render_data);
+	const uint64_t now = OS::get_singleton()->get_ticks_usec();
+	rt_last_us = now;
+	if (rt_timing() && (now - since > 8000 || gap > 40000)) {
+		print_line(vformat("PXTGI_RT frame %d: since last frame %.1f ms, GI recording %.1f ms (hardware update %.1f: static %.1f, moving %.1f)", int64_t(Engine::get_singleton()->get_frames_drawn()), gap / 1000.0, (now - since) / 1000.0, hw_update_us / 1000.0, hw_static_us / 1000.0, hw_moving_us / 1000.0));
+	}
+}
+
+void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_render_data) {
 	Snapshot s;
 	{
 		MutexLock lock(mutex);
@@ -2711,7 +2808,9 @@ void PhysXGIEffect::_render(int p_callback_type, const RenderData *p_render_data
 	data.hw[0] = float(s.moving_root);
 	// Hardware tracing for this frame's world rays (trace, reflect, cache) when it is asked for and everything is up
 	// to date; the software walk otherwise.
+	const uint64_t hw_since = OS::get_singleton()->get_ticks_usec();
 	hw_active = (s.trace_mode == 2 || s.trace_mode == 3) && _hw_update(rd, s);
+	hw_update_us = OS::get_singleton()->get_ticks_usec() - hw_since;
 	data.counts[2] = s.omni_count;
 	data.counts[3] = s.spot_count;
 	for (int i = 0; i < s.spot_count; i++) {
