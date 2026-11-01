@@ -97,6 +97,19 @@ void rendering_device_driver_vulkan_checkpoint(uint64_t p_cmd_buffer_id, uint64_
 		rdd_vk_cmd_set_checkpoint(command_buffer, reinterpret_cast<void *>(uintptr_t(p_marker)));
 	}
 }
+// Transfer-worker uploads (copy engine, recorded on loader threads) mark their own slots: 32 x (top, bottom) after the
+// graph's pair, so a loss shows whether an upload was in flight on the transfer queue.
+static constexpr uint32_t RDD_MARKER_TRANSFER_SLOTS = 32;
+void rendering_device_driver_vulkan_transfer_marker(uint64_t p_cmd_buffer_id, uint32_t p_slot, uint32_t p_marker) {
+	if (rdd_marker_vk_buffer == VK_NULL_HANDLE) {
+		return;
+	}
+	const VkCommandBuffer command_buffer = *reinterpret_cast<VkCommandBuffer *>(p_cmd_buffer_id);
+	const VkDeviceSize offset = (2 + 2 * (p_slot % RDD_MARKER_TRANSFER_SLOTS)) * sizeof(uint32_t);
+	rdd_vk_cmd_write_buffer_marker(command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, rdd_marker_vk_buffer, offset, p_marker);
+	rdd_vk_cmd_write_buffer_marker(command_buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, rdd_marker_vk_buffer, offset + sizeof(uint32_t), p_marker);
+}
+String rendering_device_transfer_marker_describe(uint32_t p_marker);
 String rendering_device_graph_checkpoint_describe(uint64_t p_marker);
 uint64_t rendering_device_graph_checkpoint_latest();
 #endif
@@ -1956,7 +1969,7 @@ Error RenderingDeviceDriverVulkan::initialize(uint32_t p_device_index, uint32_t 
 #endif
 #if defined(VULKAN_ENABLED)
 	if (rdd_vulkan_checkpoints && rdd_vk_cmd_write_buffer_marker != nullptr) {
-		marker_buffer = buffer_create(4u * sizeof(uint32_t), BufferUsageBits::BUFFER_USAGE_TRANSFER_TO_BIT, MemoryAllocationType::MEMORY_ALLOCATION_TYPE_CPU, UINT64_MAX);
+		marker_buffer = buffer_create((2u + 2u * RDD_MARKER_TRANSFER_SLOTS) * sizeof(uint32_t), BufferUsageBits::BUFFER_USAGE_TRANSFER_TO_BIT, MemoryAllocationType::MEMORY_ALLOCATION_TYPE_CPU, UINT64_MAX);
 		rdd_marker_vk_buffer = ((BufferInfo *)marker_buffer.id)->vk_buffer;
 		print_line("NV_CHECKPOINTS via VK_AMD_buffer_marker");
 	}
@@ -7130,11 +7143,29 @@ void RenderingDeviceDriverVulkan::print_lost_device_info() {
 	if (rdd_marker_vk_buffer != VK_NULL_HANDLE) {
 		void *ptr = nullptr;
 		const VmaAllocation allocation = ((BufferInfo *)marker_buffer.id)->allocation.handle;
-		vmaInvalidateAllocation(allocator, allocation, 0, 4u * sizeof(uint32_t));
+		vmaInvalidateAllocation(allocator, allocation, 0, (2u + 2u * RDD_MARKER_TRANSFER_SLOTS) * sizeof(uint32_t));
 		if (vmaMapMemory(allocator, allocation, &ptr) == VK_SUCCESS) {
 			const uint32_t top = ((const uint32_t *)ptr)[0];
 			const uint32_t bottom = ((const uint32_t *)ptr)[1];
+			uint32_t transfer[2 * RDD_MARKER_TRANSFER_SLOTS];
+			memcpy(transfer, ((const uint32_t *)ptr) + 2, sizeof(transfer));
 			vmaUnmapMemory(allocator, allocation);
+			{
+				String tmsg = "Transfer-worker upload markers (slot: top / bottom):";
+				for (uint32_t slot = 0; slot < RDD_MARKER_TRANSFER_SLOTS; slot++) {
+					const uint32_t t = transfer[slot * 2];
+					const uint32_t b = transfer[slot * 2 + 1];
+					if (t == 0 && b == 0) {
+						continue;
+					}
+					tmsg += vformat("\n   slot %d: top %d / bottom %d%s", slot, t, b, t != b ? "  << IN FLIGHT" : "");
+					tmsg += "\n      top    " + rendering_device_transfer_marker_describe(t);
+					if (t != b) {
+						tmsg += "\n      bottom " + rendering_device_transfer_marker_describe(b);
+					}
+				}
+				_err_print_error_asap(tmsg);
+			}
 			// Markers are the low 32 bits of the checkpoint sequence; rebuild them against the latest number.
 			const uint64_t latest = rendering_device_graph_checkpoint_latest();
 			const uint64_t top64 = (latest & ~uint64_t(UINT32_MAX)) | top;

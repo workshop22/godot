@@ -37,6 +37,7 @@
 #include "core/io/file_access.h"
 #include "core/object/class_db.h"
 #include "core/os/os.h"
+#include "core/os/thread.h"
 #include "core/profiling/profiling.h"
 #include "core/templates/fixed_vector.h"
 #include "servers/rendering/rendering_device_binds.h"
@@ -857,6 +858,11 @@ RenderingDevice::Buffer *RenderingDevice::_get_buffer_from_owner(RID p_buffer) {
 	return buffer;
 }
 
+#if defined(VULKAN_ENABLED)
+// Diagnostic (engine-pin lane): transfer-worker upload markers, defined with the checkpoint helpers below.
+static void rd_transfer_mark(RDD::CommandBufferID p_cmd, uint32_t p_worker, uint64_t p_target, uint32_t p_bytes, bool p_texture, bool p_end, uint32_t p_width = 0, uint32_t p_height = 0);
+#endif
+
 Error RenderingDevice::_buffer_initialize(Buffer *p_buffer, Span<uint8_t> p_data, uint32_t p_required_align) {
 	uint32_t transfer_worker_offset;
 	TransferWorker *transfer_worker = _acquire_transfer_worker(p_data.size(), p_required_align, transfer_worker_offset);
@@ -879,7 +885,13 @@ Error RenderingDevice::_buffer_initialize(Buffer *p_buffer, Span<uint8_t> p_data
 	region.src_offset = transfer_worker_offset;
 	region.dst_offset = 0;
 	region.size = p_data.size();
+#if defined(VULKAN_ENABLED)
+	rd_transfer_mark(transfer_worker->command_buffer, transfer_worker->index, p_buffer->driver_id.id, p_data.size(), false, false);
+#endif
 	driver->command_copy_buffer(transfer_worker->command_buffer, transfer_worker->staging_buffer, p_buffer->driver_id, region);
+#if defined(VULKAN_ENABLED)
+	rd_transfer_mark(transfer_worker->command_buffer, transfer_worker->index, p_buffer->driver_id.id, p_data.size(), false, true);
+#endif
 
 	_release_transfer_worker(transfer_worker);
 
@@ -2147,6 +2159,9 @@ Error RenderingDevice::_texture_initialize(RID p_texture, uint32_t p_layer, cons
 		if (copy_pass) {
 			transfer_worker = _acquire_transfer_worker(staging_local_offset, required_align, staging_worker_offset);
 			texture->transfer_worker_index = transfer_worker->index;
+#if defined(VULKAN_ENABLED)
+			rd_transfer_mark(transfer_worker->command_buffer, transfer_worker->index, texture->driver_id.id, staging_local_offset, true, false, texture->width, texture->height);
+#endif
 
 			{
 				MutexLock lock(transfer_worker->operations_mutex);
@@ -2224,6 +2239,9 @@ Error RenderingDevice::_texture_initialize(RID p_texture, uint32_t p_layer, cons
 
 		if (copy_pass) {
 			driver->buffer_unmap(transfer_worker->staging_buffer);
+#if defined(VULKAN_ENABLED)
+			rd_transfer_mark(transfer_worker->command_buffer, transfer_worker->index, texture->driver_id.id, staging_local_offset, true, true, texture->width, texture->height);
+#endif
 
 			// If the texture does not have a tracker, it means it must be transitioned to the sampling state.
 			if (texture->draw_tracker == nullptr && driver->api_trait_get(RDD::API_TRAIT_HONORS_PIPELINE_BARRIERS)) {
@@ -4824,6 +4842,53 @@ bool RenderingDevice::uniform_sets_have_linear_pools() const {
 // Diagnostic (engine-pin lane): checkpoint reports name pipelines by their shader; render timestamps by their name.
 void rendering_device_graph_name_pipeline(uint64_t p_driver_pipeline, const String &p_name);
 static String rd_timestamp_names[4096];
+// Transfer-worker uploads: a sequence number per recorded copy as its buffer marker, and what it was.
+void rendering_device_driver_vulkan_transfer_marker(uint64_t p_cmd_buffer_id, uint32_t p_slot, uint32_t p_marker);
+extern bool rdd_vulkan_checkpoints;
+struct RDTransferMark {
+	uint64_t usec = 0;
+	uint64_t thread = 0;
+	uint64_t target = 0; // Driver id of the destination buffer or texture.
+	uint32_t bytes = 0;
+	uint32_t width = 0;
+	uint32_t height = 0;
+	uint32_t worker = 0;
+	bool texture = false;
+	bool end = false; // Marks the end of the upload's copies (else their start).
+};
+static constexpr uint32_t RD_TRANSFER_RING = 1 << 14;
+static RDTransferMark rd_transfer_marks[RD_TRANSFER_RING];
+static uint32_t rd_transfer_next = 1;
+static Mutex rd_transfer_mutex;
+static void rd_transfer_mark(RDD::CommandBufferID p_cmd, uint32_t p_worker, uint64_t p_target, uint32_t p_bytes, bool p_texture, bool p_end, uint32_t p_width, uint32_t p_height) {
+	if (!rdd_vulkan_checkpoints) {
+		return;
+	}
+	uint32_t marker;
+	{
+		MutexLock lock(rd_transfer_mutex);
+		marker = rd_transfer_next++;
+		RDTransferMark &m = rd_transfer_marks[marker & (RD_TRANSFER_RING - 1)];
+		m.usec = OS::get_singleton()->get_ticks_usec();
+		m.thread = Thread::get_caller_id();
+		m.target = p_target;
+		m.bytes = p_bytes;
+		m.width = p_width;
+		m.height = p_height;
+		m.worker = p_worker;
+		m.texture = p_texture;
+		m.end = p_end;
+	}
+	rendering_device_driver_vulkan_transfer_marker(p_cmd.id, p_worker, marker);
+}
+String rendering_device_transfer_marker_describe(uint32_t p_marker) {
+	MutexLock lock(rd_transfer_mutex);
+	if (p_marker == 0 || p_marker >= rd_transfer_next || rd_transfer_next - p_marker > RD_TRANSFER_RING) {
+		return vformat("#%d (not in the ring)", p_marker);
+	}
+	const RDTransferMark &m = rd_transfer_marks[p_marker & (RD_TRANSFER_RING - 1)];
+	return vformat("#%d %s of %s 0x%x %d bytes %dx%d worker %d thread %d, recorded %.1f ms before the report", p_marker, m.end ? "end" : "start", m.texture ? "texture" : "buffer", m.target, m.bytes, m.width, m.height, m.worker, m.thread, double(OS::get_singleton()->get_ticks_usec() - m.usec) / 1000.0);
+}
 String rendering_device_timestamp_name(uint32_t p_index) {
 	return p_index < std_size(rd_timestamp_names) ? rd_timestamp_names[p_index] : String();
 }
