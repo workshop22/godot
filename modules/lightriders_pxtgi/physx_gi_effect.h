@@ -127,6 +127,15 @@ public:
 		Vector<float> primitives;
 		int primitive_count = 0;
 		uint64_t primitives_version = 0; // primitives and nodes: uploaded only when this changes
+		int trace_mode = 0; // PXTGI3D.trace_mode: 0 software, 1 world misses, 2 hardware, 3 hardware where safe
+		int static_count = 0; // the static primitives, first in leaf order
+		uint64_t static_version = 0;
+		int moving_root = -1; // the software walk's moving part (unused by hardware tracing)
+		// Hardware tracing (trace_mode 2, 3): each leaf's mesh id (0: a box), the meshes' triangles by id.
+		Vector<uint64_t> primitive_keys;
+		Vector<uint64_t> block_keys;
+		Vector<Vector<float>> block_triangles;
+		uint64_t blocks_version = 0;
 		Vector<float> nodes;
 		int node_count = 0;
 		// Hull planes and mesh trees and triangles (vec4s), shared by the primitives that point into it; uploaded when
@@ -219,6 +228,35 @@ private:
 	RID geometry_buffer;
 	uint64_t geometry_uploaded = UINT64_MAX;
 	bool failed = false;
+	// Hardware tracing (Snapshot::trace_mode 2, or 3 where it is safe): the shapes as acceleration structures, one
+	// bottom-level structure per mesh (and one unit box), built once; a static top-level structure rebuilt only when the
+	// static shapes really change, and a moving one every frame. Any failure leaves tracing in software for good.
+	RID hw_shaders[PASS_MAX];
+	RID hw_pipelines[PASS_MAX];
+	RID hw_box_vertices;
+	RID hw_box_blas;
+	HashMap<uint64_t, Pair<RID, RID>> hw_meshes; // mesh id -> (its corners, its structure)
+	uint64_t hw_blocks_version = UINT64_MAX;
+	RID hw_static_tlas;
+	RID hw_moving_tlas;
+	uint32_t hw_moving_capacity = 0;
+	uint32_t hw_static_capacity = 0;
+	uint64_t hw_static_version = UINT64_MAX;
+	uint32_t hw_static_hash = 0;
+	bool hw_failed = false;
+	bool hw_active = false; // the hardware variants run this frame
+	bool hw_guarded = false; // this session wrote the crash guard
+	bool _hw_compile(RenderingDevice *p_rd);
+	bool _hw_self_test(RenderingDevice *p_rd);
+	// Render-thread timing (PXTGI_RT_TIMING=1): this effect's recording, its hardware update and the time between frames.
+	uint64_t rt_last_us = 0;
+	uint64_t hw_static_us = 0;
+	uint64_t hw_moving_us = 0;
+	uint64_t hw_update_us = 0;
+	void _render_frame(int p_callback_type, const RenderData *p_render_data);
+	bool _hw_update(RenderingDevice *p_rd, const Snapshot &p_snapshot);
+	bool _hw_instance(const Snapshot &p_snapshot, int p_slot, RD::AccelerationStructureInstance &r_instance) const;
+	void _hw_free(RenderingDevice *p_rd);
 
 	// The radiance cache: surface patches the off-screen rays hit, hashed by position (cells growing with distance from
 	// the camera) and facing; each holds the light leaving it, bounce light included, refined a ray per frame.

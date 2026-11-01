@@ -1405,12 +1405,14 @@ void PXTGI3D::_build_tree() {
 		static_leaves = leaf_order.size();
 		static_rooted = rooted;
 		static_dirty = false;
+		static_version++;
 		_stage(STAGE_STATIC_TREE, since);
 	}
 	const uint64_t since = OS::get_singleton()->get_ticks_usec();
 	tree_nodes.resize(static_node_floats);
 	ordered_floats.resize(static_record_floats);
 	leaf_order.resize(static_leaves);
+	moving_root_node = -1;
 	if (!moving_items.is_empty()) {
 		const int moving_root = build_bvh(moving_items, 0, moving_items.size(), entry_floats.ptr(), tree_nodes, ordered_floats, leaf_order, rooted ? 1 : 0);
 		if (rooted) {
@@ -1425,6 +1427,7 @@ void PXTGI3D::_build_tree() {
 			store_int(&root[3], moving_root);
 			store_int(&root[7], 0);
 		}
+		moving_root_node = moving_root;
 	}
 	entry_slot.resize(n);
 	for (int i = 0; i < n; i++) {
@@ -1628,11 +1631,41 @@ void PXTGI3D::_update_primitives(PhysXGIEffect::Snapshot &r_snapshot) {
 		radiance_dirty = false;
 		_stage(STAGE_COPY, copy_since);
 	}
+	if (trace_mode >= 2) {
+		// Which mesh each leaf is, and the meshes' triangles (only when the geometry was laid out again).
+		if (rebuilt || published_keys.size() != int(leaf_order.size())) {
+			published_keys.resize(leaf_order.size());
+			uint64_t *keys = published_keys.ptrw();
+			for (uint32_t k = 0; k < leaf_order.size(); k++) {
+				const ShapeEntry &entry = shapes[leaf_order[k]];
+				keys[k] = entry.geometry_type == 5 ? uint64_t(entry.shape_resource) : 0;
+			}
+		}
+		if (published_blocks_version != geometry_version) {
+			published_blocks_version = geometry_version;
+			published_block_keys.clear();
+			published_block_triangles.clear();
+			for (const KeyValue<ObjectID, GeometryBlock> &E : geometry_blocks) {
+				if (E.value.type == 5) {
+					published_block_keys.push_back(uint64_t(E.key));
+					published_block_triangles.push_back(E.value.triangles);
+				}
+			}
+		}
+		r_snapshot.primitive_keys = published_keys;
+		r_snapshot.block_keys = published_block_keys;
+		r_snapshot.block_triangles = published_block_triangles;
+		r_snapshot.blocks_version = published_blocks_version;
+	}
 	r_snapshot.primitives = published_primitives;
 	r_snapshot.primitive_count = published_count;
 	r_snapshot.nodes = published_nodes;
 	r_snapshot.node_count = published_nodes.size() / PhysXGIEffect::NODE_FLOATS;
 	r_snapshot.primitives_version = primitives_version;
+	r_snapshot.trace_mode = trace_mode;
+	r_snapshot.static_count = static_leaves;
+	r_snapshot.static_version = static_version;
+	r_snapshot.moving_root = moving_root_node;
 	moved_poses.clear();
 }
 
@@ -1987,6 +2020,8 @@ void PXTGI3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_reflection_mode"), &PXTGI3D::get_reflection_mode);
 	ClassDB::bind_method(D_METHOD("set_reflection_roughness_cutoff", "roughness"), &PXTGI3D::set_reflection_roughness_cutoff);
 	ClassDB::bind_method(D_METHOD("get_reflection_roughness_cutoff"), &PXTGI3D::get_reflection_roughness_cutoff);
+	ClassDB::bind_method(D_METHOD("set_trace_mode", "mode"), &PXTGI3D::set_trace_mode);
+	ClassDB::bind_method(D_METHOD("get_trace_mode"), &PXTGI3D::get_trace_mode);
 	ClassDB::bind_method(D_METHOD("set_debug", "mode"), &PXTGI3D::set_debug);
 	ClassDB::bind_method(D_METHOD("get_debug"), &PXTGI3D::get_debug);
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "intensity", PROPERTY_HINT_RANGE, "0,4,0.01,or_greater"), "set_intensity", "get_intensity");
@@ -2003,5 +2038,6 @@ void PXTGI3D::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "filtered_hits"), "set_filtered_hits", "get_filtered_hits");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "reflection_mode", PROPERTY_HINT_ENUM, "Godot,Screen Space,Traced,Traced + Probes"), "set_reflection_mode", "get_reflection_mode");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "reflection_roughness_cutoff", PROPERTY_HINT_RANGE, "0,1,0.01"), "set_reflection_roughness_cutoff", "get_reflection_roughness_cutoff");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "trace_mode", PROPERTY_HINT_ENUM, "Software,World Misses,Hardware,Hardware If Safe"), "set_trace_mode", "get_trace_mode");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "debug", PROPERTY_HINT_ENUM, "Off,Last Frame,Round Trip,World Only,World Hits,World Position,Screen Only"), "set_debug", "get_debug");
 }
