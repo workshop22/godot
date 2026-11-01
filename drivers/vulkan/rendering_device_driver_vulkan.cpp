@@ -34,6 +34,7 @@
 #include "core/config/project_settings.h"
 #include "core/os/os.h"
 #include "core/os/thread.h"
+#include "core/io/file_access.h"
 #include "core/templates/fixed_vector.h"
 #include "drivers/vulkan/vulkan_hooks.h"
 
@@ -1153,6 +1154,7 @@ Error RenderingDeviceDriverVulkan::_check_device_capabilities() {
 		// vkGetDeviceFaultInfoEXT is only valid when the deviceFault feature is enabled at device creation.
 		if (enabled_device_extension_names.has(VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
 			device_fault_support = device_fault_features.deviceFault;
+			device_fault_vendor_binary_support = device_fault_features.deviceFaultVendorBinary;
 		}
 #if defined(VK_TRACK_DEVICE_MEMORY)
 		if (enabled_device_extension_names.has(VK_EXT_DEVICE_MEMORY_REPORT_EXTENSION_NAME)) {
@@ -1480,6 +1482,9 @@ Error RenderingDeviceDriverVulkan::_initialize_device(const LocalVector<VkDevice
 		device_fault_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT;
 		device_fault_features.pNext = create_info_next;
 		device_fault_features.deviceFault = VK_TRUE;
+		// Diagnostic (engine-pin lane): with LIGHTRIDERS_NV_CHECKPOINTS the vendor binary (the driver's own crash dump)
+		// is requested and saved to user://logs/device-fault-vendor.bin.
+		device_fault_features.deviceFaultVendorBinary = device_fault_vendor_binary_support && OS::get_singleton()->has_environment("LIGHTRIDERS_NV_CHECKPOINTS");
 		create_info_next = &device_fault_features;
 	}
 
@@ -7079,8 +7084,24 @@ void RenderingDeviceDriverVulkan::on_device_lost() const {
 			? (VkDeviceFaultAddressInfoEXT *)memalloc(fault_counts.addressInfoCount * sizeof(VkDeviceFaultAddressInfoEXT))
 			: nullptr;
 	const uint64_t vendor_binary_size = fault_counts.vendorBinarySize;
-	fault_counts.vendorBinarySize = 0;
+	const bool want_binary = vendor_binary_size > 0 && device_fault_vendor_binary_support && OS::get_singleton()->has_environment("LIGHTRIDERS_NV_CHECKPOINTS");
+	Vector<uint8_t> vendor_binary;
+	if (want_binary) {
+		vendor_binary.resize(vendor_binary_size);
+		fault_info.pVendorBinaryData = vendor_binary.ptrw();
+	} else {
+		fault_counts.vendorBinarySize = 0;
+	}
 	vkres = device_functions.GetDeviceFaultInfoEXT(vk_device, &fault_counts, &fault_info);
+	if (want_binary && (vkres == VK_SUCCESS || vkres == VK_INCOMPLETE)) {
+		const String path = OS::get_singleton()->get_user_data_dir().path_join("logs/device-fault-vendor.bin");
+		Ref<FileAccess> file = FileAccess::open(path, FileAccess::WRITE);
+		if (file.is_valid()) {
+			file->store_buffer(vendor_binary.ptr(), MIN(uint64_t(vendor_binary.size()), uint64_t(fault_counts.vendorBinarySize)));
+			file->flush();
+			_err_print_error(FUNCTION_STR, __FILE__, __LINE__, "Device fault vendor binary saved to " + path + " (" + itos(fault_counts.vendorBinarySize) + " bytes)");
+		}
+	}
 	// The vendor binary is not requested, so drivers that have one return VK_INCOMPLETE; the description and the
 	// vendor and address infos, sized from the count query above, are still complete.
 	if (vkres != VK_SUCCESS && vkres != VK_INCOMPLETE) {

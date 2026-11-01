@@ -168,6 +168,7 @@ class RenderingDeviceDriverVulkan : public RenderingDeviceDriver {
 	RaytracingCapabilities raytracing_capabilities;
 	bool pipeline_cache_control_support = false;
 	bool device_fault_support = false;
+	bool device_fault_vendor_binary_support = false;
 	bool framebuffer_depth_resolve = false;
 #if defined(VK_TRACK_DEVICE_MEMORY)
 	bool device_memory_report_support = false;
