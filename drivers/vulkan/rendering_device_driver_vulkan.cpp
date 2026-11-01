@@ -88,6 +88,19 @@ static PFN_vkGetQueueCheckpointDataNV rdd_vk_get_queue_checkpoint_data = nullptr
 static PFN_vkCmdWriteBufferMarkerAMD rdd_vk_cmd_write_buffer_marker = nullptr;
 static VkBuffer rdd_marker_vk_buffer = VK_NULL_HANDLE;
 bool rdd_vulkan_checkpoints = false;
+static bool rdd_memory_budget = false;
+static String rdd_budget_line(VmaAllocator p_allocator) {
+	const VkPhysicalDeviceMemoryProperties *memory_properties = nullptr;
+	vmaGetMemoryProperties(p_allocator, &memory_properties);
+	VmaBudget budgets[VK_MAX_MEMORY_HEAPS];
+	vmaSetCurrentFrameIndex(p_allocator, uint32_t(OS::get_singleton()->get_ticks_msec()));
+	vmaGetHeapBudgets(p_allocator, budgets);
+	String line;
+	for (uint32_t i = 0; i < memory_properties->memoryHeapCount; i++) {
+		line += vformat(" heap%d%s %d/%d MiB (ours %d)", i, (memory_properties->memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) ? "L" : "", budgets[i].usage >> 20, budgets[i].budget >> 20, budgets[i].statistics.blockBytes >> 20);
+	}
+	return line;
+}
 void rendering_device_driver_vulkan_checkpoint(uint64_t p_cmd_buffer_id, uint64_t p_marker) {
 	// CommandBufferInfo begins with its VkCommandBuffer.
 	const VkCommandBuffer command_buffer = *reinterpret_cast<VkCommandBuffer *>(p_cmd_buffer_id);
@@ -659,6 +672,7 @@ Error RenderingDeviceDriverVulkan::_initialize_device_extensions() {
 	if (OS::get_singleton()->has_environment("LIGHTRIDERS_NV_CHECKPOINTS")) {
 		_register_requested_device_extension(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME, false);
 		_register_requested_device_extension(VK_AMD_BUFFER_MARKER_EXTENSION_NAME, false);
+		_register_requested_device_extension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME, false);
 	}
 #endif
 
@@ -1664,6 +1678,11 @@ Error RenderingDeviceDriverVulkan::_initialize_allocator() {
 	}
 	if (buffer_device_address_support) {
 		allocator_info.flags |= VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
+	}
+	if (enabled_device_extension_names.has(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) {
+		// Diagnostic (engine-pin lane): the OS's per-process budget and usage, sampled into the log and the loss report.
+		allocator_info.flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
+		rdd_memory_budget = true;
 	}
 	VkResult err = vmaCreateAllocator(&allocator_info, &allocator);
 	ERR_FAIL_COND_V_MSG(err, ERR_CANT_CREATE, vformat("Couldn't create Vulkan memory allocator (VkResult error %d).", err));
@@ -3372,6 +3391,14 @@ Error RenderingDeviceDriverVulkan::command_queue_execute_and_present(CommandQueu
 		device_queue.submit_mutex.lock();
 		err = vkQueueSubmit(device_queue.queue, 1, &submit_info, vk_fence);
 		device_queue.submit_mutex.unlock();
+		if (rdd_memory_budget && p_swap_chains.size() > 0) {
+			static uint64_t last_budget_usec = 0;
+			const uint64_t now = OS::get_singleton()->get_ticks_usec();
+			if (now - last_budget_usec > 2000000) {
+				last_budget_usec = now;
+				print_line("VRAM_BUDGET" + rdd_budget_line(allocator));
+			}
+		}
 
 		if (err == VK_ERROR_DEVICE_LOST) {
 			print_lost_device_info();
@@ -7161,6 +7188,9 @@ String rendering_device_graph_label_breadcrumb_name(uint32_t p_id);
 
 void RenderingDeviceDriverVulkan::print_lost_device_info() {
 #if defined(VULKAN_ENABLED)
+	if (rdd_memory_budget) {
+		_err_print_error_asap("VRAM budget at the loss:" + rdd_budget_line(allocator));
+	}
 	if (rdd_marker_vk_buffer != VK_NULL_HANDLE) {
 		void *ptr = nullptr;
 		const VmaAllocation allocation = ((BufferInfo *)marker_buffer.id)->allocation.handle;
