@@ -240,6 +240,7 @@ private:
 	RID hw_static_tlas;
 	RID hw_moving_tlas;
 	uint32_t hw_moving_capacity = 0;
+	uint32_t hw_static_capacity = 0;
 	uint64_t hw_static_version = UINT64_MAX;
 	uint32_t hw_static_hash = 0;
 	bool hw_failed = false;

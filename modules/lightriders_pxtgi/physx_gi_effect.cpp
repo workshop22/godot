@@ -2133,6 +2133,7 @@ void PhysXGIEffect::_hw_free(RenderingDevice *p_rd) {
 	hw_box_blas = RID();
 	hw_box_vertices = RID();
 	hw_moving_capacity = 0;
+	hw_static_capacity = 0;
 	hw_static_version = UINT64_MAX;
 	hw_blocks_version = UINT64_MAX;
 	if (hw_guarded) {
@@ -2307,11 +2308,15 @@ bool PhysXGIEffect::_hw_update(RenderingDevice *p_rd, const Snapshot &p_snapshot
 				instances[0].mask = 0; // nothing: a ray never meets it
 				instances[0].hit_sbt_range = RD::HitShaderBindingTableRange(uint64_t(1) << 32);
 			}
-			if (hw_static_tlas.is_valid()) {
-				p_rd->free_rid(hw_static_tlas);
+			// Built again in place: a new structure (and freeing the old one under frames in flight) only when it grows.
+			if (instances.size() > hw_static_capacity) {
+				if (hw_static_tlas.is_valid()) {
+					p_rd->free_rid(hw_static_tlas);
+				}
+				hw_static_capacity = instances.size() + instances.size() / 4;
+				hw_static_tlas = p_rd->tlas_create(hw_static_capacity, RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT);
+				ERR_FAIL_COND_V(!hw_static_tlas.is_valid(), false);
 			}
-			hw_static_tlas = p_rd->tlas_create(instances.size(), RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT);
-			ERR_FAIL_COND_V(!hw_static_tlas.is_valid(), false);
 			ERR_FAIL_COND_V(p_rd->tlas_build(hw_static_tlas, Span<RD::AccelerationStructureInstance>(instances.ptr(), instances.size())) != OK, false);
 			print_line(vformat("PXTGI: static structure, %d shapes in %.2f ms (frame %d).", count, (OS::get_singleton()->get_ticks_usec() - since) / 1000.0, int64_t(Engine::get_singleton()->get_frames_drawn())));
 		}
