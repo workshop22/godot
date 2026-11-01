@@ -2087,12 +2087,12 @@ bool PhysXGIEffect::_hw_prepare(RenderingDevice *p_rd, const Snapshot &p_snapsho
 		Ref<RDShaderFile> file;
 		file.instantiate();
 		const String defines = RendererSceneRenderRD::get_singleton()->is_using_radiance_octmap_array() ? "#define SKY_OCTMAP_ARRAY\n" : "";
-		const String source = String(SHADERS[PASS_TRACE]).replace("@WORLD@", WORLD).replace("@COMMON@", defines + COMMON).replace("#version 450\n", "#version 450\n#extension GL_EXT_ray_query : require\n#define PXTGI_HW_STATIC\n");
-		ERR_FAIL_COND_V_MSG(file->parse_versions_from_text(source) != OK, false, "PXTGI: the hardware trace shader failed to parse.");
+		const String source = String(SHADERS[PASS_TRACE]).replace("@WORLD@", WORLD).replace("@COMMON@", defines + COMMON).replace("#version 450\n", "#version 460\n#extension GL_EXT_ray_query : require\n#define PXTGI_HW_STATIC\n");
+		file->parse_versions_from_text(source);
 		Ref<RDShaderSPIRV> spirv = file->get_spirv();
-		ERR_FAIL_COND_V(spirv.is_null(), false);
-		const String err = spirv->get_stage_compile_error(RD::SHADER_STAGE_COMPUTE);
-		ERR_FAIL_COND_V_MSG(!err.is_empty(), false, vformat("PXTGI: hardware trace shader: %s", err));
+		const String err = spirv.is_valid() ? spirv->get_stage_compile_error(RD::SHADER_STAGE_COMPUTE) : file->get_base_error();
+		// The compiler's message without the source listing it appends.
+		ERR_FAIL_COND_V_MSG(spirv.is_null() || !err.is_empty(), false, vformat("PXTGI: hardware trace shader: %s", err.get_slice("\n\nStage", 0)));
 		hw_shader = p_rd->shader_create_from_spirv(file->get_spirv_stages());
 		ERR_FAIL_COND_V(!hw_shader.is_valid(), false);
 		hw_pipeline = p_rd->compute_pipeline_create(hw_shader);
@@ -2188,6 +2188,9 @@ bool PhysXGIEffect::_hw_prepare(RenderingDevice *p_rd, const Snapshot &p_snapsho
 	geometry.vertex_stride = 12;
 	geometry.vertex_count = owners.size() * 3;
 	geometry.vertex_format = RD::DATA_FORMAT_R32G32B32_SFLOAT;
+	// Anything failing from here on leaves tracing in software for good: a structure that was never built must not
+	// be queried (that loses the device).
+	hw_failed = true;
 	hw_blas = p_rd->blas_create(Span<RD::AccelerationStructureGeometry>(&geometry, 1), RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT);
 	ERR_FAIL_COND_V(!hw_blas.is_valid(), false);
 	ERR_FAIL_COND_V(p_rd->blas_build(hw_blas) != OK, false);
@@ -2195,8 +2198,11 @@ bool PhysXGIEffect::_hw_prepare(RenderingDevice *p_rd, const Snapshot &p_snapsho
 	ERR_FAIL_COND_V(!hw_tlas.is_valid(), false);
 	RD::AccelerationStructureInstance instance;
 	instance.blas = hw_blas;
+	// RenderingDevice wants a hit shader table range on every instance, though a ray query uses none: offset 0, count 1.
+	instance.hit_sbt_range = RD::HitShaderBindingTableRange(uint64_t(1) << 32);
 	instance.flags = RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT | RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT;
 	ERR_FAIL_COND_V(p_rd->tlas_build(hw_tlas, Span<RD::AccelerationStructureInstance>(&instance, 1)) != OK, false);
+	hw_failed = false;
 	print_line(vformat("PXTGI_HW static structure: %d triangles from %d shapes (%d other shapes left out), %.1f ms", int(owners.size()), p_snapshot.static_count, skipped, (OS::get_singleton()->get_ticks_usec() - since) / 1000.0));
 	return true;
 }
