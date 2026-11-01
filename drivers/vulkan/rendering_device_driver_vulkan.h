@@ -225,6 +225,7 @@ private:
 	VmaPool _find_or_create_small_allocs_pool(uint32_t p_mem_type_index);
 
 private:
+	BufferID marker_buffer; // Diagnostic (engine-pin lane): checkpoint markers, see rendering_device_driver_vulkan_checkpoint().
 #if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
 	// It's a circular buffer.
 	BufferID breadcrumb_buffer;

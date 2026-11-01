@@ -78,14 +78,26 @@ static Mutex respv_parse_mutex;
 // Diagnostic (engine-pin lane): with LIGHTRIDERS_NV_CHECKPOINTS set, VK_NV_device_diagnostic_checkpoints marks every
 // recorded command and draw (rendering_device_graph.cpp numbers them); a device loss prints, per queue, the last marker
 // each pipeline stage reached, so the faulting work lies between the bottom- and top-of-pipe markers.
+// NVIDIA returned no checkpoint data after a real loss (driver 610.88), so where VK_AMD_buffer_marker exists (this NVIDIA
+// driver has it) each marker is written twice into a host-visible buffer instead: at top of pipe (the stream reached it)
+// and at bottom of pipe (everything before it completed). The faulting work lies between the two values.
 static PFN_vkCmdSetCheckpointNV rdd_vk_cmd_set_checkpoint = nullptr;
 static PFN_vkGetQueueCheckpointDataNV rdd_vk_get_queue_checkpoint_data = nullptr;
+static PFN_vkCmdWriteBufferMarkerAMD rdd_vk_cmd_write_buffer_marker = nullptr;
+static VkBuffer rdd_marker_vk_buffer = VK_NULL_HANDLE;
 bool rdd_vulkan_checkpoints = false;
 void rendering_device_driver_vulkan_checkpoint(uint64_t p_cmd_buffer_id, uint64_t p_marker) {
 	// CommandBufferInfo begins with its VkCommandBuffer.
-	rdd_vk_cmd_set_checkpoint(*reinterpret_cast<VkCommandBuffer *>(p_cmd_buffer_id), reinterpret_cast<void *>(uintptr_t(p_marker)));
+	const VkCommandBuffer command_buffer = *reinterpret_cast<VkCommandBuffer *>(p_cmd_buffer_id);
+	if (rdd_marker_vk_buffer != VK_NULL_HANDLE) {
+		rdd_vk_cmd_write_buffer_marker(command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, rdd_marker_vk_buffer, 0, uint32_t(p_marker));
+		rdd_vk_cmd_write_buffer_marker(command_buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, rdd_marker_vk_buffer, sizeof(uint32_t), uint32_t(p_marker));
+	} else {
+		rdd_vk_cmd_set_checkpoint(command_buffer, reinterpret_cast<void *>(uintptr_t(p_marker)));
+	}
 }
 String rendering_device_graph_checkpoint_describe(uint64_t p_marker);
+uint64_t rendering_device_graph_checkpoint_latest();
 #endif
 
 // Record numerous statistics about pipeline creation such as time and shader sizes. When combined with enabling
@@ -624,6 +636,7 @@ Error RenderingDeviceDriverVulkan::_initialize_device_extensions() {
 #if defined(VULKAN_ENABLED)
 	if (OS::get_singleton()->has_environment("LIGHTRIDERS_NV_CHECKPOINTS")) {
 		_register_requested_device_extension(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME, false);
+		_register_requested_device_extension(VK_AMD_BUFFER_MARKER_EXTENSION_NAME, false);
 	}
 #endif
 
@@ -1591,6 +1604,9 @@ Error RenderingDeviceDriverVulkan::_initialize_device(const LocalVector<VkDevice
 			rdd_vulkan_checkpoints = rdd_vk_cmd_set_checkpoint != nullptr && rdd_vk_get_queue_checkpoint_data != nullptr;
 			print_line(vformat("NV_CHECKPOINTS %s", rdd_vulkan_checkpoints ? "enabled" : "unavailable"));
 		}
+		if (enabled_device_extension_names.has(VK_AMD_BUFFER_MARKER_EXTENSION_NAME)) {
+			rdd_vk_cmd_write_buffer_marker = (PFN_vkCmdWriteBufferMarkerAMD)functions.GetDeviceProcAddr(vk_device, "vkCmdWriteBufferMarkerAMD");
+		}
 #endif
 
 		// Device raytracing extensions.
@@ -1929,6 +1945,13 @@ Error RenderingDeviceDriverVulkan::initialize(uint32_t p_device_index, uint32_t 
 
 #if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
 	breadcrumb_buffer = buffer_create(2u * sizeof(uint32_t) * BREADCRUMB_BUFFER_ENTRIES, BufferUsageBits::BUFFER_USAGE_TRANSFER_TO_BIT, MemoryAllocationType::MEMORY_ALLOCATION_TYPE_CPU, UINT64_MAX);
+#endif
+#if defined(VULKAN_ENABLED)
+	if (rdd_vulkan_checkpoints && rdd_vk_cmd_write_buffer_marker != nullptr) {
+		marker_buffer = buffer_create(4u * sizeof(uint32_t), BufferUsageBits::BUFFER_USAGE_TRANSFER_TO_BIT, MemoryAllocationType::MEMORY_ALLOCATION_TYPE_CPU, UINT64_MAX);
+		rdd_marker_vk_buffer = ((BufferInfo *)marker_buffer.id)->vk_buffer;
+		print_line("NV_CHECKPOINTS via VK_AMD_buffer_marker");
+	}
 #endif
 
 #if defined(SWAPPY_FRAME_PACING_ENABLED)
@@ -7096,7 +7119,37 @@ String rendering_device_graph_label_breadcrumb_name(uint32_t p_id);
 
 void RenderingDeviceDriverVulkan::print_lost_device_info() {
 #if defined(VULKAN_ENABLED)
-	if (rdd_vulkan_checkpoints) {
+	if (rdd_marker_vk_buffer != VK_NULL_HANDLE) {
+		void *ptr = nullptr;
+		const VmaAllocation allocation = ((BufferInfo *)marker_buffer.id)->allocation.handle;
+		vmaInvalidateAllocation(allocator, allocation, 0, 4u * sizeof(uint32_t));
+		if (vmaMapMemory(allocator, allocation, &ptr) == VK_SUCCESS) {
+			const uint32_t top = ((const uint32_t *)ptr)[0];
+			const uint32_t bottom = ((const uint32_t *)ptr)[1];
+			vmaUnmapMemory(allocator, allocation);
+			// Markers are the low 32 bits of the checkpoint sequence; rebuild them against the latest number.
+			const uint64_t latest = rendering_device_graph_checkpoint_latest();
+			const uint64_t top64 = (latest & ~uint64_t(UINT32_MAX)) | top;
+			const uint64_t high = top64 > latest ? top64 - (uint64_t(1) << 32) : top64;
+			const uint64_t bottom64 = (latest & ~uint64_t(UINT32_MAX)) | bottom;
+			const uint64_t low = bottom64 > latest ? bottom64 - (uint64_t(1) << 32) : bottom64;
+			String msg = vformat("NV checkpoints (buffer markers): recorded up to #%d; top of pipe #%d, bottom of pipe #%d", latest, high, low);
+			msg += vformat("\n   top    #%d %s", high, rendering_device_graph_checkpoint_describe(high));
+			msg += vformat("\n   bottom #%d %s", low, rendering_device_graph_checkpoint_describe(low));
+			if (high >= low && low > 0) {
+				msg += vformat("\n   in flight #%d..#%d:", low, high);
+				for (uint64_t m = low; m <= high; m++) {
+					if (high - low > 160 && m == low + 100) {
+						msg += vformat("\n      ... %d more ...", high - 50 - m);
+						m = high - 50;
+					}
+					msg += vformat("\n      #%d %s", m, rendering_device_graph_checkpoint_describe(m));
+				}
+			}
+			_err_print_error_asap(msg);
+		}
+	}
+	if (rdd_vulkan_checkpoints && rdd_marker_vk_buffer == VK_NULL_HANDLE) {
 		for (uint32_t family = 0; family < queue_families.size(); family++) {
 			for (uint32_t index = 0; index < queue_families[family].size(); index++) {
 				uint32_t count = 0;

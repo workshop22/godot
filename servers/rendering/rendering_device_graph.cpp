@@ -92,6 +92,10 @@ static void rdg_checkpoint(RDD::CommandBufferID p_command_buffer, uint32_t p_kin
 	rendering_device_driver_vulkan_checkpoint(p_command_buffer.id, marker);
 }
 
+uint64_t rendering_device_graph_checkpoint_latest() {
+	return rdg_checkpoint_next - 1;
+}
+
 String rendering_device_graph_checkpoint_describe(uint64_t p_marker) {
 	if (p_marker == 0 || p_marker >= rdg_checkpoint_next || rdg_checkpoint_next - p_marker > RDG_CHECKPOINT_RING) {
 		return "(not in the ring)";
