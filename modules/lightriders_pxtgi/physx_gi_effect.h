@@ -127,6 +127,10 @@ public:
 		Vector<float> primitives;
 		int primitive_count = 0;
 		uint64_t primitives_version = 0; // primitives and nodes: uploaded only when this changes
+		int trace_mode = 0; // spike (PXTGI3D.trace_mode): 0 software, 1 world misses, 2 hardware static
+		int static_count = 0; // the static primitives, first in leaf order
+		uint64_t static_version = 0;
+		int moving_root = -1;
 		Vector<float> nodes;
 		int node_count = 0;
 		// Hull planes and mesh trees and triangles (vec4s), shared by the primitives that point into it; uploaded when
@@ -219,6 +223,17 @@ private:
 	RID geometry_buffer;
 	uint64_t geometry_uploaded = UINT64_MAX;
 	bool failed = false;
+	// Hardware trace spike (Snapshot::trace_mode 2): the static shapes as one world-space triangle structure that
+	// PASS_TRACE queries in hardware; the moving part stays on the software tree.
+	RID hw_shader;
+	RID hw_pipeline;
+	RID hw_corners;
+	RID hw_prims;
+	RID hw_blas;
+	RID hw_tlas;
+	uint64_t hw_version = UINT64_MAX;
+	bool hw_failed = false;
+	bool _hw_prepare(RenderingDevice *p_rd, const Snapshot &p_snapshot);
 
 	// The radiance cache: surface patches the off-screen rays hit, hashed by position (cells growing with distance from
 	// the camera) and facing; each holds the light leaving it, bounce light included, refined a ray per frame.

@@ -170,6 +170,9 @@ class PXTGI3D : public Node3D {
 	uint32_t static_record_floats = 0;
 	uint32_t static_leaves = 0;
 	bool static_rooted = false; // the static part was built under a shared root
+	uint64_t static_version = 0; // the static part's layout: bumped whenever it is rebuilt (hardware trace spike)
+	int moving_root_node = -1; // the moving part's root node, -1 with no moving part
+	int trace_mode = 0; // spike: 0 software, 1 world rays find nothing (their share of the cost), 2 hardware queries for the static part
 	bool static_dirty = true;
 	bool moving_dirty = true;
 	bool radiance_dirty = false; // only glow changed: the records in place, not the tree
@@ -265,6 +268,8 @@ public:
 	int get_reflection_mode() const { return reflection_mode; }
 	void set_reflection_roughness_cutoff(float p_value) { reflection_cutoff = CLAMP(p_value, 0.0f, 1.0f); }
 	float get_reflection_roughness_cutoff() const { return reflection_cutoff; }
+	void set_trace_mode(int p_mode) { trace_mode = CLAMP(p_mode, 0, 2); }
+	int get_trace_mode() const { return trace_mode; }
 	void set_debug(int p_value) { debug = p_value; }
 	int get_debug() const { return debug; }
 };

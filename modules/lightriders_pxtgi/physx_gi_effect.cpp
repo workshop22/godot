@@ -34,6 +34,8 @@
 #include "physx_compositor_effects.h"
 #include "pxtgi_blue_noise.h"
 
+#include "core/os/os.h"
+
 #include "core/object/callable_mp.h"
 #include "scene/3d/camera_3d.h"
 #include "scene/resources/3d/world_3d.h"
@@ -122,6 +124,7 @@ layout(set = 0, binding = 9, std140) uniform Frame {
 	vec4 src_border; // x: the atlas maps' border, y: the scale inside it, z: the roughest level
 	vec4 trace_settings; // x: reflection reach, y: filtered mirror rays, z: previous colour is valid, w: reflection softness
 	vec4 polish; // x: blue noise, y: GI history clamp, z: the source's mip levels for screen hits (0: level 0 only), w: frame pixels a reflection texel spans
+	vec4 hw; // hardware trace spike: x: the moving part's root node (-1: none)
 }
 f;
 
@@ -507,16 +510,16 @@ float box_entry(vec3 o, vec3 inv, vec3 lo, vec3 hi, float best) {
 // The nearest shape along the ray, walking the tree near child first (the far one waits on the stack, and is skipped
 // when a hit closer than its box has been found by then). With any_hit, the first shape in the way will do (shadow
 // rays): returns at once.
-int walk_world(vec3 o, vec3 d, inout float t, out vec3 normal, bool any_hit) {
+int walk_tree(int start, vec3 o, vec3 d, inout float t, out vec3 normal, bool any_hit) {
 	int hit = -1;
-	if (f.counts.y == 0) {
+	if (f.counts.y == 0 || start < 0) {
 		return hit;
 	}
 	vec3 inv = 1.0 / d;
 	int stack[16];
 	int top = 0;
-	int node = 0;
-	if (box_entry(o, inv, bvh.n[0].lo.xyz, bvh.n[0].hi.xyz, t) >= 1e30) {
+	int node = start;
+	if (box_entry(o, inv, bvh.n[start].lo.xyz, bvh.n[start].hi.xyz, t) >= 1e30) {
 		return hit;
 	}
 	while (true) {
@@ -572,6 +575,55 @@ int walk_world(vec3 o, vec3 d, inout float t, out vec3 normal, bool any_hit) {
 	}
 	return hit;
 }
+
+#ifdef PXTGI_HW_STATIC
+// Hardware trace spike: the static shapes as one triangle structure (world space), its triangles' corners and their
+// primitives; the moving part still walks the software tree from its own root.
+layout(set = 0, binding = 15) uniform accelerationStructureEXT static_scene;
+layout(std430, set = 0, binding = 16) restrict readonly buffer HwCorners {
+	float c[];
+}
+hw_corners;
+layout(std430, set = 0, binding = 17) restrict readonly buffer HwPrims {
+	int p[];
+}
+hw_prims;
+
+int walk_world(vec3 o, vec3 d, inout float t, out vec3 normal, bool any_hit) {
+	int hit = -1;
+	if (f.counts.y == 0) {
+		return hit;
+	}
+	rayQueryEXT q;
+	rayQueryInitializeEXT(q, static_scene, gl_RayFlagsOpaqueEXT | (any_hit ? gl_RayFlagsTerminateOnFirstHitEXT : 0u), 0xFF, o, 0.0, d, t);
+	while (rayQueryProceedEXT(q)) {
+	}
+	if (rayQueryGetIntersectionTypeEXT(q, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
+		t = rayQueryGetIntersectionTEXT(q, true);
+		int tri = rayQueryGetIntersectionPrimitiveIndexEXT(q, true);
+		vec3 a = vec3(hw_corners.c[tri * 9], hw_corners.c[tri * 9 + 1], hw_corners.c[tri * 9 + 2]);
+		vec3 b = vec3(hw_corners.c[tri * 9 + 3], hw_corners.c[tri * 9 + 4], hw_corners.c[tri * 9 + 5]);
+		vec3 c = vec3(hw_corners.c[tri * 9 + 6], hw_corners.c[tri * 9 + 7], hw_corners.c[tri * 9 + 8]);
+		vec3 n = normalize(cross(b - a, c - a));
+		normal = dot(n, d) > 0.0 ? -n : n;
+		hit = hw_prims.p[tri];
+		if (any_hit) {
+			return hit;
+		}
+	}
+	vec3 moving_normal;
+	int moving = walk_tree(int(f.hw.x), o, d, t, moving_normal, any_hit);
+	if (moving >= 0) {
+		hit = moving;
+		normal = moving_normal;
+	}
+	return hit;
+}
+#else
+int walk_world(vec3 o, vec3 d, inout float t, out vec3 normal, bool any_hit) {
+	return walk_tree(0, o, d, t, normal, any_hit);
+}
+#endif
 
 int trace_world(vec3 o, vec3 d, inout float t, out vec3 normal) {
 	return walk_world(o, d, t, normal, false);
@@ -1861,6 +1913,7 @@ struct FrameData {
 	float src_border[4];
 	float trace_settings[4];
 	float polish[4];
+	float hw[4];
 };
 
 void projection_info(const Projection &p_projection, const Size2i &p_size, float *r_info) {
@@ -2004,12 +2057,148 @@ PhysXGIEffect::~PhysXGIEffect() {
 				rd->free_rid(shaders[i]);
 			}
 		}
-		for (RID r : { linear_sampler, mip_sampler, nearest_sampler, data_buffer, primitive_buffer, node_buffer, cache_keys, cache_cells, geometry_buffer, blue_noise }) {
+		for (RID r : { hw_pipeline, hw_shader, hw_tlas, hw_blas, hw_corners, hw_prims, linear_sampler, mip_sampler, nearest_sampler, data_buffer, primitive_buffer, node_buffer, cache_keys, cache_cells, geometry_buffer, blue_noise }) {
 			if (r.is_valid()) {
 				rd->free_rid(r);
 			}
 		}
 	});
+}
+
+static int float_bits(float p_value) {
+	int out;
+	memcpy(&out, &p_value, sizeof(out));
+	return out;
+}
+
+// The hardware trace spike: compile PASS_TRACE with ray queries once, and (re)build the static triangle structure
+// whenever the static part of the tree was rebuilt. Boxes and triangle meshes; other static shapes are left out (and
+// counted). False (software from then on) without ray query support or when anything fails.
+bool PhysXGIEffect::_hw_prepare(RenderingDevice *p_rd, const Snapshot &p_snapshot) {
+	if (hw_failed) {
+		return false;
+	}
+	if (hw_pipeline.is_null()) {
+		hw_failed = true;
+		if (!p_rd->has_feature(RD::SUPPORTS_RAY_QUERY)) {
+			WARN_PRINT("PXTGI: this device has no ray queries; tracing stays in software.");
+			return false;
+		}
+		Ref<RDShaderFile> file;
+		file.instantiate();
+		const String defines = RendererSceneRenderRD::get_singleton()->is_using_radiance_octmap_array() ? "#define SKY_OCTMAP_ARRAY\n" : "";
+		const String source = String(SHADERS[PASS_TRACE]).replace("@WORLD@", WORLD).replace("@COMMON@", defines + COMMON).replace("#version 450\n", "#version 450\n#extension GL_EXT_ray_query : require\n#define PXTGI_HW_STATIC\n");
+		ERR_FAIL_COND_V_MSG(file->parse_versions_from_text(source) != OK, false, "PXTGI: the hardware trace shader failed to parse.");
+		Ref<RDShaderSPIRV> spirv = file->get_spirv();
+		ERR_FAIL_COND_V(spirv.is_null(), false);
+		const String err = spirv->get_stage_compile_error(RD::SHADER_STAGE_COMPUTE);
+		ERR_FAIL_COND_V_MSG(!err.is_empty(), false, vformat("PXTGI: hardware trace shader: %s", err));
+		hw_shader = p_rd->shader_create_from_spirv(file->get_spirv_stages());
+		ERR_FAIL_COND_V(!hw_shader.is_valid(), false);
+		hw_pipeline = p_rd->compute_pipeline_create(hw_shader);
+		ERR_FAIL_COND_V(!hw_pipeline.is_valid(), false);
+		hw_failed = false;
+	}
+	if (p_snapshot.static_version == hw_version && hw_tlas.is_valid()) {
+		return true;
+	}
+	const uint64_t since = OS::get_singleton()->get_ticks_usec();
+	LocalVector<float> corners;
+	LocalVector<int32_t> owners;
+	int skipped = 0;
+	const float *records = p_snapshot.primitives.ptr();
+	const float *geo = p_snapshot.geometry.ptr();
+	for (int i = 0; i < p_snapshot.static_count; i++) {
+		const float *r = records + i * PRIMITIVE_FLOATS;
+		const Transform3D to_local(Basis(r[0], r[1], r[2], r[4], r[5], r[6], r[8], r[9], r[10]), Vector3(r[3], r[7], r[11]));
+		const Transform3D to_world = to_local.affine_inverse();
+		auto triangle = [&](const Vector3 &p_a, const Vector3 &p_b, const Vector3 &p_c) {
+			for (const Vector3 &v : { p_a, p_b, p_c }) {
+				const Vector3 w = to_world.xform(v);
+				corners.push_back(w.x);
+				corners.push_back(w.y);
+				corners.push_back(w.z);
+			}
+			owners.push_back(i);
+		};
+		const int type = int(r[12] + 0.5f);
+		if (type == 0) {
+			const Vector3 e(r[13], r[14], r[15]);
+			Vector3 c[8];
+			for (int k = 0; k < 8; k++) {
+				c[k] = Vector3(k & 1 ? e.x : -e.x, k & 2 ? e.y : -e.y, k & 4 ? e.z : -e.z);
+			}
+			static const int faces[6][4] = { { 0, 2, 3, 1 }, { 4, 5, 7, 6 }, { 0, 1, 5, 4 }, { 2, 6, 7, 3 }, { 0, 4, 6, 2 }, { 1, 3, 7, 5 } };
+			for (const int *f : faces) {
+				triangle(c[f[0]], c[f[1]], c[f[2]]);
+				triangle(c[f[0]], c[f[2]], c[f[3]]);
+			}
+		} else if (type == 5) {
+			// The mesh's triangles: as many as its tree's leaves reach.
+			const int nodes = float_bits(r[13]);
+			const int tris = float_bits(r[14]);
+			int count = 0;
+			LocalVector<int> stack;
+			stack.push_back(0);
+			while (!stack.is_empty()) {
+				const int node = stack[stack.size() - 1];
+				stack.resize(stack.size() - 1);
+				const float *lo = geo + (nodes + node * 2) * 4;
+				const float *hi = lo + 4;
+				const int leaf = float_bits(hi[3]);
+				if (leaf == 0) {
+					stack.push_back(node + 1);
+					stack.push_back(float_bits(lo[3]));
+				} else {
+					count = MAX(count, float_bits(lo[3]) + leaf);
+				}
+			}
+			for (int k = 0; k < count; k++) {
+				const float *a = geo + (tris + k * 3) * 4;
+				triangle(Vector3(a[0], a[1], a[2]), Vector3(a[4], a[5], a[6]), Vector3(a[8], a[9], a[10]));
+			}
+		} else {
+			skipped++;
+		}
+	}
+	for (RID r : { hw_tlas, hw_blas, hw_corners, hw_prims }) {
+		if (r.is_valid()) {
+			p_rd->free_rid(r);
+		}
+	}
+	hw_tlas = RID();
+	hw_blas = RID();
+	hw_corners = RID();
+	hw_prims = RID();
+	hw_version = p_snapshot.static_version;
+	if (owners.is_empty()) {
+		return false;
+	}
+	Vector<uint8_t> corner_bytes;
+	corner_bytes.resize(corners.size() * sizeof(float));
+	memcpy(corner_bytes.ptrw(), corners.ptr(), corner_bytes.size());
+	hw_corners = p_rd->vertex_buffer_create(corner_bytes.size(), corner_bytes, RD::BUFFER_CREATION_DEVICE_ADDRESS_BIT | RD::BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT | RD::BUFFER_CREATION_AS_STORAGE_BIT);
+	Vector<uint8_t> owner_bytes;
+	owner_bytes.resize(owners.size() * sizeof(int32_t));
+	memcpy(owner_bytes.ptrw(), owners.ptr(), owner_bytes.size());
+	hw_prims = p_rd->storage_buffer_create(owner_bytes.size(), owner_bytes);
+	RD::AccelerationStructureGeometry geometry;
+	geometry.flags = RD::ACCELERATION_STRUCTURE_GEOMETRY_OPAQUE_BIT;
+	geometry.vertex_buffer = hw_corners;
+	geometry.vertex_stride = 12;
+	geometry.vertex_count = owners.size() * 3;
+	geometry.vertex_format = RD::DATA_FORMAT_R32G32B32_SFLOAT;
+	hw_blas = p_rd->blas_create(Span<RD::AccelerationStructureGeometry>(&geometry, 1), RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT);
+	ERR_FAIL_COND_V(!hw_blas.is_valid(), false);
+	ERR_FAIL_COND_V(p_rd->blas_build(hw_blas) != OK, false);
+	hw_tlas = p_rd->tlas_create(1, RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT);
+	ERR_FAIL_COND_V(!hw_tlas.is_valid(), false);
+	RD::AccelerationStructureInstance instance;
+	instance.blas = hw_blas;
+	instance.flags = RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT | RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT;
+	ERR_FAIL_COND_V(p_rd->tlas_build(hw_tlas, Span<RD::AccelerationStructureInstance>(&instance, 1)) != OK, false);
+	print_line(vformat("PXTGI_HW static structure: %d triangles from %d shapes (%d other shapes left out), %.1f ms", int(owners.size()), p_snapshot.static_count, skipped, (OS::get_singleton()->get_ticks_usec() - since) / 1000.0));
+	return true;
 }
 
 bool PhysXGIEffect::_ensure(RenderingDevice *p_rd) {
@@ -2362,7 +2551,8 @@ void PhysXGIEffect::_render(int p_callback_type, const RenderData *p_render_data
 	}
 	data.ambient[3] = s.world_distance;
 	data.counts[0] = s.primitive_count;
-	data.counts[1] = s.node_count;
+	data.counts[1] = s.trace_mode == 1 ? 0 : s.node_count; // trace mode 1: world rays find nothing (their share)
+	data.hw[0] = float(s.moving_root);
 	data.counts[2] = s.omni_count;
 	data.counts[3] = s.spot_count;
 	for (int i = 0; i < s.spot_count; i++) {
@@ -2490,7 +2680,21 @@ void PhysXGIEffect::_render(int p_callback_type, const RenderData *p_render_data
 	if (s.multi_bounce && s.primitive_count > 0) {
 		_dispatch(rd, PASS_CACHE, { sampled(0, nearest_sampler, depth), sampled(2, linear_sampler, color), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 4, primitive_buffer), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 5, node_buffer), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 6, cache_keys), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 7, cache_cells), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 10, geometry_buffer), sampled(11, linear_sampler, sky_map) }, Size2i(CACHE_ROW, CACHE_SLOTS / CACHE_ROW / 4), nullptr, 0);
 	}
-	_dispatch(rd, PASS_TRACE, { sampled(0, nearest_sampler, depth), sampled(1, nearest_sampler, normal), sampled(2, mip_sampler, color), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 3, v.trace), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 4, primitive_buffer), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 5, node_buffer), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 6, cache_keys), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 7, cache_cells), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 10, geometry_buffer), sampled(11, linear_sampler, sky_map), sampled(14, nearest_sampler, blue_noise) }, v.trace_size, nullptr, 0);
+	// Hardware trace spike: PASS_TRACE's static shapes through ray queries, the moving part in software.
+	const bool hw_trace = s.trace_mode == 2 && _hw_prepare(rd, s);
+	Vector<RD::Uniform> trace_uniforms = { sampled(0, nearest_sampler, depth), sampled(1, nearest_sampler, normal), sampled(2, mip_sampler, color), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 3, v.trace), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 4, primitive_buffer), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 5, node_buffer), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 6, cache_keys), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 7, cache_cells), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 10, geometry_buffer), sampled(11, linear_sampler, sky_map), sampled(14, nearest_sampler, blue_noise) };
+	if (hw_trace) {
+		trace_uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_ACCELERATION_STRUCTURE, 15, hw_tlas));
+		trace_uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 16, hw_corners));
+		trace_uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 17, hw_prims));
+		SWAP(shaders[PASS_TRACE], hw_shader);
+		SWAP(pipelines[PASS_TRACE], hw_pipeline);
+	}
+	_dispatch(rd, PASS_TRACE, trace_uniforms, v.trace_size, nullptr, 0);
+	if (hw_trace) {
+		SWAP(shaders[PASS_TRACE], hw_shader);
+		SWAP(pipelines[PASS_TRACE], hw_pipeline);
+	}
 
 	int32_t history[4] = { v.have_history ? 1 : 0, 0, 0, 0 };
 	_dispatch(rd, PASS_TEMPORAL, { sampled(0, nearest_sampler, v.trace), sampled(1, linear_sampler, v.accum[prev]), sampled(2, nearest_sampler, v.accum_depth[prev]), sampled(3, nearest_sampler, depth), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 4, v.accum[v.current]), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 5, v.accum_depth[v.current]), sampled(6, linear_sampler, v.moments[prev]), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 7, v.moments[v.current]), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 8, v.variance) }, v.trace_size, history, sizeof(history));
