@@ -34,7 +34,11 @@
 #include "physx_compositor_effects.h"
 #include "pxtgi_blue_noise.h"
 
+#include "core/config/engine.h"
+#include "core/io/file_access.h"
+#include "core/math/math_funcs_binary.h"
 #include "core/os/os.h"
+#include "core/templates/hashfuncs.h"
 
 #include "core/object/callable_mp.h"
 #include "scene/3d/camera_3d.h"
@@ -576,46 +580,57 @@ int walk_tree(int start, vec3 o, vec3 d, inout float t, out vec3 normal, bool an
 	return hit;
 }
 
-#ifdef PXTGI_HW_STATIC
-// Hardware trace spike: the static shapes as one triangle structure (world space), its triangles' corners and their
-// primitives; the moving part still walks the software tree from its own root.
+#ifdef PXTGI_HW
+// Hardware tracing: the same shapes as acceleration structures, a static one (built when the static shapes change) and a
+// moving one (built every frame). An instance's custom index is its shape's slot in prims; a mesh's triangles keep
+// the order of its geometry block, so the hit's normal comes from the same corners the software walk uses.
 layout(set = 0, binding = 15) uniform accelerationStructureEXT static_scene;
-layout(std430, set = 0, binding = 16) restrict readonly buffer HwCorners {
-	float c[];
+layout(set = 0, binding = 16) uniform accelerationStructureEXT moving_scene;
+
+vec3 hw_normal(int slot, int tri, vec3 p, vec3 d) {
+	Primitive q = prims.p[slot];
+	vec3 n;
+	if (int(q.shape.x + 0.5) == 5) {
+		int at = floatBitsToInt(q.shape.z) + tri * 3;
+		vec3 a = geo.v[at].xyz;
+		n = cross(geo.v[at + 1].xyz - a, geo.v[at + 2].xyz - a);
+	} else {
+		vec3 lp = vec3(dot(q.r0.xyz, p) + q.r0.w, dot(q.r1.xyz, p) + q.r1.w, dot(q.r2.xyz, p) + q.r2.w) / max(q.shape.yzw, vec3(1e-6));
+		vec3 m = abs(lp);
+		n = m.x >= m.y && m.x >= m.z ? vec3(sign(lp.x), 0.0, 0.0) : (m.y >= m.z ? vec3(0.0, sign(lp.y), 0.0) : vec3(0.0, 0.0, sign(lp.z)));
+	}
+	// Local to world for a normal: the transpose of the world-to-local rows.
+	n = normalize(n.x * q.r0.xyz + n.y * q.r1.xyz + n.z * q.r2.xyz);
+	return dot(n, d) > 0.0 ? -n : n;
 }
-hw_corners;
-layout(std430, set = 0, binding = 17) restrict readonly buffer HwPrims {
-	int p[];
-}
-hw_prims;
+
+#define HW_QUERY(SCENE) \
+	{ \
+		rayQueryEXT q; \
+		rayQueryInitializeEXT(q, SCENE, flags, 0xFF, o, 0.0, d, t); \
+		while (rayQueryProceedEXT(q)) { \
+		} \
+		if (rayQueryGetIntersectionTypeEXT(q, true) == gl_RayQueryCommittedIntersectionTriangleEXT) { \
+			t = rayQueryGetIntersectionTEXT(q, true); \
+			hit = rayQueryGetIntersectionInstanceCustomIndexEXT(q, true); \
+			tri = rayQueryGetIntersectionPrimitiveIndexEXT(q, true); \
+		} \
+	}
 
 int walk_world(vec3 o, vec3 d, inout float t, out vec3 normal, bool any_hit) {
 	int hit = -1;
+	int tri = 0;
+	normal = vec3(0.0, 1.0, 0.0);
 	if (f.counts.y == 0) {
 		return hit;
 	}
-	rayQueryEXT q;
-	rayQueryInitializeEXT(q, static_scene, gl_RayFlagsOpaqueEXT | (any_hit ? gl_RayFlagsTerminateOnFirstHitEXT : 0u), 0xFF, o, 0.0, d, t);
-	while (rayQueryProceedEXT(q)) {
+	uint flags = gl_RayFlagsOpaqueEXT | (any_hit ? gl_RayFlagsTerminateOnFirstHitEXT : 0u);
+	HW_QUERY(static_scene)
+	if (!any_hit || hit < 0) {
+		HW_QUERY(moving_scene)
 	}
-	if (rayQueryGetIntersectionTypeEXT(q, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
-		t = rayQueryGetIntersectionTEXT(q, true);
-		int tri = rayQueryGetIntersectionPrimitiveIndexEXT(q, true);
-		vec3 a = vec3(hw_corners.c[tri * 9], hw_corners.c[tri * 9 + 1], hw_corners.c[tri * 9 + 2]);
-		vec3 b = vec3(hw_corners.c[tri * 9 + 3], hw_corners.c[tri * 9 + 4], hw_corners.c[tri * 9 + 5]);
-		vec3 c = vec3(hw_corners.c[tri * 9 + 6], hw_corners.c[tri * 9 + 7], hw_corners.c[tri * 9 + 8]);
-		vec3 n = normalize(cross(b - a, c - a));
-		normal = dot(n, d) > 0.0 ? -n : n;
-		hit = hw_prims.p[tri];
-		if (any_hit) {
-			return hit;
-		}
-	}
-	vec3 moving_normal;
-	int moving = walk_tree(int(f.hw.x), o, d, t, moving_normal, any_hit);
-	if (moving >= 0) {
-		hit = moving;
-		normal = moving_normal;
+	if (hit >= 0) {
+		normal = hw_normal(hit, tri, o + d * t, d);
 	}
 	return hit;
 }
@@ -2057,7 +2072,8 @@ PhysXGIEffect::~PhysXGIEffect() {
 				rd->free_rid(shaders[i]);
 			}
 		}
-		for (RID r : { hw_pipeline, hw_shader, hw_tlas, hw_blas, hw_corners, hw_prims, linear_sampler, mip_sampler, nearest_sampler, data_buffer, primitive_buffer, node_buffer, cache_keys, cache_cells, geometry_buffer, blue_noise }) {
+		_hw_free(rd);
+		for (RID r : { linear_sampler, mip_sampler, nearest_sampler, data_buffer, primitive_buffer, node_buffer, cache_keys, cache_cells, geometry_buffer, blue_noise }) {
 			if (r.is_valid()) {
 				rd->free_rid(r);
 			}
@@ -2071,139 +2087,260 @@ static int float_bits(float p_value) {
 	return out;
 }
 
-// The hardware trace spike: compile PASS_TRACE with ray queries once, and (re)build the static triangle structure
-// whenever the static part of the tree was rebuilt. Boxes and triangle meshes; other static shapes are left out (and
-// counted). False (software from then on) without ray query support or when anything fails.
-bool PhysXGIEffect::_hw_prepare(RenderingDevice *p_rd, const Snapshot &p_snapshot) {
-	if (hw_failed) {
-		return false;
+// The crash guard for trace_mode 3: written as the hardware path starts, cleared when the effect goes away normally.
+// A session that lost the device (or died any other way) while it was on leaves it set, and the next one traces in
+// software.
+static const char *HW_GUARD_PATH = "user://pxtgi_hardware_trace.guard";
+
+static void hw_guard_write(const String &p_state) {
+	Ref<FileAccess> file = FileAccess::open(HW_GUARD_PATH, FileAccess::WRITE);
+	if (file.is_valid()) {
+		file->store_string(p_state);
 	}
-	if (hw_pipeline.is_null()) {
-		hw_failed = true;
-		if (!p_rd->has_feature(RD::SUPPORTS_RAY_QUERY)) {
-			WARN_PRINT("PXTGI: this device has no ray queries; tracing stays in software.");
-			return false;
-		}
-		Ref<RDShaderFile> file;
-		file.instantiate();
-		const String defines = RendererSceneRenderRD::get_singleton()->is_using_radiance_octmap_array() ? "#define SKY_OCTMAP_ARRAY\n" : "";
-		const String source = String(SHADERS[PASS_TRACE]).replace("@WORLD@", WORLD).replace("@COMMON@", defines + COMMON).replace("#version 450\n", "#version 460\n#extension GL_EXT_ray_query : require\n#define PXTGI_HW_STATIC\n");
-		file->parse_versions_from_text(source);
-		Ref<RDShaderSPIRV> spirv = file->get_spirv();
-		const String err = spirv.is_valid() ? spirv->get_stage_compile_error(RD::SHADER_STAGE_COMPUTE) : file->get_base_error();
-		// The compiler's message without the source listing it appends.
-		ERR_FAIL_COND_V_MSG(spirv.is_null() || !err.is_empty(), false, vformat("PXTGI: hardware trace shader: %s", err.get_slice("\n\nStage", 0)));
-		hw_shader = p_rd->shader_create_from_spirv(file->get_spirv_stages());
-		ERR_FAIL_COND_V(!hw_shader.is_valid(), false);
-		hw_pipeline = p_rd->compute_pipeline_create(hw_shader);
-		ERR_FAIL_COND_V(!hw_pipeline.is_valid(), false);
-		hw_failed = false;
-	}
-	if (p_snapshot.static_version == hw_version && hw_tlas.is_valid()) {
-		return true;
-	}
-	const uint64_t since = OS::get_singleton()->get_ticks_usec();
-	LocalVector<float> corners;
-	LocalVector<int32_t> owners;
-	int skipped = 0;
-	const float *records = p_snapshot.primitives.ptr();
-	const float *geo = p_snapshot.geometry.ptr();
-	for (int i = 0; i < p_snapshot.static_count; i++) {
-		const float *r = records + i * PRIMITIVE_FLOATS;
-		const Transform3D to_local(Basis(r[0], r[1], r[2], r[4], r[5], r[6], r[8], r[9], r[10]), Vector3(r[3], r[7], r[11]));
-		const Transform3D to_world = to_local.affine_inverse();
-		auto triangle = [&](const Vector3 &p_a, const Vector3 &p_b, const Vector3 &p_c) {
-			for (const Vector3 &v : { p_a, p_b, p_c }) {
-				const Vector3 w = to_world.xform(v);
-				corners.push_back(w.x);
-				corners.push_back(w.y);
-				corners.push_back(w.z);
-			}
-			owners.push_back(i);
-		};
-		const int type = int(r[12] + 0.5f);
-		if (type == 0) {
-			const Vector3 e(r[13], r[14], r[15]);
-			Vector3 c[8];
-			for (int k = 0; k < 8; k++) {
-				c[k] = Vector3(k & 1 ? e.x : -e.x, k & 2 ? e.y : -e.y, k & 4 ? e.z : -e.z);
-			}
-			static const int faces[6][4] = { { 0, 2, 3, 1 }, { 4, 5, 7, 6 }, { 0, 1, 5, 4 }, { 2, 6, 7, 3 }, { 0, 4, 6, 2 }, { 1, 3, 7, 5 } };
-			for (const int *f : faces) {
-				triangle(c[f[0]], c[f[1]], c[f[2]]);
-				triangle(c[f[0]], c[f[2]], c[f[3]]);
-			}
-		} else if (type == 5) {
-			// The mesh's triangles: as many as its tree's leaves reach.
-			const int nodes = float_bits(r[13]);
-			const int tris = float_bits(r[14]);
-			int count = 0;
-			LocalVector<int> stack;
-			stack.push_back(0);
-			while (!stack.is_empty()) {
-				const int node = stack[stack.size() - 1];
-				stack.resize(stack.size() - 1);
-				const float *lo = geo + (nodes + node * 2) * 4;
-				const float *hi = lo + 4;
-				const int leaf = float_bits(hi[3]);
-				if (leaf == 0) {
-					stack.push_back(node + 1);
-					stack.push_back(float_bits(lo[3]));
-				} else {
-					count = MAX(count, float_bits(lo[3]) + leaf);
-				}
-			}
-			for (int k = 0; k < count; k++) {
-				const float *a = geo + (tris + k * 3) * 4;
-				triangle(Vector3(a[0], a[1], a[2]), Vector3(a[4], a[5], a[6]), Vector3(a[8], a[9], a[10]));
-			}
-		} else {
-			skipped++;
-		}
-	}
-	for (RID r : { hw_tlas, hw_blas, hw_corners, hw_prims }) {
+}
+
+void PhysXGIEffect::_hw_free(RenderingDevice *p_rd) {
+	// Structures before the buffers they were built from (freeing a buffer frees what was built from it).
+	for (RID r : { hw_static_tlas, hw_moving_tlas, hw_box_blas }) {
 		if (r.is_valid()) {
 			p_rd->free_rid(r);
 		}
 	}
-	hw_tlas = RID();
-	hw_blas = RID();
-	hw_corners = RID();
-	hw_prims = RID();
-	hw_version = p_snapshot.static_version;
-	if (owners.is_empty()) {
+	for (const KeyValue<uint64_t, Pair<RID, RID>> &E : hw_meshes) {
+		if (E.value.second.is_valid()) {
+			p_rd->free_rid(E.value.second);
+		}
+		if (E.value.first.is_valid()) {
+			p_rd->free_rid(E.value.first);
+		}
+	}
+	hw_meshes.clear();
+	if (hw_box_vertices.is_valid()) {
+		p_rd->free_rid(hw_box_vertices);
+	}
+	for (int i = 0; i < PASS_MAX; i++) {
+		if (hw_pipelines[i].is_valid()) {
+			p_rd->free_rid(hw_pipelines[i]);
+		}
+		if (hw_shaders[i].is_valid()) {
+			p_rd->free_rid(hw_shaders[i]);
+		}
+		hw_pipelines[i] = RID();
+		hw_shaders[i] = RID();
+	}
+	hw_static_tlas = RID();
+	hw_moving_tlas = RID();
+	hw_box_blas = RID();
+	hw_box_vertices = RID();
+	hw_moving_capacity = 0;
+	hw_static_version = UINT64_MAX;
+	hw_blocks_version = UINT64_MAX;
+	if (hw_guarded) {
+		hw_guard_write("clean");
+		hw_guarded = false;
+	}
+}
+
+// The passes that trace the world, compiled again with ray queries.
+bool PhysXGIEffect::_hw_compile(RenderingDevice *p_rd) {
+	const String defines = RendererSceneRenderRD::get_singleton()->is_using_radiance_octmap_array() ? "#define SKY_OCTMAP_ARRAY\n" : "";
+	for (int i : { PASS_TRACE, PASS_REFLECT, PASS_CACHE }) {
+		Ref<RDShaderFile> file;
+		file.instantiate();
+		const String source = String(SHADERS[i]).replace("@WORLD@", WORLD).replace("@COMMON@", defines + COMMON).replace("#version 450\n", "#version 460\n#extension GL_EXT_ray_query : require\n#define PXTGI_HW\n");
+		file->parse_versions_from_text(source);
+		Ref<RDShaderSPIRV> spirv = file->get_spirv();
+		const String err = spirv.is_valid() ? spirv->get_stage_compile_error(RD::SHADER_STAGE_COMPUTE) : file->get_base_error();
+		// The compiler's message without the source listing it appends.
+		ERR_FAIL_COND_V_MSG(spirv.is_null() || !err.is_empty(), false, vformat("PXTGI: hardware %s shader: %s", PASS_NAMES[i], err.get_slice("\n\nStage", 0)));
+		hw_shaders[i] = p_rd->shader_create_from_spirv(file->get_spirv_stages());
+		ERR_FAIL_COND_V(!hw_shaders[i].is_valid(), false);
+		hw_pipelines[i] = p_rd->compute_pipeline_create(hw_shaders[i]);
+		ERR_FAIL_COND_V(!hw_pipelines[i].is_valid(), false);
+	}
+	return true;
+}
+
+// One leaf as an instance: its record's local-to-world (a box scaled to its half extents over the unit box), its slot as
+// the custom index. False for a shape the hardware path doesn't have (spheres, capsules, cylinders, hulls) or a mesh
+// whose structure is missing.
+bool PhysXGIEffect::_hw_instance(const Snapshot &p_snapshot, int p_slot, RD::AccelerationStructureInstance &r_instance) const {
+	const float *r = p_snapshot.primitives.ptr() + p_slot * PRIMITIVE_FLOATS;
+	const Transform3D to_local(Basis(r[0], r[1], r[2], r[4], r[5], r[6], r[8], r[9], r[10]), Vector3(r[3], r[7], r[11]));
+	Transform3D to_world = to_local.affine_inverse();
+	const int type = int(r[12] + 0.5f);
+	if (type == 0) {
+		to_world.basis = to_world.basis * Basis::from_scale(Vector3(MAX(r[13], 1e-5f), MAX(r[14], 1e-5f), MAX(r[15], 1e-5f)));
+		r_instance.blas = hw_box_blas;
+	} else if (type == 5 && p_slot < p_snapshot.primitive_keys.size()) {
+		const Pair<RID, RID> *mesh = hw_meshes.getptr(p_snapshot.primitive_keys[p_slot]);
+		if (mesh == nullptr) {
+			return false;
+		}
+		r_instance.blas = mesh->second;
+	} else {
 		return false;
 	}
-	Vector<uint8_t> corner_bytes;
-	corner_bytes.resize(corners.size() * sizeof(float));
-	memcpy(corner_bytes.ptrw(), corners.ptr(), corner_bytes.size());
-	hw_corners = p_rd->vertex_buffer_create(corner_bytes.size(), corner_bytes, RD::BUFFER_CREATION_DEVICE_ADDRESS_BIT | RD::BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT | RD::BUFFER_CREATION_AS_STORAGE_BIT);
-	Vector<uint8_t> owner_bytes;
-	owner_bytes.resize(owners.size() * sizeof(int32_t));
-	memcpy(owner_bytes.ptrw(), owners.ptr(), owner_bytes.size());
-	hw_prims = p_rd->storage_buffer_create(owner_bytes.size(), owner_bytes);
-	RD::AccelerationStructureGeometry geometry;
-	geometry.flags = RD::ACCELERATION_STRUCTURE_GEOMETRY_OPAQUE_BIT;
-	geometry.vertex_buffer = hw_corners;
-	geometry.vertex_stride = 12;
-	geometry.vertex_count = owners.size() * 3;
-	geometry.vertex_format = RD::DATA_FORMAT_R32G32B32_SFLOAT;
-	// Anything failing from here on leaves tracing in software for good: a structure that was never built must not
-	// be queried (that loses the device).
-	hw_failed = true;
-	hw_blas = p_rd->blas_create(Span<RD::AccelerationStructureGeometry>(&geometry, 1), RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT);
-	ERR_FAIL_COND_V(!hw_blas.is_valid(), false);
-	ERR_FAIL_COND_V(p_rd->blas_build(hw_blas) != OK, false);
-	hw_tlas = p_rd->tlas_create(1, RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT);
-	ERR_FAIL_COND_V(!hw_tlas.is_valid(), false);
-	RD::AccelerationStructureInstance instance;
-	instance.blas = hw_blas;
+	r_instance.transform = to_world;
+	r_instance.id = uint32_t(p_slot);
+	r_instance.mask = 0xFF;
 	// RenderingDevice wants a hit shader table range on every instance, though a ray query uses none: offset 0, count 1.
-	instance.hit_sbt_range = RD::HitShaderBindingTableRange(uint64_t(1) << 32);
-	instance.flags = RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT | RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT;
-	ERR_FAIL_COND_V(p_rd->tlas_build(hw_tlas, Span<RD::AccelerationStructureInstance>(&instance, 1)) != OK, false);
+	r_instance.hit_sbt_range = RD::HitShaderBindingTableRange(uint64_t(1) << 32);
+	r_instance.flags = RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT | RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT;
+	return true;
+}
+
+// Brings the structures up to date for this frame; false (and software from then on) when anything fails.
+bool PhysXGIEffect::_hw_update(RenderingDevice *p_rd, const Snapshot &p_snapshot) {
+	if (hw_failed) {
+		return false;
+	}
+	// From here, any early return is a failure.
+	hw_failed = true;
+	if (hw_pipelines[PASS_TRACE].is_null()) {
+		if (!p_rd->has_feature(RD::SUPPORTS_RAY_QUERY)) {
+			print_line("PXTGI: no ray queries on this device; tracing stays in software.");
+			return false;
+		}
+		if (p_snapshot.trace_mode == 3) {
+			// Where it is safe: NVIDIA (the only hardware measured), and no earlier session died with it on.
+			if (!p_rd->get_device_vendor_name().to_lower().contains("nvidia")) {
+				print_line("PXTGI: hardware tracing is only automatic on NVIDIA; tracing stays in software.");
+				return false;
+			}
+			Ref<FileAccess> guard = FileAccess::open(HW_GUARD_PATH, FileAccess::READ);
+			if (guard.is_valid() && guard->get_as_text().strip_edges() != "clean") {
+				print_line("PXTGI: an earlier session ended with hardware tracing on; tracing stays in software.");
+				return false;
+			}
+			hw_guard_write("active");
+			hw_guarded = true;
+		}
+		if (!_hw_compile(p_rd)) {
+			return false;
+		}
+		// The unit box: 12 triangles over corners at +-1.
+		LocalVector<float> box;
+		Vector3 c[8];
+		for (int k = 0; k < 8; k++) {
+			c[k] = Vector3(k & 1 ? 1 : -1, k & 2 ? 1 : -1, k & 4 ? 1 : -1);
+		}
+		static const int faces[6][4] = { { 0, 2, 3, 1 }, { 4, 5, 7, 6 }, { 0, 1, 5, 4 }, { 2, 6, 7, 3 }, { 0, 4, 6, 2 }, { 1, 3, 7, 5 } };
+		for (const int *fc : faces) {
+			for (int k : { fc[0], fc[1], fc[2], fc[0], fc[2], fc[3] }) {
+				box.push_back(c[k].x);
+				box.push_back(c[k].y);
+				box.push_back(c[k].z);
+			}
+		}
+		Vector<uint8_t> bytes;
+		bytes.resize(box.size() * sizeof(float));
+		memcpy(bytes.ptrw(), box.ptr(), bytes.size());
+		hw_box_vertices = p_rd->vertex_buffer_create(bytes.size(), bytes, RD::BUFFER_CREATION_DEVICE_ADDRESS_BIT | RD::BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT);
+		RD::AccelerationStructureGeometry geometry;
+		geometry.flags = RD::ACCELERATION_STRUCTURE_GEOMETRY_OPAQUE_BIT;
+		geometry.vertex_buffer = hw_box_vertices;
+		geometry.vertex_stride = 12;
+		geometry.vertex_count = 36;
+		geometry.vertex_format = RD::DATA_FORMAT_R32G32B32_SFLOAT;
+		hw_box_blas = p_rd->blas_create(Span<RD::AccelerationStructureGeometry>(&geometry, 1), RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT);
+		ERR_FAIL_COND_V(!hw_box_blas.is_valid() || p_rd->blas_build(hw_box_blas) != OK, false);
+		print_line(vformat("PXTGI: hardware tracing on (%s).", p_rd->get_device_name()));
+	}
+	// A structure for each mesh not seen before (its triangles as laid out in its geometry block: 16 bytes a corner).
+	if (p_snapshot.blocks_version != hw_blocks_version) {
+		hw_blocks_version = p_snapshot.blocks_version;
+		const uint64_t since = OS::get_singleton()->get_ticks_usec();
+		int built = 0;
+		int64_t triangles = 0;
+		for (int i = 0; i < p_snapshot.block_keys.size(); i++) {
+			const uint64_t key = p_snapshot.block_keys[i];
+			const Vector<float> &tris = p_snapshot.block_triangles[i];
+			if (hw_meshes.has(key) || tris.size() < 12) {
+				continue;
+			}
+			const Span<uint8_t> data((const uint8_t *)tris.ptr(), tris.size() * sizeof(float));
+			const RID vertices = p_rd->vertex_buffer_create(data.size(), data, RD::BUFFER_CREATION_DEVICE_ADDRESS_BIT | RD::BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT);
+			ERR_FAIL_COND_V(!vertices.is_valid(), false);
+			RD::AccelerationStructureGeometry geometry;
+			geometry.flags = RD::ACCELERATION_STRUCTURE_GEOMETRY_OPAQUE_BIT;
+			geometry.vertex_buffer = vertices;
+			geometry.vertex_stride = 16;
+			geometry.vertex_count = tris.size() / 4;
+			geometry.vertex_format = RD::DATA_FORMAT_R32G32B32_SFLOAT;
+			const RID blas = p_rd->blas_create(Span<RD::AccelerationStructureGeometry>(&geometry, 1), RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT);
+			ERR_FAIL_COND_V(!blas.is_valid() || p_rd->blas_build(blas) != OK, false);
+			hw_meshes.insert(key, Pair<RID, RID>(vertices, blas));
+			built++;
+			triangles += tris.size() / 12;
+		}
+		if (built > 0) {
+			print_line(vformat("PXTGI: %d mesh structures (%d triangles) in %.1f ms; %d meshes in all.", built, triangles, (OS::get_singleton()->get_ticks_usec() - since) / 1000.0, hw_meshes.size()));
+		}
+	}
+	// The static shapes: their structure is rebuilt only when they really changed (the static part of the tree can be
+	// laid out again with the same shapes).
+	if (p_snapshot.static_version != hw_static_version || hw_static_tlas.is_null()) {
+		hw_static_version = p_snapshot.static_version;
+		const int count = p_snapshot.static_count;
+		// Where and what each shape is (a record's first 16 floats); its look is read from the records at a hit.
+		uint32_t hash = HASH_MURMUR3_SEED;
+		for (int i = 0; i < count; i++) {
+			hash = hash_murmur3_buffer(p_snapshot.primitives.ptr() + i * PRIMITIVE_FLOATS, 16 * sizeof(float), hash);
+		}
+		if (p_snapshot.primitive_keys.size() >= count) {
+			hash = hash_murmur3_buffer(p_snapshot.primitive_keys.ptr(), count * sizeof(uint64_t), hash);
+		}
+		if (hash != hw_static_hash || hw_static_tlas.is_null()) {
+			hw_static_hash = hash;
+			const uint64_t since = OS::get_singleton()->get_ticks_usec();
+			LocalVector<RD::AccelerationStructureInstance> instances;
+			instances.resize(MAX(count, 1));
+			for (int i = 0; i < count; i++) {
+				if (!_hw_instance(p_snapshot, i, instances[i])) {
+					print_line(vformat("PXTGI: static shape %d has no hardware structure (type %d); tracing stays in software.", i, int(p_snapshot.primitives[i * PRIMITIVE_FLOATS + 12] + 0.5f)));
+					return false;
+				}
+			}
+			if (count == 0) {
+				instances[0].blas = hw_box_blas;
+				instances[0].mask = 0; // nothing: a ray never meets it
+				instances[0].hit_sbt_range = RD::HitShaderBindingTableRange(uint64_t(1) << 32);
+			}
+			if (hw_static_tlas.is_valid()) {
+				p_rd->free_rid(hw_static_tlas);
+			}
+			hw_static_tlas = p_rd->tlas_create(instances.size(), RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT);
+			ERR_FAIL_COND_V(!hw_static_tlas.is_valid(), false);
+			ERR_FAIL_COND_V(p_rd->tlas_build(hw_static_tlas, Span<RD::AccelerationStructureInstance>(instances.ptr(), instances.size())) != OK, false);
+			print_line(vformat("PXTGI: static structure, %d shapes in %.2f ms (frame %d).", count, (OS::get_singleton()->get_ticks_usec() - since) / 1000.0, int64_t(Engine::get_singleton()->get_frames_drawn())));
+		}
+	}
+	// The moving shapes, every frame (bikes, riders' walls).
+	const int moving = p_snapshot.primitive_count - p_snapshot.static_count;
+	LocalVector<RD::AccelerationStructureInstance> instances;
+	instances.resize(MAX(moving, 1));
+	for (int i = 0; i < moving; i++) {
+		if (!_hw_instance(p_snapshot, p_snapshot.static_count + i, instances[i])) {
+			print_line(vformat("PXTGI: moving shape %d has no hardware structure; tracing stays in software.", p_snapshot.static_count + i));
+			return false;
+		}
+	}
+	if (moving == 0) {
+		instances[0].blas = hw_box_blas;
+		instances[0].mask = 0;
+		instances[0].hit_sbt_range = RD::HitShaderBindingTableRange(uint64_t(1) << 32);
+	}
+	if (instances.size() > hw_moving_capacity) {
+		if (hw_moving_tlas.is_valid()) {
+			p_rd->free_rid(hw_moving_tlas);
+		}
+		hw_moving_capacity = MAX(1024u, Math::next_power_of_2(uint32_t(instances.size() * 2)));
+		hw_moving_tlas = p_rd->tlas_create(hw_moving_capacity, RD::ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT);
+		ERR_FAIL_COND_V(!hw_moving_tlas.is_valid(), false);
+	}
+	ERR_FAIL_COND_V(p_rd->tlas_build(hw_moving_tlas, Span<RD::AccelerationStructureInstance>(instances.ptr(), instances.size())) != OK, false);
 	hw_failed = false;
-	print_line(vformat("PXTGI_HW static structure: %d triangles from %d shapes (%d other shapes left out), %.1f ms", int(owners.size()), p_snapshot.static_count, skipped, (OS::get_singleton()->get_ticks_usec() - since) / 1000.0));
 	return true;
 }
 
@@ -2341,12 +2478,18 @@ void PhysXGIEffect::_dispatch(RenderingDevice *p_rd, int p_pass, const Vector<RD
 		uniforms.push_back(u);
 	}
 	uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_UNIFORM_BUFFER, 9, data_buffer));
-	const RID set = UniformSetCacheRD::get_singleton()->get_cache_vec(shaders[p_pass], 0, uniforms);
+	const bool hw = hw_active && hw_pipelines[p_pass].is_valid();
+	if (hw) {
+		uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_ACCELERATION_STRUCTURE, 15, hw_static_tlas));
+		uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_ACCELERATION_STRUCTURE, 16, hw_moving_tlas));
+	}
+	const RID shader = hw ? hw_shaders[p_pass] : shaders[p_pass];
+	const RID set = UniformSetCacheRD::get_singleton()->get_cache_vec(shader, 0, uniforms);
 	ERR_FAIL_COND(!set.is_valid());
 	// GPU timestamps per pass (the visual profiler shows them).
 	p_rd->capture_timestamp(String("PXTGI ") + PASS_NAMES[p_pass]);
 	const RD::ComputeListID list = p_rd->compute_list_begin();
-	p_rd->compute_list_bind_compute_pipeline(list, pipelines[p_pass]);
+	p_rd->compute_list_bind_compute_pipeline(list, hw ? hw_pipelines[p_pass] : pipelines[p_pass]);
 	p_rd->compute_list_bind_uniform_set(list, set, 0);
 	if (p_push_size > 0) {
 		p_rd->compute_list_set_push_constant(list, p_push, p_push_size);
@@ -2559,6 +2702,9 @@ void PhysXGIEffect::_render(int p_callback_type, const RenderData *p_render_data
 	data.counts[0] = s.primitive_count;
 	data.counts[1] = s.trace_mode == 1 ? 0 : s.node_count; // trace mode 1: world rays find nothing (their share)
 	data.hw[0] = float(s.moving_root);
+	// Hardware tracing for this frame's world rays (trace, reflect, cache) when it is asked for and everything is up
+	// to date; the software walk otherwise.
+	hw_active = (s.trace_mode == 2 || s.trace_mode == 3) && _hw_update(rd, s);
 	data.counts[2] = s.omni_count;
 	data.counts[3] = s.spot_count;
 	for (int i = 0; i < s.spot_count; i++) {
@@ -2686,21 +2832,7 @@ void PhysXGIEffect::_render(int p_callback_type, const RenderData *p_render_data
 	if (s.multi_bounce && s.primitive_count > 0) {
 		_dispatch(rd, PASS_CACHE, { sampled(0, nearest_sampler, depth), sampled(2, linear_sampler, color), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 4, primitive_buffer), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 5, node_buffer), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 6, cache_keys), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 7, cache_cells), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 10, geometry_buffer), sampled(11, linear_sampler, sky_map) }, Size2i(CACHE_ROW, CACHE_SLOTS / CACHE_ROW / 4), nullptr, 0);
 	}
-	// Hardware trace spike: PASS_TRACE's static shapes through ray queries, the moving part in software.
-	const bool hw_trace = s.trace_mode == 2 && _hw_prepare(rd, s);
-	Vector<RD::Uniform> trace_uniforms = { sampled(0, nearest_sampler, depth), sampled(1, nearest_sampler, normal), sampled(2, mip_sampler, color), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 3, v.trace), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 4, primitive_buffer), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 5, node_buffer), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 6, cache_keys), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 7, cache_cells), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 10, geometry_buffer), sampled(11, linear_sampler, sky_map), sampled(14, nearest_sampler, blue_noise) };
-	if (hw_trace) {
-		trace_uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_ACCELERATION_STRUCTURE, 15, hw_tlas));
-		trace_uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 16, hw_corners));
-		trace_uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 17, hw_prims));
-		SWAP(shaders[PASS_TRACE], hw_shader);
-		SWAP(pipelines[PASS_TRACE], hw_pipeline);
-	}
-	_dispatch(rd, PASS_TRACE, trace_uniforms, v.trace_size, nullptr, 0);
-	if (hw_trace) {
-		SWAP(shaders[PASS_TRACE], hw_shader);
-		SWAP(pipelines[PASS_TRACE], hw_pipeline);
-	}
+	_dispatch(rd, PASS_TRACE, { sampled(0, nearest_sampler, depth), sampled(1, nearest_sampler, normal), sampled(2, mip_sampler, color), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 3, v.trace), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 4, primitive_buffer), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 5, node_buffer), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 6, cache_keys), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 7, cache_cells), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 10, geometry_buffer), sampled(11, linear_sampler, sky_map), sampled(14, nearest_sampler, blue_noise) }, v.trace_size, nullptr, 0);
 
 	int32_t history[4] = { v.have_history ? 1 : 0, 0, 0, 0 };
 	_dispatch(rd, PASS_TEMPORAL, { sampled(0, nearest_sampler, v.trace), sampled(1, linear_sampler, v.accum[prev]), sampled(2, nearest_sampler, v.accum_depth[prev]), sampled(3, nearest_sampler, depth), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 4, v.accum[v.current]), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 5, v.accum_depth[v.current]), sampled(6, linear_sampler, v.moments[prev]), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 7, v.moments[v.current]), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 8, v.variance) }, v.trace_size, history, sizeof(history));

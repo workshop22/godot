@@ -172,13 +172,18 @@ class PXTGI3D : public Node3D {
 	bool static_rooted = false; // the static part was built under a shared root
 	uint64_t static_version = 0; // the static part's layout: bumped whenever it is rebuilt (hardware trace spike)
 	int moving_root_node = -1; // the moving part's root node, -1 with no moving part
-	int trace_mode = 0; // spike: 0 software, 1 world rays find nothing (their share of the cost), 2 hardware queries for the static part
+	int trace_mode = 0; // 0 software, 1 world rays find nothing (their share of the cost), 2 hardware, 3 hardware where it is safe (NVIDIA, no earlier session lost with it)
 	bool static_dirty = true;
 	bool moving_dirty = true;
 	bool radiance_dirty = false; // only glow changed: the records in place, not the tree
 	Vector<float> published_primitives;
 	Vector<float> published_nodes;
 	int published_count = 0;
+	// Hardware tracing: each leaf's mesh (its Shape3D's id; 0 for a box), and every mesh's triangles by that id.
+	Vector<uint64_t> published_keys;
+	Vector<uint64_t> published_block_keys;
+	Vector<Vector<float>> published_block_triangles;
+	uint64_t published_blocks_version = UINT64_MAX;
 	uint64_t primitives_version = 0;
 
 	void _rescan();
@@ -268,7 +273,7 @@ public:
 	int get_reflection_mode() const { return reflection_mode; }
 	void set_reflection_roughness_cutoff(float p_value) { reflection_cutoff = CLAMP(p_value, 0.0f, 1.0f); }
 	float get_reflection_roughness_cutoff() const { return reflection_cutoff; }
-	void set_trace_mode(int p_mode) { trace_mode = CLAMP(p_mode, 0, 2); }
+	void set_trace_mode(int p_mode) { trace_mode = CLAMP(p_mode, 0, 3); }
 	int get_trace_mode() const { return trace_mode; }
 	void set_debug(int p_value) { debug = p_value; }
 	int get_debug() const { return debug; }

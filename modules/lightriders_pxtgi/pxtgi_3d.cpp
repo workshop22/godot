@@ -1631,6 +1631,32 @@ void PXTGI3D::_update_primitives(PhysXGIEffect::Snapshot &r_snapshot) {
 		radiance_dirty = false;
 		_stage(STAGE_COPY, copy_since);
 	}
+	if (trace_mode >= 2) {
+		// Which mesh each leaf is, and the meshes' triangles (only when the geometry was laid out again).
+		if (rebuilt || published_keys.size() != int(leaf_order.size())) {
+			published_keys.resize(leaf_order.size());
+			uint64_t *keys = published_keys.ptrw();
+			for (uint32_t k = 0; k < leaf_order.size(); k++) {
+				const ShapeEntry &entry = shapes[leaf_order[k]];
+				keys[k] = entry.geometry_type == 5 ? uint64_t(entry.shape_resource) : 0;
+			}
+		}
+		if (published_blocks_version != geometry_version) {
+			published_blocks_version = geometry_version;
+			published_block_keys.clear();
+			published_block_triangles.clear();
+			for (const KeyValue<ObjectID, GeometryBlock> &E : geometry_blocks) {
+				if (E.value.type == 5) {
+					published_block_keys.push_back(uint64_t(E.key));
+					published_block_triangles.push_back(E.value.triangles);
+				}
+			}
+		}
+		r_snapshot.primitive_keys = published_keys;
+		r_snapshot.block_keys = published_block_keys;
+		r_snapshot.block_triangles = published_block_triangles;
+		r_snapshot.blocks_version = published_blocks_version;
+	}
 	r_snapshot.primitives = published_primitives;
 	r_snapshot.primitive_count = published_count;
 	r_snapshot.nodes = published_nodes;
@@ -2012,6 +2038,6 @@ void PXTGI3D::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "filtered_hits"), "set_filtered_hits", "get_filtered_hits");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "reflection_mode", PROPERTY_HINT_ENUM, "Godot,Screen Space,Traced,Traced + Probes"), "set_reflection_mode", "get_reflection_mode");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "reflection_roughness_cutoff", PROPERTY_HINT_RANGE, "0,1,0.01"), "set_reflection_roughness_cutoff", "get_reflection_roughness_cutoff");
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "trace_mode", PROPERTY_HINT_ENUM, "Software,World Misses,Hardware Static"), "set_trace_mode", "get_trace_mode");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "trace_mode", PROPERTY_HINT_ENUM, "Software,World Misses,Hardware,Hardware If Safe"), "set_trace_mode", "get_trace_mode");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "debug", PROPERTY_HINT_ENUM, "Off,Last Frame,Round Trip,World Only,World Hits,World Position,Screen Only"), "set_debug", "get_debug");
 }
