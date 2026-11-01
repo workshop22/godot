@@ -33,6 +33,7 @@
 #include "core/config/engine.h"
 #include "core/config/project_settings.h"
 #include "core/os/os.h"
+#include "core/os/thread.h"
 #include "core/templates/fixed_vector.h"
 #include "drivers/vulkan/vulkan_hooks.h"
 
@@ -7133,7 +7134,7 @@ void RenderingDeviceDriverVulkan::print_lost_device_info() {
 			const uint64_t high = top64 > latest ? top64 - (uint64_t(1) << 32) : top64;
 			const uint64_t bottom64 = (latest & ~uint64_t(UINT32_MAX)) | bottom;
 			const uint64_t low = bottom64 > latest ? bottom64 - (uint64_t(1) << 32) : bottom64;
-			String msg = vformat("NV checkpoints (buffer markers): recorded up to #%d; top of pipe #%d, bottom of pipe #%d", latest, high, low);
+			String msg = vformat("NV checkpoints (buffer markers): recorded up to #%d; top of pipe #%d, bottom of pipe #%d; render thread %d", latest, high, low, uint64_t(Thread::get_caller_id()));
 			msg += vformat("\n   top    #%d %s", high, rendering_device_graph_checkpoint_describe(high));
 			msg += vformat("\n   bottom #%d %s", low, rendering_device_graph_checkpoint_describe(low));
 			if (high >= low && low > 0) {
