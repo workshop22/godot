@@ -1807,6 +1807,12 @@ void RendererSceneCull::_update_instance(Instance *p_instance) const {
 				idata.instance_data_rid = light_data->instance.get_id();
 				light_data->uses_projector = RSG::light_storage->light_has_projector(p_instance->base);
 				light_data->uses_softshadow = RSG::light_storage->light_get_type(p_instance->base) == RSE::LIGHT_AREA || RSG::light_storage->light_get_param(p_instance->base, RSE::LIGHT_PARAM_SIZE) > CMP_EPSILON;
+				// Diagnostic (engine-pin lane): LIGHTRIDERS_SOFT_NEEDS_SHADOW=1 drops the soft-shadow pairing for lights
+				// without shadows (their soft path can't run), to A/B the device loss.
+				static const bool soft_needs_shadow = OS::get_singleton()->has_environment("LIGHTRIDERS_SOFT_NEEDS_SHADOW");
+				if (soft_needs_shadow && !RSG::light_storage->light_has_shadow(p_instance->base)) {
+					light_data->uses_softshadow = false;
+				}
 			} break;
 			case RSE::INSTANCE_REFLECTION_PROBE: {
 				idata.instance_data_rid = static_cast<InstanceReflectionProbeData *>(p_instance->base_data)->instance.get_id();

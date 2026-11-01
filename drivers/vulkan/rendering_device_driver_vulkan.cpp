@@ -101,6 +101,13 @@ String rendering_device_graph_checkpoint_describe(uint64_t p_marker);
 uint64_t rendering_device_graph_checkpoint_latest();
 #endif
 
+// Diagnostic (engine-pin lane): LIGHTRIDERS_NO_RESPV=1 leaves specialization to the driver (no re-spirv), to A/B the
+// device loss against re-spirv's optimized shaders.
+static bool rdd_no_respv() {
+	static const bool no_respv = OS::get_singleton()->has_environment("LIGHTRIDERS_NO_RESPV");
+	return no_respv;
+}
+
 // Record numerous statistics about pipeline creation such as time and shader sizes. When combined with enabling
 // and disabling re-spirv, this can be used to measure its effects.
 #define RECORD_PIPELINE_STATISTICS 0
@@ -4417,7 +4424,7 @@ RDD::ShaderID RenderingDeviceDriverVulkan::shader_create_from_container(const Re
 	Vector<uint8_t> decompressed_code;
 	VkShaderModule vk_module;
 	PackedByteArray decoded_spirv;
-	const bool use_respv = (RESPV_ENABLED == 1) && !shader_container_format.get_debug_info_enabled();
+	const bool use_respv = (RESPV_ENABLED == 1) && !shader_container_format.get_debug_info_enabled() && !rdd_no_respv();
 	const bool store_respv = use_respv && !shader_refl.specialization_constants.is_empty();
 	const int64_t stage_count = shader_refl.stages_vector.size();
 	shader_info.vk_stages_create_info.reserve(stage_count);
