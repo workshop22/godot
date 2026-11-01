@@ -110,7 +110,7 @@ String rendering_device_graph_checkpoint_describe(uint64_t p_marker) {
 		kind = vformat("%s #%d (%d x %d) area %dx%d", kind, c.index, c.a, c.b, c.width, c.height);
 	} else {
 		kind = (c.kind - 1000) < std_size(commands) ? commands[c.kind - 1000] : "command ?";
-		if (c.kind == 1000 + RecordedCommand::TYPE_DRAW_LIST) {
+		if (c.kind == 1000 + RenderingDeviceGraph::RecordedCommand::TYPE_DRAW_LIST) {
 			kind += vformat(" area %dx%d", c.width, c.height);
 		}
 	}
