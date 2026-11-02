@@ -2396,6 +2396,23 @@ bool PhysXGIEffect::_hw_update(RenderingDevice *p_rd, const Snapshot &p_snapshot
 	// A structure for each mesh not seen before (its triangles as laid out in its geometry block: 16 bytes a corner).
 	if (p_snapshot.blocks_version != hw_blocks_version) {
 		hw_blocks_version = p_snapshot.blocks_version;
+		HashSet<uint64_t> live;
+		for (uint64_t key : p_snapshot.block_keys) {
+			live.insert(key);
+		}
+		LocalVector<uint64_t> retired;
+		for (const KeyValue<uint64_t, Pair<RID, RID>> &entry : hw_meshes) {
+			if (!live.has(entry.key)) {
+				retired.push_back(entry.key);
+			}
+		}
+		for (uint64_t key : retired) {
+			// RenderingDevice defers destruction until the in-flight frame has completed.
+			const Pair<RID, RID> mesh = hw_meshes[key];
+			p_rd->free_rid(mesh.second);
+			p_rd->free_rid(mesh.first);
+			hw_meshes.erase(key);
+		}
 		const uint64_t since = OS::get_singleton()->get_ticks_usec();
 		int built = 0;
 		int64_t triangles = 0;

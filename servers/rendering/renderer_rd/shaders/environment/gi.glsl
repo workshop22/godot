@@ -30,6 +30,7 @@ layout(set = 0, binding = 5) uniform texture3D occlusion_texture;
 
 layout(set = 0, binding = 6) uniform sampler linear_sampler;
 layout(set = 0, binding = 7) uniform sampler linear_sampler_with_mipmaps;
+layout(set = 0, binding = 8) uniform sampler nearest_sampler;
 
 struct ProbeCascadeData {
 	vec3 position;
@@ -162,7 +163,7 @@ vec3 reconstruct_position(ivec2 screen_pos) {
 	if (sc_use_full_projection_matrix) {
 		vec4 pos;
 		pos.xy = (2.0 * vec2(screen_pos) / vec2(scene_data.screen_size)) - 1.0;
-		pos.z = texelFetch(sampler2D(depth_buffer, linear_sampler), screen_pos, 0).r;
+		pos.z = texelFetch(sampler2D(depth_buffer, nearest_sampler), screen_pos, 0).r;
 		pos.w = 1.0;
 
 		pos = scene_data.inv_projection[params.view_index] * pos;
@@ -170,7 +171,7 @@ vec3 reconstruct_position(ivec2 screen_pos) {
 		return pos.xyz / pos.w;
 	} else {
 		vec3 pos;
-		pos.z = texelFetch(sampler2D(depth_buffer, linear_sampler), screen_pos, 0).r;
+		pos.z = texelFetch(sampler2D(depth_buffer, nearest_sampler), screen_pos, 0).r;
 
 		pos.z = pos.z * 2.0 - 1.0;
 		if (params.orthogonal) {
@@ -607,7 +608,7 @@ void voxel_gi_compute(uint index, vec3 position, vec3 normal, vec3 ref_vec, mat3
 }
 
 vec4 fetch_normal_and_roughness(ivec2 pos) {
-	vec4 normal_roughness = texelFetch(sampler2D(normal_roughness_buffer, linear_sampler), pos, 0);
+	vec4 normal_roughness = texelFetch(sampler2D(normal_roughness_buffer, nearest_sampler), pos, 0);
 	normal_roughness.xyz = normalize(normal_roughness.xyz * 2.0 - 1.0);
 	return normal_roughness;
 }
@@ -639,7 +640,7 @@ void process_gi(ivec2 pos, vec3 vertex, inout vec4 ambient_light, inout vec4 ref
 #ifdef SAMPLE_VOXEL_GI_NEAREST
 			uvec2 voxel_gi_tex = texelFetch(voxel_gi_buffer, pos, 0).rg;
 #else
-			uvec2 voxel_gi_tex = texelFetch(usampler2D(voxel_gi_buffer, linear_sampler), pos, 0).rg;
+			uvec2 voxel_gi_tex = texelFetch(usampler2D(voxel_gi_buffer, nearest_sampler), pos, 0).rg;
 #endif
 			roughness *= roughness;
 			//find arbitrary tangent and bitangent, then build a matrix
