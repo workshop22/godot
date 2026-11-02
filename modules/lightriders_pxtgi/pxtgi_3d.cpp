@@ -1231,9 +1231,18 @@ void PXTGI3D::_refresh_geometry() {
 			continue;
 		}
 		_geometry_for(resource);
-		const GeometryBlock &block = geometry_blocks[id];
+		GeometryBlock &block = geometry_blocks[id];
 		const int words = (block.planes.size() + block.nodes.size() + block.triangles.size()) / 4;
-		relayout |= words != block.words || (words > 0 && block.offset < 0);
+		if (words > 0 && block.offset < 0) {
+			// A reserved empty pool shape becomes a wall: append its first block without
+			// moving any existing geometry or invalidating the static city's tree.
+			block.offset = geometry.size() / 4;
+			block.words = words;
+			geometry.append_array(block.planes);
+			geometry.append_array(block.nodes);
+			geometry.append_array(block.triangles);
+		}
+		relayout |= words != block.words;
 		blocks.push_back(id);
 		for (int i : *entries) {
 			ShapeEntry &entry = shapes[i];
