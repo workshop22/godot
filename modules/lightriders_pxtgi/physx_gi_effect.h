@@ -34,6 +34,7 @@
 #include "core/math/transform_3d.h"
 #include "core/os/mutex.h"
 #include "core/templates/hash_map.h"
+#include "core/templates/hash_set.h"
 #include "core/templates/local_vector.h"
 #include "scene/resources/compositor.h"
 #include "servers/rendering/renderer_rd/storage_rd/render_buffer_custom_data_rd.h"
@@ -64,7 +65,10 @@ public:
 	RID reflect_motion; // previous minus current UV of the reflected point, virtual depth, valid
 	RID primitive_motion; // current world point -> its previous rendered world point, by primitive slot
 	uint32_t primitive_motion_capacity = 0;
+	Vector<float> primitive_motion_data;
+	uint64_t primitive_motion_static_version = UINT64_MAX;
 	HashMap<uint64_t, Pair<uint64_t, Transform3D>> previous_shapes;
+	HashSet<uint64_t> previous_moving_shapes;
 	RID reflect_accum[2]; // reflection size: accumulated, ping-ponged
 	RID reflect_info[2]; // reflection size: frames of history, hit distance, motion in the reflection
 	RID reflect_depth[2];
@@ -128,6 +132,16 @@ public:
 	// An inner node's left child follows it.
 	static constexpr int NODE_FLOATS = 8;
 
+	// Immutable shape revisions share their small source arrays with the render snapshot.
+	// Keeping these separate avoids copying the entire city when one wall grows.
+	struct GeometryUpload {
+		uint64_t key = 0;
+		int offset = 0; // floats, in the packed GPU geometry buffer
+		Vector<float> planes;
+		Vector<float> nodes;
+		Vector<float> triangles;
+	};
+
 	struct Snapshot {
 		RID compositor;
 		RID environment;
@@ -146,9 +160,10 @@ public:
 		uint64_t blocks_version = 0;
 		Vector<float> nodes;
 		int node_count = 0;
-		// Hull planes and mesh trees and triangles (vec4s), shared by the primitives that point into it; uploaded when
-		// the version changes.
-		Vector<float> geometry;
+		// The complete current block list, not a delta: render frames may skip publications.
+		// Only changed revisions or offsets need uploading into the shared geometry buffer.
+		Vector<GeometryUpload> geometry;
+		int geometry_floats = 0;
 		uint64_t geometry_version = 0;
 		Vector3 sun_direction; // toward the sun, world space
 		Color sun_color; // linear, times energy; black for none
@@ -234,6 +249,8 @@ private:
 	RID node_buffer;
 	int node_capacity = 0;
 	RID geometry_buffer;
+	uint32_t geometry_capacity = 0; // floats
+	HashMap<uint64_t, int> geometry_offsets; // uploaded revision key -> float offset
 	uint64_t geometry_uploaded = UINT64_MAX;
 	ObjectID snapshot_owner;
 	bool failed = false;
@@ -262,6 +279,9 @@ private:
 	uint64_t hw_static_us = 0;
 	uint64_t hw_moving_us = 0;
 	uint64_t hw_update_us = 0;
+	uint64_t motion_update_us = 0;
+	uint64_t geometry_update_us = 0;
+	uint64_t geometry_update_bytes = 0;
 	void _render_frame(int p_callback_type, const RenderData *p_render_data);
 	bool _hw_update(RenderingDevice *p_rd, const Snapshot &p_snapshot);
 	bool _hw_instance(const Snapshot &p_snapshot, int p_slot, RD::AccelerationStructureInstance &r_instance) const;

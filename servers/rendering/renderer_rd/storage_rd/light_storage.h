@@ -301,6 +301,9 @@ private:
 		RendererRD::ForwardID forward_id = -1;
 
 		Transform3D transform;
+		Transform3D capture_transform;
+		Transform3D captured_transform;
+		bool capture_valid = false;
 	};
 
 	mutable RID_Owner<ReflectionProbeInstance> reflection_probe_instance_owner;
@@ -988,6 +991,18 @@ public:
 		ERR_FAIL_NULL_V(rpi, Transform3D());
 
 		return rpi->transform;
+	}
+
+	// A moving probe can wait for a capture slot while its previous image remains
+	// in the atlas. Texture-source lookups must use the pose of that image.
+	_FORCE_INLINE_ bool reflection_probe_instance_get_captured_transform(RID p_instance, Transform3D &r_transform) {
+		ReflectionProbeInstance *rpi = reflection_probe_instance_owner.get_or_null(p_instance);
+		ERR_FAIL_NULL_V(rpi, false);
+		if (!rpi->capture_valid || rpi->atlas_index < 0) {
+			return false;
+		}
+		r_transform = rpi->captured_transform;
+		return true;
 	}
 
 	_FORCE_INLINE_ int reflection_probe_instance_get_atlas_index(RID p_instance) {

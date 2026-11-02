@@ -73,6 +73,8 @@ class PXTGI3D : public Node3D {
 	// and emissive meshes outside any body, which stand in as their bounding box (mesh_proxy).
 	struct ShapeEntry {
 		ObjectID shape_node;
+		ObjectID body_node;
+		int previous_index = -1; // preceding scan's record, before entry_of is updated in place
 		uint64_t motion_generation = 0; // pooled proxy identity, independent of geometry revisions
 		Color albedo;
 		Color emission;
@@ -111,10 +113,10 @@ class PXTGI3D : public Node3D {
 	HashMap<ObjectID, GeometryBlock> geometry_blocks;
 	HashSet<ObjectID> geometry_dirty;
 	HashMap<ObjectID, LocalVector<int>> geometry_entries;
-	Vector<float> geometry;
+	int geometry_floats = 0; // logical size; the immutable blocks are packed only on the GPU
+	Vector<PhysXGIEffect::GeometryUpload> published_geometry;
+	uint64_t published_geometry_version = UINT64_MAX;
 	uint64_t geometry_version = 0;
-	uint32_t geometry_signature = 0;
-	bool geometry_layout_dirty = false; // appended ranges differ from the cached canonical layout
 
 	const GeometryBlock *_geometry_for(const Ref<Shape3D> &p_shape);
 	void _geometry_changed(ObjectID p_shape);
@@ -198,8 +200,8 @@ class PXTGI3D : public Node3D {
 	uint64_t published_blocks_version = UINT64_MAX;
 	uint64_t primitives_version = 0;
 
-	void _rescan();
-	void _keep_records(const LocalVector<ShapeEntry> &p_was, const HashMap<ObjectID, int> &p_was_index, const LocalVector<float> &p_was_floats, const LocalVector<AABB> &p_was_bounds, const LocalVector<uint8_t> &p_was_valid);
+	void _rescan(const LocalVector<ShapeEntry> &p_was);
+	void _keep_records(const LocalVector<ShapeEntry> &p_was, const LocalVector<float> &p_was_floats, const LocalVector<AABB> &p_was_bounds, const LocalVector<uint8_t> &p_was_valid);
 	bool _shape_frame(int p_index, Transform3D &r_to_world, float &r_type, Vector3 &r_extents) const;
 	void _pack_entry(int p_index, const Transform3D &p_to_world, float p_type, const Vector3 &p_extents, float *r_out, AABB &r_bounds) const;
 	bool _refresh_entry(int p_index, float *r_out, AABB &r_bounds);
@@ -223,6 +225,9 @@ class PXTGI3D : public Node3D {
 		STAGE_MOVING_TREE, // the moving part rebuilt
 		STAGE_SELECT, // the directly sampled emitters chosen
 		STAGE_COPY, // records and tree handed to the renderer
+		STAGE_SCAN_MEMBERS,
+		STAGE_SCAN_LAYOUT,
+		STAGE_SCAN_KEEP,
 		STAGE_MAX,
 	};
 	struct StageTime {

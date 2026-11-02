@@ -124,6 +124,7 @@ layout(set = 0, binding = 9, std140) uniform Frame {
 	vec4 src_box[8];
 	vec4 src_offset[8];
 	vec4 src_capture[8];
+	vec4 src_usage[8]; // x: fallback intensity; zero-intensity captures only colour actual traced hits
 	ivec4 srcs; // x: count
 	vec4 src_border; // x: the atlas maps' border, y: the scale inside it, z: the roughest level
 	vec4 trace_settings; // x: reflection reach, y: filtered mirror rays, z: previous colour is valid, w: reflection softness
@@ -1766,6 +1767,9 @@ vec3 probe_reflection(vec3 w, vec3 r, float rough, out float r_weight) {
 	vec3 l = vec3(0.0);
 	for (int i = 0; i < f.srcs.x; i++) {
 		vec3 li = vec3(dot(f.src_x[i].xyz, w) + f.src_x[i].w, dot(f.src_y[i].xyz, w) + f.src_y[i].w, dot(f.src_z[i].xyz, w) + f.src_z[i].w);
+		if (f.src_usage[i].x <= 0.0) {
+			continue;
+		}
 		vec3 e = f.src_box[i].xyz;
 		float volume = e.x * e.y * e.z;
 		if (all(lessThanEqual(abs(li), e)) && volume < best_volume) {
@@ -1795,7 +1799,7 @@ vec3 probe_reflection(vec3 w, vec3 r, float rough, out float r_weight) {
 	d /= abs(d.x) + abs(d.y) + abs(d.z);
 	vec2 uv = d.z >= 0.0 ? d.xy : (1.0 - abs(d.yx)) * vec2(d.x >= 0.0 ? 1.0 : -1.0, d.y >= 0.0 ? 1.0 : -1.0);
 	uv = (uv * 0.5 + 0.5) * f.src_border.y + f.src_border.x;
-	return textureLod(probe_atlas, vec3(uv, floor(f.src_box[best].w * 0.5)), sqrt(rough) * f.src_border.z).rgb * f.src_offset[best].w;
+	return textureLod(probe_atlas, vec3(uv, floor(f.src_box[best].w * 0.5)), sqrt(rough) * f.src_border.z).rgb * f.src_offset[best].w * f.src_usage[best].x;
 }
 
 void main() {
@@ -1989,6 +1993,7 @@ struct FrameData {
 	float src_box[8][4];
 	float src_offset[8][4];
 	float src_capture[8][4];
+	float src_usage[8][4];
 	int32_t srcs[4];
 	float src_border[4];
 	float trace_settings[4];
@@ -2595,6 +2600,9 @@ void PhysXGIView::free_data() {
 		}
 	}
 	previous_shapes.clear();
+	previous_moving_shapes.clear();
+	primitive_motion_data.clear();
+	primitive_motion_static_version = UINT64_MAX;
 	primitive_motion_capacity = 0;
 	targets_for = Size2i();
 	source_size = Size2i();
@@ -2687,11 +2695,14 @@ void PhysXGIEffect::_render(int p_callback_type, const RenderData *p_render_data
 	hw_static_us = 0;
 	hw_moving_us = 0;
 	hw_update_us = 0;
+	motion_update_us = 0;
+	geometry_update_us = 0;
+	geometry_update_bytes = 0;
 	_render_frame(p_callback_type, p_render_data);
 	const uint64_t now = OS::get_singleton()->get_ticks_usec();
 	rt_last_us = now;
 	if (rt_timing() && (now - since > 8000 || gap > 40000)) {
-		print_line(vformat("PXTGI_RT frame %d: since last frame %.1f ms, GI recording %.1f ms (hardware update %.1f: static %.1f, moving %.1f)", int64_t(Engine::get_singleton()->get_frames_drawn()), gap / 1000.0, (now - since) / 1000.0, hw_update_us / 1000.0, hw_static_us / 1000.0, hw_moving_us / 1000.0));
+		print_line(vformat("PXTGI_RT frame %d: since last frame %.1f ms, GI recording %.1f ms (hardware update %.1f: static %.1f, moving %.1f), motion %.1f ms, geometry %.1f ms (%d KiB)", int64_t(Engine::get_singleton()->get_frames_drawn()), gap / 1000.0, (now - since) / 1000.0, hw_update_us / 1000.0, hw_static_us / 1000.0, hw_moving_us / 1000.0, motion_update_us / 1000.0, geometry_update_us / 1000.0, int64_t(geometry_update_bytes / 1024)));
 	}
 }
 
@@ -2729,6 +2740,7 @@ void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_rende
 		snapshot_owner = owner;
 		primitives_uploaded = UINT64_MAX;
 		geometry_uploaded = UINT64_MAX;
+		geometry_offsets.clear();
 		_hw_free(rd);
 		rd->buffer_clear(cache_keys, 0, CACHE_SLOTS * sizeof(uint32_t));
 		rd->buffer_clear(cache_cells, 0, CACHE_SLOTS * 5 * 4 * sizeof(float));
@@ -2789,11 +2801,29 @@ void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_rende
 	}
 	// Track poses consumed by this viewport, not the last main-thread publication: Separate
 	// rendering may skip publications, and a BVH rebuild may reorder every primitive slot.
+	const uint64_t motion_since = OS::get_singleton()->get_ticks_usec();
+	const bool static_changed = v.primitive_motion_static_version != s.static_version;
 	HashMap<uint64_t, Pair<uint64_t, Transform3D>> current_shapes;
-	Vector<float> motion;
+	if (static_changed) {
+		current_shapes.reserve(s.primitive_count);
+	}
+	HashSet<uint64_t> current_moving_shapes;
+	current_moving_shapes.reserve(s.primitive_count - s.static_count);
+	Vector<float> &motion = v.primitive_motion_data;
 	motion.resize(MAX(s.primitive_count, 1) * 16);
 	motion.fill(0.0f);
-	for (int i = 0; i < s.primitive_count; i++) {
+	float *motion_data = motion.ptrw();
+	if (!static_changed) {
+		// These exact static leaves occupied these slots in the preceding rendered
+		// frame. Their world points stay fixed; no pose inversions or history-map
+		// allocation are needed for the tens of thousands of city instances.
+		for (int i = 0; i < s.static_count; i++) {
+			float *out = motion_data + i * 16;
+			out[0] = out[5] = out[10] = 1.0f;
+			out[12] = v.have_history ? 1.0f : 0.0f;
+		}
+	}
+	for (int i = static_changed ? 0 : s.static_count; i < s.primitive_count; i++) {
 		const float *record = &s.primitives[i * PRIMITIVE_FLOATS];
 		Transform3D local;
 		for (int r = 0; r < 3; r++) {
@@ -2807,7 +2837,7 @@ void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_rende
 		// New shapes and teleports cannot supply trustworthy reflection history.
 		const bool valid = previous && previous->origin.distance_squared_to(world.origin) < 400.0f;
 		const Transform3D delta = valid ? *previous * local : Transform3D();
-		float *out = &motion.ptrw()[i * 16];
+		float *out = motion_data + i * 16;
 		for (int r = 0; r < 3; r++) {
 			out[r * 4] = delta.basis.rows[r].x;
 			out[r * 4 + 1] = delta.basis.rows[r].y;
@@ -2815,9 +2845,28 @@ void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_rende
 			out[r * 4 + 3] = delta.origin[r];
 		}
 		out[12] = valid ? 1.0f : 0.0f;
-		current_shapes.insert(identity.first, { identity.second, world });
+		if (static_changed) {
+			current_shapes.insert(identity.first, { identity.second, world });
+		} else {
+			v.previous_shapes.insert(identity.first, { identity.second, world });
+		}
+		if (i >= s.static_count) {
+			current_moving_shapes.insert(identity.first);
+		}
 	}
-	v.previous_shapes = current_shapes;
+	if (static_changed) {
+		// Rebuild membership only when the static tree changed; a new/returning
+		// shape must not inherit history from an absent earlier frame.
+		v.previous_shapes = std::move(current_shapes);
+	} else {
+		for (uint64_t id : v.previous_moving_shapes) {
+			if (!current_moving_shapes.has(id)) {
+				v.previous_shapes.erase(id);
+			}
+		}
+	}
+	v.previous_moving_shapes = std::move(current_moving_shapes);
+	v.primitive_motion_static_version = s.static_version;
 	const uint32_t motion_bytes = motion.size() * sizeof(float);
 	if (v.primitive_motion_capacity < motion_bytes) {
 		if (v.primitive_motion.is_valid()) {
@@ -2827,6 +2876,7 @@ void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_rende
 		v.primitive_motion = rd->storage_buffer_create(v.primitive_motion_capacity);
 	}
 	rd->buffer_update(v.primitive_motion, 0, motion_bytes, motion.ptr());
+	motion_update_us = OS::get_singleton()->get_ticks_usec() - motion_since;
 	FrameData data = {};
 	RendererRD::MaterialStorage::store_transform(cam_transform, data.view_to_world);
 	RendererRD::MaterialStorage::store_transform(cam_transform.affine_inverse(), data.world_to_view);
@@ -2932,7 +2982,10 @@ void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_rende
 					continue;
 				}
 				const RID probe = light_storage->reflection_probe_instance_get_probe(instance);
-				const Transform3D xf = light_storage->reflection_probe_instance_get_transform(instance);
+				Transform3D xf;
+				if (!light_storage->reflection_probe_instance_get_captured_transform(instance, xf)) {
+					continue;
+				}
 				const Transform3D to_box = xf.affine_inverse();
 				const Vector3 extents = light_storage->reflection_probe_get_size(probe) * 0.5f;
 				const Vector3 offset = light_storage->reflection_probe_get_origin_offset(probe);
@@ -2957,6 +3010,10 @@ void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_rende
 				data.src_capture[count][1] = capture.y;
 				data.src_capture[count][2] = capture.z;
 				data.src_capture[count][3] = light_storage->reflection_probe_get_blend_distance(probe);
+				// Texture captures can colour a real, visible static hit without
+				// inventing geometry for a miss. Respect the probe's intended
+				// intensity and receiver mask for generic cubemap fallback.
+				data.src_usage[count][0] = (light_storage->reflection_probe_get_reflection_mask(probe) & 0xFFFFF) == 0xFFFFF ? light_storage->reflection_probe_get_intensity(probe) : 0.0f;
 				count++;
 			}
 			data.srcs[0] = count;
@@ -3082,19 +3139,40 @@ void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_rende
 	if (primitives_uploaded == UINT64_MAX) {
 		primitives_uploaded = s.primitives_version;
 	}
+	const uint64_t geometry_since = OS::get_singleton()->get_ticks_usec();
 	if (s.geometry_version != geometry_uploaded || geometry_buffer.is_null()) {
-		if (geometry_buffer.is_valid()) {
-			rd->free_rid(geometry_buffer);
+		// A wall revision changes kilobytes, not the hundreds of megabytes of city
+		// geometry beside it. Preserve the buffer and all unchanged block ranges.
+		const uint32_t required = MAX(s.geometry_floats, 4);
+		if (geometry_buffer.is_null() || required > geometry_capacity) {
+			if (geometry_buffer.is_valid()) {
+				rd->free_rid(geometry_buffer);
+			}
+			geometry_capacity = Math::next_power_of_2(required);
+			geometry_buffer = rd->storage_buffer_create(geometry_capacity * sizeof(float));
+			ERR_FAIL_COND(geometry_buffer.is_null());
+			geometry_offsets.clear();
 		}
-		Vector<uint8_t> bytes;
-		bytes.resize(MAX(s.geometry.size(), 4) * sizeof(float));
-		bytes.fill(0);
-		if (s.geometry.size() > 0) {
-			memcpy(bytes.ptrw(), s.geometry.ptr(), s.geometry.size() * sizeof(float));
+		HashMap<uint64_t, int> current_offsets;
+		for (const GeometryUpload &block : s.geometry) {
+			const int *uploaded = geometry_offsets.getptr(block.key);
+			if (uploaded == nullptr || *uploaded != block.offset) {
+				uint32_t offset = block.offset * sizeof(float);
+				for (const Vector<float> *part : { &block.planes, &block.nodes, &block.triangles }) {
+					const uint32_t bytes = part->size() * sizeof(float);
+					if (bytes > 0) {
+						ERR_FAIL_COND(rd->buffer_update(geometry_buffer, offset, bytes, part->ptr()) != OK);
+						geometry_update_bytes += bytes;
+						offset += bytes;
+					}
+				}
+			}
+			current_offsets.insert(block.key, block.offset);
 		}
-		geometry_buffer = rd->storage_buffer_create(bytes.size(), bytes);
+		geometry_offsets = current_offsets;
 		geometry_uploaded = s.geometry_version;
 	}
+	geometry_update_us = OS::get_singleton()->get_ticks_usec() - geometry_since;
 
 	auto sampled = [&](int p_binding, const RID &p_sampler, const RID &p_texture) {
 		return RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, p_binding, Vector<RID>({ p_sampler, p_texture }));

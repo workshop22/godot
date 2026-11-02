@@ -1659,6 +1659,7 @@ bool LightStorage::reflection_probe_has_atlas_index(RID p_instance) {
 void LightStorage::reflection_probe_release_atlas_index(RID p_instance) {
 	ReflectionProbeInstance *rpi = reflection_probe_instance_owner.get_or_null(p_instance);
 	ERR_FAIL_NULL(rpi);
+	rpi->capture_valid = false;
 
 	if (rpi->atlas.is_null()) {
 		return; //nothing to release
@@ -1828,6 +1829,7 @@ bool LightStorage::reflection_probe_instance_begin_render(RID p_instance, RID p_
 	}
 
 	rpi->atlas = p_reflection_atlas;
+	rpi->capture_transform = rpi->transform;
 	rpi->rendering = true;
 	rpi->dirty = false;
 	rpi->processing_layer = 1;
@@ -1849,6 +1851,8 @@ bool LightStorage::reflection_probe_instance_end_render(RID p_instance, RID p_re
 
 	RD::get_singleton()->draw_command_begin_label("Convert reflection probe to octahedral");
 	copy_effects->copy_cubemap_to_octmap(atlas->color_buffer, atlas->reflections.write[rpi->atlas_index].data.layers[0].mipmaps[0].framebuffer, atlas->uv_border_size);
+	rpi->captured_transform = rpi->capture_transform;
+	rpi->capture_valid = true;
 	RD::get_singleton()->draw_command_end_label();
 
 	return true;
