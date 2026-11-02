@@ -1260,13 +1260,13 @@ void PXTGI3D::_refresh_geometry() {
 		static_dirty = true;
 		moving_dirty = true;
 	} else {
-		float *data = geometry.ptrw();
+		float *packed_geometry = geometry.ptrw();
 		for (const ObjectID &id : blocks) {
 			const GeometryBlock &block = geometry_blocks[id];
 			if (block.words == 0) {
 				continue;
 			}
-			float *destination = data + block.offset * 4;
+			float *destination = packed_geometry + block.offset * 4;
 			if (block.type == 4) {
 				memcpy(destination, block.planes.ptr(), block.planes.size() * sizeof(float));
 			} else {
