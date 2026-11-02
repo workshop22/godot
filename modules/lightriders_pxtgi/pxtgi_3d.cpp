@@ -918,7 +918,7 @@ Node *PXTGI3D::_scan_root() const {
 	if (Engine::get_singleton()->is_editor_hint() && get_tree()->get_edited_scene_root()) {
 		return get_tree()->get_edited_scene_root();
 	}
-	return get_tree()->get_root();
+	return get_viewport();
 }
 
 void PXTGI3D::_track_all(Node *p_root) {
@@ -1916,7 +1916,8 @@ void PXTGI3D::_publish() {
 		s.probe_overrides[i] = overrides;
 	}
 	s.light_changed = fresh_frames > 0;
-	PhysXGIEffect::set_settings(get_instance_id(), s);
+	const Ref<Compositor> compositor = camera && camera->get_compositor().is_valid() ? camera->get_compositor() : get_world_3d()->get_compositor();
+	s.compositor = compositor.is_valid() ? compositor->get_rid() : RID();
 	// SDFGI is only the switch that makes surfaces read the GI buffer: on, at its cheapest (one cascade of 8 m cells,
 	// so a moving camera rarely makes it re-voxelize).
 	Ref<Environment> env = camera && camera->get_environment().is_valid() ? camera->get_environment() : get_world_3d()->get_environment();
@@ -1924,6 +1925,8 @@ void PXTGI3D::_publish() {
 		environment->set_sdfgi_enabled(environment->is_sdfgi_enabled());
 	}
 	environment = env;
+	s.environment = env.is_valid() ? env->get_rid() : RID();
+	PhysXGIEffect::set_settings(get_instance_id(), s);
 	if (env.is_valid()) {
 		RenderingServer::get_singleton()->environment_set_sdfgi(env->get_rid(), true, 1, 8.0f, RSE::ENV_SDFGI_Y_SCALE_100_PERCENT, false, 0.0f, false, 1.0f, 1.1f, 1.1f);
 	}
