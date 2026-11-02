@@ -1307,6 +1307,11 @@ bool PXTGI3D::_refresh_entry(int p_index, float *r_out, AABB &r_bounds) {
 		if (body) {
 			entry.in_body = body->get_global_transform().affine_inverse() * to_world;
 			entry.posed = true;
+			const uint64_t generation = uint64_t(int64_t(body->get_meta("pxtgi_motion_identity", int64_t(0))));
+			if (entry.motion_generation != generation) {
+				entry.motion_generation = generation;
+				(entry.moving ? moving_dirty : static_dirty) = true;
+			}
 		}
 	}
 	return true;
@@ -1335,6 +1340,7 @@ void PXTGI3D::_keep_records(const LocalVector<ShapeEntry> &p_was, const HashMap<
 		}
 		const ShapeEntry &before = p_was[*was];
 		now_index[*was] = i;
+		entry.motion_generation = before.motion_generation;
 		entry.posed = before.posed;
 		entry.in_body = before.in_body;
 		entry.type = before.type;
@@ -1651,7 +1657,8 @@ void PXTGI3D::_update_primitives(PhysXGIEffect::Snapshot &r_snapshot) {
 		if (rebuilt) {
 			published_ids.resize(leaf_order.size());
 			for (uint32_t k = 0; k < leaf_order.size(); k++) {
-				published_ids.ptrw()[k] = uint64_t(shapes[leaf_order[k]].shape_node);
+				const ShapeEntry &entry = shapes[leaf_order[k]];
+				published_ids.ptrw()[k] = { uint64_t(entry.shape_node), entry.motion_generation };
 			}
 			published_nodes.resize(tree_nodes.size());
 			if (tree_nodes.size()) {

@@ -73,6 +73,7 @@ class PXTGI3D : public Node3D {
 	// and emissive meshes outside any body, which stand in as their bounding box (mesh_proxy).
 	struct ShapeEntry {
 		ObjectID shape_node;
+		uint64_t motion_generation = 0; // pooled proxy identity, independent of geometry revisions
 		Color albedo;
 		Color emission;
 		bool mesh_proxy = false;
@@ -181,7 +182,7 @@ class PXTGI3D : public Node3D {
 	bool moving_dirty = true;
 	bool radiance_dirty = false; // only glow changed: the records in place, not the tree
 	Vector<float> published_primitives;
-	Vector<uint64_t> published_ids;
+	Vector<Pair<uint64_t, uint64_t>> published_ids;
 	Vector<float> published_nodes;
 	int published_count = 0;
 	// Hardware tracing: each leaf's mesh (its Shape3D's id; 0 for a box), and every mesh's triangles by that id.

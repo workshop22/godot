@@ -64,7 +64,7 @@ public:
 	RID reflect_motion; // previous minus current UV of the reflected point, virtual depth, valid
 	RID primitive_motion; // current world point -> its previous rendered world point, by primitive slot
 	uint32_t primitive_motion_capacity = 0;
-	HashMap<uint64_t, Transform3D> previous_shapes;
+	HashMap<uint64_t, Pair<uint64_t, Transform3D>> previous_shapes;
 	RID reflect_accum[2]; // reflection size: accumulated, ping-ponged
 	RID reflect_info[2]; // reflection size: frames of history, hit distance, motion in the reflection
 	RID reflect_depth[2];
@@ -132,7 +132,7 @@ public:
 		RID compositor;
 		RID environment;
 		Vector<float> primitives;
-		Vector<uint64_t> primitive_ids; // stable shape-node identity, independent of BVH leaf order
+		Vector<Pair<uint64_t, uint64_t>> primitive_ids; // shape-node ID and pooled-proxy generation, independent of BVH order
 		int primitive_count = 0;
 		uint64_t primitives_version = 0; // primitives and nodes: uploaded only when this changes
 		int trace_mode = 0; // PXTGI3D.trace_mode: 0 software, 1 world misses, 2 hardware, 3 hardware where safe

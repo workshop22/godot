@@ -2789,7 +2789,7 @@ void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_rende
 	}
 	// Track poses consumed by this viewport, not the last main-thread publication: Separate
 	// rendering may skip publications, and a BVH rebuild may reorder every primitive slot.
-	HashMap<uint64_t, Transform3D> current_shapes;
+	HashMap<uint64_t, Pair<uint64_t, Transform3D>> current_shapes;
 	Vector<float> motion;
 	motion.resize(MAX(s.primitive_count, 1) * 16);
 	motion.fill(0.0f);
@@ -2801,8 +2801,9 @@ void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_rende
 			local.origin[r] = record[r * 4 + 3];
 		}
 		const Transform3D world = local.affine_inverse();
-		const uint64_t id = s.primitive_ids[i];
-		const Transform3D *previous = v.have_history ? v.previous_shapes.getptr(id) : nullptr;
+		const Pair<uint64_t, uint64_t> &identity = s.primitive_ids[i];
+		const Pair<uint64_t, Transform3D> *previous_entry = v.have_history ? v.previous_shapes.getptr(identity.first) : nullptr;
+		const Transform3D *previous = previous_entry && previous_entry->first == identity.second ? &previous_entry->second : nullptr;
 		// New shapes and teleports cannot supply trustworthy reflection history.
 		const bool valid = previous && previous->origin.distance_squared_to(world.origin) < 400.0f;
 		const Transform3D delta = valid ? *previous * local : Transform3D();
@@ -2814,7 +2815,7 @@ void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_rende
 			out[r * 4 + 3] = delta.origin[r];
 		}
 		out[12] = valid ? 1.0f : 0.0f;
-		current_shapes.insert(id, world);
+		current_shapes.insert(identity.first, { identity.second, world });
 	}
 	v.previous_shapes = current_shapes;
 	const uint32_t motion_bytes = motion.size() * sizeof(float);
