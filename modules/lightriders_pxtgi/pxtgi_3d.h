@@ -46,6 +46,7 @@
 // layout instead, and SDFGI is kept to its cheapest settings (it is only the switch that makes surfaces read the
 // buffer). Hidden or gone, Godot's pipelines and the environment's own SDFGI settings are restored.
 class MeshInstance3D;
+class CollisionShape3D;
 
 class PXTGI3D : public Node3D {
 	GDCLASS(PXTGI3D, Node3D);
@@ -74,6 +75,9 @@ class PXTGI3D : public Node3D {
 	struct ShapeEntry {
 		ObjectID shape_node;
 		ObjectID body_node;
+		CollisionShape3D *collision_node = nullptr; // valid only while this ID is tracked in the tree
+		LocalVector<int> *body_indices = nullptr; // stable HashMap values, reused until this owner retires
+		LocalVector<int> *geometry_indices = nullptr;
 		int previous_index = -1; // preceding scan's record, before entry_of is updated in place
 		uint64_t motion_generation = 0; // pooled proxy identity, independent of geometry revisions
 		Color albedo;
@@ -228,6 +232,13 @@ class PXTGI3D : public Node3D {
 		STAGE_SCAN_MEMBERS,
 		STAGE_SCAN_LAYOUT,
 		STAGE_SCAN_KEEP,
+		STAGE_SCAN_PREPARE,
+		STAGE_SCAN_WALK,
+		STAGE_SCAN_PRUNE,
+		STAGE_SCAN_CHECK,
+		STAGE_SCAN_LOOK,
+		STAGE_SCAN_GEOMETRY,
+		STAGE_SCAN_REGISTER,
 		STAGE_MAX,
 	};
 	struct StageTime {
@@ -237,6 +248,8 @@ class PXTGI3D : public Node3D {
 	};
 	StageTime stage_times[STAGE_MAX];
 	uint64_t records_changed = 0;
+	uint64_t scan_retained = 0;
+	uint64_t scan_fresh = 0;
 	String last_change; // what last made the shapes need finding again
 	PackedStringArray rescan_causes; // since the stats were last read
 	void _stage(Stage p_stage, uint64_t p_since);

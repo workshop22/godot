@@ -986,7 +986,8 @@ void PXTGI3D::_node_removed(Node *p_node) {
 	const ObjectID id = p_node->get_instance_id();
 	if (tracked.erase(id)) {
 		looks.erase(id);
-		if (entry_of.has(id)) {
+		if (const int *index = entry_of.getptr(id)) {
+			shapes[*index].collision_node = nullptr; // leaving/re-entering must revalidate the node and its look
 			tracked_changed = true;
 			last_change = "removed " + String(p_node->get_path());
 		}
@@ -1058,7 +1059,8 @@ void PXTGI3D::_restyle_slice(LocalVector<int> &r_changed) {
 void PXTGI3D::_rescan(const LocalVector<ShapeEntry> &p_was) {
 	const uint64_t members_since = OS::get_singleton()->get_ticks_usec();
 	Node *root = _scan_root();
-	if (root->get_instance_id() != tracked_root) {
+	const bool fresh_root = root->get_instance_id() != tracked_root;
+	if (fresh_root) {
 		_track_all(root);
 	}
 	tracked_changed = false;
@@ -1082,34 +1084,38 @@ void PXTGI3D::_rescan(const LocalVector<ShapeEntry> &p_was) {
 	proxy_entries.clear();
 	emissive_entries.clear();
 	shape_signature = 0;
+	_stage(STAGE_SCAN_PREPARE, members_since);
+	const uint64_t walk_since = OS::get_singleton()->get_ticks_usec();
+	static const bool detailed_timing = OS::get_singleton()->has_environment("PXTGI_SCAN_TIMING");
 	for (const ObjectID &id : tracked) {
-		Node *n = ObjectDB::get_instance<Node>(id);
+		uint64_t step_since = detailed_timing ? OS::get_singleton()->get_ticks_usec() : 0;
+		const int *known = entry_of.getptr(id);
+		const ShapeEntry *before = !fresh_root && known && uint32_t(*known) < p_was.size() && p_was[*known].shape_node == id ? &p_was[*known] : nullptr;
+		// node_removed invalidates cached pointers before a tracked node can die.
+		// Retained collision shapes therefore need no global ObjectDB lock/cast.
+		CollisionShape3D *cs = before ? before->collision_node : nullptr;
+		Node *n = cs ? static_cast<Node *>(cs) : ObjectDB::get_instance<Node>(id);
 		if (n == nullptr) {
 			continue;
 		}
 		ShapeEntry entry;
-		CollisionShape3D *cs = nullptr;
 		Node *body = nullptr;
 		Ref<Shape3D> shape;
 		bool retained = false;
-		const int *known = entry_of.getptr(id);
-		if (known && uint32_t(*known) < p_was.size() && p_was[*known].shape_node == id && !p_was[*known].mesh_proxy) {
-			cs = Object::cast_to<CollisionShape3D>(n);
-			if (cs) {
-				body = cs->get_parent();
-				shape = cs->get_shape();
-				const ObjectID shape_id = shape.is_valid() ? shape->get_instance_id() : ObjectID();
-				retained = body && body->get_instance_id() == p_was[*known].body_node && shape_id == p_was[*known].shape_resource;
-			}
+		if (cs) {
+			body = cs->get_parent();
+			shape = cs->get_shape();
+			const ObjectID shape_id = shape.is_valid() ? shape->get_instance_id() : ObjectID();
+			retained = body && body->get_instance_id() == before->body_node && shape_id == before->shape_resource;
 		}
 		if (retained) {
 			// A node's class and its unchanged parent's class cannot change. Keep
 			// the cached classification, while authoring metadata remains live.
-			if (bool(n->get_meta(meta_ignore(), false))) {
+			if (n->has_meta(meta_ignore()) && bool(n->get_meta(meta_ignore()))) {
 				continue;
 			}
-			entry = p_was[*known];
-			entry.sample_emission = bool(body->get_meta(meta_sample_emission(), true));
+			entry = *before;
+			entry.sample_emission = !body->has_meta(meta_sample_emission()) || bool(body->get_meta(meta_sample_emission()));
 		} else {
 			if (!is_tracked(n)) {
 				continue;
@@ -1130,26 +1136,27 @@ void PXTGI3D::_rescan(const LocalVector<ShapeEntry> &p_was) {
 				continue;
 			}
 		}
-		const Pair<Color, Color> *look = looks.getptr(id);
-		if (look == nullptr) {
-			look = &looks.insert(id, _look_of(n))->value;
+		if (detailed_timing) {
+			_stage(STAGE_SCAN_CHECK, step_since);
+			step_since = OS::get_singleton()->get_ticks_usec();
+		}
+		if (!retained) {
+			const Pair<Color, Color> *look = looks.getptr(id);
+			if (look == nullptr) {
+				look = &looks.insert(id, _look_of(n))->value;
+			}
+			entry.albedo = look->first;
+			entry.emission = look->second;
 		}
 		look_order.push_back(id);
 		entry.shape_node = id;
-		entry.albedo = look->first;
-		entry.emission = look->second;
+		if (detailed_timing) {
+			_stage(STAGE_SCAN_LOOK, step_since);
+			step_since = OS::get_singleton()->get_ticks_usec();
+		}
 		if (retained) {
-			if (geometry_dirty.has(entry.shape_resource)) {
-				_geometry_for(shape);
-			}
-			// Another instance of this shared resource may already have consumed
-			// its dirty notification earlier in this scan. All instances take its
-			// latest geometry key and bounds, not only the first one encountered.
-			if (const GeometryBlock *block = geometry_blocks.getptr(entry.shape_resource)) {
-				entry.geometry_type = block->type;
-				entry.geometry_key = block->key;
-				entry.local_bounds = block->bounds;
-			}
+			// Dirty shared resources were refreshed before copying p_was. Restyle
+			// and driven-emission updates likewise keep the retained record current.
 		} else if (MeshInstance3D *mesh = Object::cast_to<MeshInstance3D>(n)) {
 			// A mesh outside any body only counts while it gives off light (and not when it's kept out of GI, as
 			// Godot's own GI leaves it out).
@@ -1160,6 +1167,7 @@ void PXTGI3D::_rescan(const LocalVector<ShapeEntry> &p_was) {
 			entry.moving = true;
 		} else {
 			cs = Object::cast_to<CollisionShape3D>(n);
+			entry.collision_node = cs;
 			body = cs->get_parent();
 			shape = cs->get_shape();
 			entry.body_node = body->get_instance_id();
@@ -1175,7 +1183,12 @@ void PXTGI3D::_rescan(const LocalVector<ShapeEntry> &p_was) {
 				}
 			}
 		}
+		if (detailed_timing) {
+			_stage(STAGE_SCAN_GEOMETRY, step_since);
+			step_since = OS::get_singleton()->get_ticks_usec();
+		}
 		const int index = shapes.size();
+		(retained ? scan_retained : scan_fresh)++;
 		if (int *previous = entry_of.getptr(id)) {
 			entry.previous_index = *previous;
 			*previous = index;
@@ -1189,17 +1202,26 @@ void PXTGI3D::_rescan(const LocalVector<ShapeEntry> &p_was) {
 		if (entry.mesh_proxy) {
 			proxy_entries.push_back(index);
 		} else {
-			body_entries[entry.body_node].push_back(index);
-			if (entry.shape_resource.is_valid()) {
-				geometry_entries[entry.shape_resource].push_back(index);
+			if (!retained) {
+				entry.body_indices = &body_entries[entry.body_node];
+				entry.geometry_indices = entry.shape_resource.is_valid() ? &geometry_entries[entry.shape_resource] : nullptr;
 			}
-			if (!entry.fixed && !bool(body->get_meta(meta_manual_updates(), false))) {
+			entry.body_indices->push_back(index);
+			if (entry.shape_resource.is_valid()) {
+				entry.geometry_indices->push_back(index);
+			}
+			if (!entry.fixed && (!body->has_meta(meta_manual_updates()) || !bool(body->get_meta(meta_manual_updates())))) {
 				dynamic_entries.push_back(index);
 			}
 			shape_signature = hash_murmur3_one_64(uint64_t(entry.shape_resource), shape_signature);
 		}
 		shapes.push_back(entry);
+		if (detailed_timing) {
+			_stage(STAGE_SCAN_REGISTER, step_since);
+		}
 	}
+	_stage(STAGE_SCAN_WALK, walk_since);
+	const uint64_t prune_since = OS::get_singleton()->get_ticks_usec();
 	LocalVector<ObjectID> retired;
 	for (const KeyValue<ObjectID, int> &entry : entry_of) {
 		if (uint32_t(entry.value) >= shapes.size() || shapes[entry.value].shape_node != entry.key) {
@@ -1227,6 +1249,7 @@ void PXTGI3D::_rescan(const LocalVector<ShapeEntry> &p_was) {
 	for (const ObjectID &id : retired) {
 		body_entries.erase(id);
 	}
+	_stage(STAGE_SCAN_PRUNE, prune_since);
 	_stage(STAGE_SCAN_MEMBERS, members_since);
 	const uint64_t layout_since = OS::get_singleton()->get_ticks_usec();
 	_layout_geometry();
@@ -1509,7 +1532,7 @@ void PXTGI3D::_keep_records(const LocalVector<ShapeEntry> &p_was, const LocalVec
 	for (int i = 0; i < n; i++) {
 		ShapeEntry &entry = shapes[i];
 		const int was = entry.previous_index;
-		if (uint32_t(was) >= p_was.size() || p_was[was].shape_node != entry.shape_node || p_was[was].body_node != entry.body_node || p_was[was].shape_resource != entry.shape_resource || p_was[was].geometry_key != entry.geometry_key || p_was[was].mesh_proxy != entry.mesh_proxy) {
+		if (uint32_t(was) >= p_was.size() || p_was[was].shape_node != entry.shape_node || p_was[was].body_node != entry.body_node || p_was[was].shape_resource != entry.shape_resource || p_was[was].geometry_key != entry.geometry_key || p_was[was].mesh_proxy != entry.mesh_proxy || (!entry.mesh_proxy && p_was[was].collision_node == nullptr)) {
 			entry_valid[i] = _refresh_entry(i, &entry_floats[i * PF], entry_bounds[i]);
 			continue;
 		}
@@ -1720,6 +1743,10 @@ void PXTGI3D::_update_primitives(PhysXGIEffect::Snapshot &r_snapshot) {
 	// doesn't rescan every frame).
 	if (tracked_root.is_null() || (tracked_changed && ++frames_since_rescan >= 10)) {
 		const uint64_t since = OS::get_singleton()->get_ticks_usec();
+		// Shape edits already identify every affected instance. Apply those once
+		// before retaining records, rather than rediscovering their geometry in
+		// every instance visited by the membership scan.
+		_refresh_geometry();
 		const LocalVector<ShapeEntry> was(shapes);
 		const LocalVector<float> was_floats(entry_floats);
 		const LocalVector<AABB> was_bounds(entry_bounds);
@@ -1957,7 +1984,7 @@ void PXTGI3D::_stage(Stage p_stage, uint64_t p_since) {
 // Each stage's time since the last reset: total and worst microseconds, and calls (frames for the whole update); the
 // shapes, emitters and moving records it keeps.
 Dictionary PXTGI3D::get_stats(bool p_reset) {
-	static const char *names[STAGE_MAX] = { "publish", "emitters", "rescan", "records", "static_tree", "moving_tree", "select", "copy", "scan_members", "scan_layout", "scan_keep" };
+	static const char *names[STAGE_MAX] = { "publish", "emitters", "rescan", "records", "static_tree", "moving_tree", "select", "copy", "scan_members", "scan_layout", "scan_keep", "scan_prepare", "scan_walk", "scan_prune", "scan_check", "scan_look", "scan_geometry", "scan_register" };
 	Dictionary stats;
 	for (int i = 0; i < STAGE_MAX; i++) {
 		Dictionary stage;
@@ -1975,11 +2002,16 @@ Dictionary PXTGI3D::get_stats(bool p_reset) {
 	stats["geometry_floats"] = int64_t(geometry_floats);
 	stats["rescan_causes"] = rescan_causes;
 	stats["mesh_proxies"] = int64_t(proxy_entries.size());
+	stats["tracked"] = int64_t(tracked.size());
+	stats["scan_retained"] = int64_t(scan_retained);
+	stats["scan_fresh"] = int64_t(scan_fresh);
 	if (p_reset) {
 		for (StageTime &t : stage_times) {
 			t = StageTime();
 		}
 		records_changed = 0;
+		scan_retained = 0;
+		scan_fresh = 0;
 		rescan_causes.clear();
 	}
 	return stats;

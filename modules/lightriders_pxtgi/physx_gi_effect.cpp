@@ -2600,6 +2600,7 @@ void PhysXGIView::free_data() {
 		}
 	}
 	previous_shapes.clear();
+	previous_static_shapes.clear();
 	previous_moving_shapes.clear();
 	primitive_motion_data.clear();
 	primitive_motion_static_version = UINT64_MAX;
@@ -2803,9 +2804,9 @@ void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_rende
 	// rendering may skip publications, and a BVH rebuild may reorder every primitive slot.
 	const uint64_t motion_since = OS::get_singleton()->get_ticks_usec();
 	const bool static_changed = v.primitive_motion_static_version != s.static_version;
-	HashMap<uint64_t, Pair<uint64_t, Transform3D>> current_shapes;
+	HashSet<uint64_t> current_static_shapes;
 	if (static_changed) {
-		current_shapes.reserve(s.primitive_count);
+		current_static_shapes.reserve(s.static_count);
 	}
 	HashSet<uint64_t> current_moving_shapes;
 	current_moving_shapes.reserve(s.primitive_count - s.static_count);
@@ -2830,13 +2831,14 @@ void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_rende
 			local.basis.rows[r] = Vector3(record[r * 4], record[r * 4 + 1], record[r * 4 + 2]);
 			local.origin[r] = record[r * 4 + 3];
 		}
-		const Transform3D world = local.affine_inverse();
 		const Pair<uint64_t, uint64_t> &identity = s.primitive_ids[i];
-		const Pair<uint64_t, Transform3D> *previous_entry = v.have_history ? v.previous_shapes.getptr(identity.first) : nullptr;
-		const Transform3D *previous = previous_entry && previous_entry->first == identity.second ? &previous_entry->second : nullptr;
+		const PhysXGIView::ShapeHistory *cached = v.previous_shapes.getptr(identity.first);
+		const bool unchanged_pose = cached && cached->local == local;
+		const Transform3D world = unchanged_pose ? cached->world : local.affine_inverse();
+		const Transform3D *previous = v.have_history && cached && cached->generation == identity.second ? &cached->world : nullptr;
 		// New shapes and teleports cannot supply trustworthy reflection history.
 		const bool valid = previous && previous->origin.distance_squared_to(world.origin) < 400.0f;
-		const Transform3D delta = valid ? *previous * local : Transform3D();
+		const Transform3D delta = valid && !unchanged_pose ? *previous * local : Transform3D();
 		float *out = motion_data + i * 16;
 		for (int r = 0; r < 3; r++) {
 			out[r * 4] = delta.basis.rows[r].x;
@@ -2845,24 +2847,28 @@ void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_rende
 			out[r * 4 + 3] = delta.origin[r];
 		}
 		out[12] = valid ? 1.0f : 0.0f;
-		if (static_changed) {
-			current_shapes.insert(identity.first, { identity.second, world });
-		} else {
-			v.previous_shapes.insert(identity.first, { identity.second, world });
+		if (!unchanged_pose || cached->generation != identity.second) {
+			v.previous_shapes.insert(identity.first, { identity.second, world, local });
 		}
-		if (i >= s.static_count) {
+		if (i < s.static_count) {
+			current_static_shapes.insert(identity.first);
+		} else {
 			current_moving_shapes.insert(identity.first);
 		}
 	}
 	if (static_changed) {
-		// Rebuild membership only when the static tree changed; a new/returning
-		// shape must not inherit history from an absent earlier frame.
-		v.previous_shapes = std::move(current_shapes);
-	} else {
-		for (uint64_t id : v.previous_moving_shapes) {
-			if (!current_moving_shapes.has(id)) {
+		// Streaming changes membership, not the poses of retained city objects.
+		// Keep their history entries and retire only identities absent this frame.
+		for (uint64_t id : v.previous_static_shapes) {
+			if (!current_static_shapes.has(id) && !current_moving_shapes.has(id)) {
 				v.previous_shapes.erase(id);
 			}
+		}
+		v.previous_static_shapes = std::move(current_static_shapes);
+	}
+	for (uint64_t id : v.previous_moving_shapes) {
+		if (!current_moving_shapes.has(id) && !v.previous_static_shapes.has(id)) {
+			v.previous_shapes.erase(id);
 		}
 	}
 	v.previous_moving_shapes = std::move(current_moving_shapes);

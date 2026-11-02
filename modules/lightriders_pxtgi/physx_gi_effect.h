@@ -67,7 +67,13 @@ public:
 	uint32_t primitive_motion_capacity = 0;
 	Vector<float> primitive_motion_data;
 	uint64_t primitive_motion_static_version = UINT64_MAX;
-	HashMap<uint64_t, Pair<uint64_t, Transform3D>> previous_shapes;
+	struct ShapeHistory {
+		uint64_t generation = 0;
+		Transform3D world;
+		Transform3D local;
+	};
+	HashMap<uint64_t, ShapeHistory> previous_shapes;
+	HashSet<uint64_t> previous_static_shapes;
 	HashSet<uint64_t> previous_moving_shapes;
 	RID reflect_accum[2]; // reflection size: accumulated, ping-ponged
 	RID reflect_info[2]; // reflection size: frames of history, hit distance, motion in the reflection
