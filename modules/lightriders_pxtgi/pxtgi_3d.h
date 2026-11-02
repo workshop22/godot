@@ -85,6 +85,7 @@ class PXTGI3D : public Node3D {
 		bool driven = false; // its glow is set by update_emitter_group, not read from its look
 		// Hulls and meshes: their type (4, 5), where their geometry starts in the geometry buffer, their local bounds.
 		int geometry_type = 0;
+		uint64_t geometry_key = 0;
 		int geometry_a = 0;
 		int geometry_b = 0;
 		AABB local_bounds;
@@ -95,20 +96,23 @@ class PXTGI3D : public Node3D {
 		float type = 0.0f;
 		Vector3 extents;
 	};
-	// Hull planes, or a mesh's tree and triangles, built once per shape resource.
+	// Hull planes, or a mesh's tree and triangles, rebuilt when the shape resource changes.
 	struct GeometryBlock {
 		int type = 0;
+		uint64_t key = 0;
 		Vector<float> planes; // hull: normal, offset
 		Vector<float> nodes; // mesh: its tree (8 floats a node; indices relative to the mesh)
 		Vector<float> triangles; // mesh: 12 floats a triangle (three corners, padded)
 		AABB bounds;
 	};
 	HashMap<ObjectID, GeometryBlock> geometry_blocks;
+	bool geometry_dirty = false;
 	Vector<float> geometry;
 	uint64_t geometry_version = 0;
 	uint32_t geometry_signature = 0;
 
 	const GeometryBlock *_geometry_for(const Ref<Shape3D> &p_shape);
+	void _geometry_changed(ObjectID p_shape);
 	LocalVector<ShapeEntry> shapes;
 	LocalVector<ObjectID> suns; // every DirectionalLight3D: the brightest one drawn on surfaces is the sun, chosen each frame
 	Ref<Environment> environment; // the one whose SDFGI is the switch, given its own settings back on leaving

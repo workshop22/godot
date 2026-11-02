@@ -39,6 +39,7 @@
 #include "core/object/callable_mp.h"
 #include "core/os/os.h"
 #include "core/templates/hashfuncs.h"
+#include "core/templates/safe_refcount.h"
 #include "scene/3d/camera_3d.h"
 #include "scene/3d/light_3d.h"
 #include "scene/3d/mesh_instance_3d.h"
@@ -826,7 +827,12 @@ int build_triangle_tree(LocalVector<TriangleItem> &p_items, uint32_t p_from, uin
 } // namespace
 
 // The planes of a convex hull, or a triangle mesh's (or height map's) tree and triangles, in the shape's local space;
-// built the first time the shape is seen.
+// rebuilt after the shape changes. Software trees and hardware structures share the same revision.
+void PXTGI3D::_geometry_changed(ObjectID p_shape) {
+	geometry_blocks.erase(p_shape);
+	geometry_dirty = true;
+}
+
 const PXTGI3D::GeometryBlock *PXTGI3D::_geometry_for(const Ref<Shape3D> &p_shape) {
 	const ObjectID id = p_shape->get_instance_id();
 	if (const GeometryBlock *known = geometry_blocks.getptr(id)) {
@@ -889,6 +895,14 @@ const PXTGI3D::GeometryBlock *PXTGI3D::_geometry_for(const Ref<Shape3D> &p_shape
 		block.bounds = AABB(corners[0], Vector3());
 		for (const Vector3 &v : corners) {
 			block.bounds.expand_to(v);
+		}
+	}
+	if (block.type) {
+		static SafeNumeric<uint64_t> next_key;
+		block.key = next_key.increment();
+		const Callable changed = callable_mp(this, &PXTGI3D::_geometry_changed).bind(id);
+		if (!p_shape->is_connected("changed", changed)) {
+			p_shape->connect("changed", changed);
 		}
 	}
 	geometry_blocks.insert(id, block);
@@ -1030,6 +1044,7 @@ void PXTGI3D::_rescan() {
 		_track_all(root);
 	}
 	tracked_changed = false;
+	geometry_dirty = false;
 	frames_since_rescan = 0;
 	shapes.clear();
 	suns.clear();
@@ -1084,6 +1099,7 @@ void PXTGI3D::_rescan() {
 				entry.shape_resource = cs->get_shape()->get_instance_id();
 				if (const GeometryBlock *block = _geometry_for(cs->get_shape())) {
 					entry.geometry_type = block->type;
+					entry.geometry_key = block->key;
 					entry.local_bounds = block->bounds;
 				}
 			}
@@ -1119,8 +1135,7 @@ void PXTGI3D::_rescan() {
 	uint32_t signature = 0;
 	for (const ShapeEntry &entry : shapes) {
 		if (entry.geometry_type) {
-			CollisionShape3D *cs = ObjectDB::get_instance<CollisionShape3D>(entry.shape_node);
-			signature = hash_murmur3_one_64(cs ? uint64_t(cs->get_shape()->get_instance_id()) : 0, signature);
+			signature = hash_murmur3_one_64(entry.geometry_key, signature);
 		}
 	}
 	const bool rebuild = signature != geometry_signature;
@@ -1161,6 +1176,16 @@ void PXTGI3D::_rescan() {
 			}
 		}
 		placed.insert(shape_id, Vector2i(entry.geometry_a, entry.geometry_b));
+	}
+	// Streamed cells and released shapes must leave both CPU and GPU geometry caches.
+	LocalVector<ObjectID> retired;
+	for (const KeyValue<ObjectID, GeometryBlock> &entry : geometry_blocks) {
+		if (!placed.has(entry.key)) {
+			retired.push_back(entry.key);
+		}
+	}
+	for (const ObjectID &id : retired) {
+		geometry_blocks.erase(id);
 	}
 	if (rebuild) {
 		geometry_version++;
@@ -1301,7 +1326,7 @@ void PXTGI3D::_keep_records(const LocalVector<ShapeEntry> &p_was, const HashMap<
 	for (int i = 0; i < n; i++) {
 		ShapeEntry &entry = shapes[i];
 		const int *was = p_was_index.getptr(entry.shape_node);
-		if (was == nullptr || p_was[*was].shape_resource != entry.shape_resource || p_was[*was].mesh_proxy != entry.mesh_proxy) {
+		if (was == nullptr || p_was[*was].shape_resource != entry.shape_resource || p_was[*was].geometry_key != entry.geometry_key || p_was[*was].mesh_proxy != entry.mesh_proxy) {
 			entry_valid[i] = _refresh_entry(i, &entry_floats[i * PF], entry_bounds[i]);
 			continue;
 		}
@@ -1509,7 +1534,7 @@ void PXTGI3D::_update_primitives(PhysXGIEffect::Snapshot &r_snapshot) {
 	pending_meshes.clear();
 	// The shapes found again when tracked nodes came or went, at most every 10 frames (a stream of spawned debris
 	// doesn't rescan every frame).
-	if (tracked_root.is_null() || (tracked_changed && ++frames_since_rescan >= 10)) {
+	if (tracked_root.is_null() || geometry_dirty || (tracked_changed && ++frames_since_rescan >= 10)) {
 		const uint64_t since = OS::get_singleton()->get_ticks_usec();
 		const LocalVector<ShapeEntry> was(shapes);
 		const HashMap<ObjectID, int> was_index(entry_of);
@@ -1638,7 +1663,7 @@ void PXTGI3D::_update_primitives(PhysXGIEffect::Snapshot &r_snapshot) {
 			uint64_t *keys = published_keys.ptrw();
 			for (uint32_t k = 0; k < leaf_order.size(); k++) {
 				const ShapeEntry &entry = shapes[leaf_order[k]];
-				keys[k] = entry.geometry_type == 5 ? uint64_t(entry.shape_resource) : 0;
+				keys[k] = entry.geometry_type == 5 ? entry.geometry_key : 0;
 			}
 		}
 		if (published_blocks_version != geometry_version) {
@@ -1647,7 +1672,7 @@ void PXTGI3D::_update_primitives(PhysXGIEffect::Snapshot &r_snapshot) {
 			published_block_triangles.clear();
 			for (const KeyValue<ObjectID, GeometryBlock> &E : geometry_blocks) {
 				if (E.value.type == 5) {
-					published_block_keys.push_back(uint64_t(E.key));
+					published_block_keys.push_back(E.value.key);
 					published_block_triangles.push_back(E.value.triangles);
 				}
 			}
