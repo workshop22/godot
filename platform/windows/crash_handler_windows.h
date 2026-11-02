@@ -32,21 +32,16 @@
 
 #include <windows.h>
 
-// Crash handler exception only enabled with MSVC
-#if defined(DEBUG_ENABLED)
+// Capture native faults in shipped MinGW templates as well as debug/MSVC builds.
 #define CRASH_HANDLER_EXCEPTION 1
-
-#ifdef _MSC_VER
 extern DWORD CrashHandlerException(EXCEPTION_POINTERS *ep);
-#endif
-
-#endif
 
 class CrashHandler {
 	bool disabled;
 
 public:
 	void initialize();
+	static void prepare_dump_path();
 
 	void disable();
 	bool is_disabled() const { return disabled; }

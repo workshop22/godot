@@ -923,6 +923,7 @@ Error RenderingDeviceDriverVulkan::_check_device_capabilities() {
 		VkPhysicalDeviceSynchronization2FeaturesKHR sync_2_features = {};
 		VkPhysicalDeviceRayTracingValidationFeaturesNV raytracing_validation_features = {};
 		VkPhysicalDeviceRayQueryFeaturesKHR ray_query_features = {};
+		VkPhysicalDeviceFaultFeaturesEXT device_fault_features = {};
 
 		const bool use_1_2_features = physical_device_properties.apiVersion >= VK_API_VERSION_1_2;
 		if (use_1_2_features) {
@@ -1019,6 +1020,12 @@ Error RenderingDeviceDriverVulkan::_check_device_capabilities() {
 			next_features = &ray_query_features;
 		}
 
+		if (enabled_device_extension_names.has(VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
+			device_fault_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT;
+			device_fault_features.pNext = next_features;
+			next_features = &device_fault_features;
+		}
+
 		VkPhysicalDeviceFeatures2 device_features_2 = {};
 		device_features_2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
 		device_features_2.pNext = next_features;
@@ -1090,8 +1097,9 @@ Error RenderingDeviceDriverVulkan::_check_device_capabilities() {
 			pipeline_cache_control_support = pipeline_cache_control_features.pipelineCreationCacheControl;
 		}
 
+		// vkGetDeviceFaultInfoEXT is only valid when the deviceFault feature is enabled at device creation.
 		if (enabled_device_extension_names.has(VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
-			device_fault_support = true;
+			device_fault_support = device_fault_features.deviceFault;
 		}
 #if defined(VK_TRACK_DEVICE_MEMORY)
 		if (enabled_device_extension_names.has(VK_EXT_DEVICE_MEMORY_REPORT_EXTENSION_NAME)) {
@@ -1418,6 +1426,7 @@ Error RenderingDeviceDriverVulkan::_initialize_device(const LocalVector<VkDevice
 	if (device_fault_support) {
 		device_fault_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT;
 		device_fault_features.pNext = create_info_next;
+		device_fault_features.deviceFault = VK_TRUE;
 		create_info_next = &device_fault_features;
 	}
 
@@ -6998,13 +7007,17 @@ void RenderingDeviceDriverVulkan::on_device_lost() const {
 			fault_counts.addressInfoCount
 			? (VkDeviceFaultAddressInfoEXT *)memalloc(fault_counts.addressInfoCount * sizeof(VkDeviceFaultAddressInfoEXT))
 			: nullptr;
+	const uint64_t vendor_binary_size = fault_counts.vendorBinarySize;
 	fault_counts.vendorBinarySize = 0;
 	vkres = device_functions.GetDeviceFaultInfoEXT(vk_device, &fault_counts, &fault_info);
-	if (vkres != VK_SUCCESS) {
+	// The vendor binary is not requested, so drivers that have one return VK_INCOMPLETE; the description and the
+	// vendor and address infos, sized from the count query above, are still complete.
+	if (vkres != VK_SUCCESS && vkres != VK_INCOMPLETE) {
 		_err_print_error(FUNCTION_STR, __FILE__, __LINE__, "vkGetDeviceFaultInfoEXT returned " + itos(vkres) + " when getting fault info, skipping VK_EXT_device_fault report...");
 	} else {
 		err_msg += "** Report from VK_EXT_device_fault **";
 		err_msg += "\nDescription: " + String(fault_info.description);
+		err_msg += "\nVendor binary: " + itos(vendor_binary_size) + " bytes (not requested)";
 		err_msg += "\nVendor infos:";
 		for (uint32_t vd = 0; vd < fault_counts.vendorInfoCount; ++vd) {
 			const VkDeviceFaultVendorInfoEXT *vendor_info = &fault_info.pVendorInfos[vd];
