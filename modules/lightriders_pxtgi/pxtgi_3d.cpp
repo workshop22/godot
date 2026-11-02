@@ -900,6 +900,8 @@ const PXTGI3D::GeometryBlock *PXTGI3D::_geometry_for(const Ref<Shape3D> &p_shape
 	if (block.type) {
 		static SafeNumeric<uint64_t> next_key;
 		block.key = next_key.increment();
+	}
+	if (Object::cast_to<ConcavePolygonShape3D>(p_shape.ptr()) || Object::cast_to<ConvexPolygonShape3D>(p_shape.ptr()) || Object::cast_to<HeightMapShape3D>(p_shape.ptr())) {
 		const Callable changed = callable_mp(this, &PXTGI3D::_geometry_changed).bind(id);
 		if (!p_shape->is_connected("changed", changed)) {
 			p_shape->connect("changed", changed);
