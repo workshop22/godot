@@ -93,6 +93,7 @@ CopyEffects::CopyEffects(BitField<RasterEffects> p_raster_effects) {
 		copy_modes.push_back("\n#define MODE_GAUSSIAN_BLUR\n#define MODE_GLOW\n#define GLOW_USE_AUTO_EXPOSURE\n");
 		copy_modes.push_back("\n#define MODE_SIMPLE_COPY\n");
 		copy_modes.push_back("\n#define MODE_SIMPLE_COPY\n#define DST_IMAGE_8BIT\n");
+		copy_modes.push_back("\n#define MODE_SIMPLE_COPY\n#define DST_IMAGE_RG16F\n");
 		copy_modes.push_back("\n#define MODE_SIMPLE_COPY_DEPTH\n");
 		copy_modes.push_back("\n#define MODE_SET_COLOR\n");
 		copy_modes.push_back("\n#define MODE_SET_COLOR\n#define DST_IMAGE_8BIT\n");
@@ -442,6 +443,10 @@ void CopyEffects::copy_to_rect(RID p_source_rd_texture, RID p_dest_texture, cons
 	RD::Uniform u_dest_texture(RD::UNIFORM_TYPE_IMAGE, 0, p_dest_texture);
 
 	CopyMode mode = p_8_bit_dst ? COPY_MODE_SIMPLY_COPY_8BIT : COPY_MODE_SIMPLY_COPY;
+	// TAA stores velocity history as RG16F; a storage image's format must match its view.
+	if (RD::get_singleton()->texture_get_format(p_dest_texture).format == RD::DATA_FORMAT_R16G16_SFLOAT) {
+		mode = COPY_MODE_SIMPLY_COPY_RG16F;
+	}
 	RID shader = copy.shader.version_get_shader(copy.shader_version, mode);
 	ERR_FAIL_COND(shader.is_null());
 
