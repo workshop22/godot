@@ -4074,7 +4074,7 @@ void GI::process_gi(Ref<RenderSceneBuffersRD> p_render_buffers, const RID *p_nor
 		pipeline_specialization |= SHADER_SPECIALIZATION_USE_VRS;
 	}
 
-	bool without_sampler = RD::get_singleton()->sampler_is_format_supported_for_filter(RD::DATA_FORMAT_R8G8_UINT, RD::SAMPLER_FILTER_LINEAR);
+	bool without_sampler = !RD::get_singleton()->sampler_is_format_supported_for_filter(RD::DATA_FORMAT_R8G8_UINT, RD::SAMPLER_FILTER_LINEAR);
 	Mode mode;
 	if (use_sdfgi && use_voxel_gi_instances) {
 		mode = without_sampler ? MODE_COMBINED_WITHOUT_SAMPLER : MODE_COMBINED;
