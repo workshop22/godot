@@ -83,6 +83,7 @@ RID hook_shader;
 const char *HOOK_SHADER = R"(
 #[compute]
 #version 450
+#extension GL_EXT_samplerless_texture_functions : require
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
@@ -200,7 +201,7 @@ void keep_bindings(ivec2 pos) {
 		vec4 k = texture(sampler3D(sdf_cascades[0], linear_sampler), vec3(0.0)) + texture(sampler3D(light_cascades[0], linear_sampler), vec3(0.0)) +
 				texture(sampler3D(aniso0_cascades[0], linear_sampler), vec3(0.0)) + texture(sampler3D(aniso1_cascades[0], linear_sampler), vec3(0.0)) +
 				texture(sampler3D(occlusion_texture, linear_sampler_with_mipmaps), vec3(0.0)) + texture(sampler2DArray(lightprobe_texture, linear_sampler), vec3(0.0)) +
-				texture(sampler2D(normal_roughness_buffer, linear_sampler), vec2(0.0)) + vec4(texelFetch(usampler2D(voxel_gi_buffer, linear_sampler), ivec2(0), 0)) +
+				texture(sampler2D(normal_roughness_buffer, linear_sampler), vec2(0.0)) + vec4(texelFetch(voxel_gi_buffer, ivec2(0), 0)) +
 				vec4(sdfgi.grid_size, sdfgi.energy) + voxel_gi_instances.data[0].xform[0] + texture(sampler3D(voxel_gi_textures[0], linear_sampler), vec3(0.0)) + scene_data.eye_offset[0] @VRS_USE@;
 		imageStore(reflection_buffer, pos, k);
 	}
@@ -900,6 +901,8 @@ const PXTGI3D::GeometryBlock *PXTGI3D::_geometry_for(const Ref<Shape3D> &p_shape
 	if (block.type) {
 		static SafeNumeric<uint64_t> next_key;
 		block.key = next_key.increment();
+	}
+	if (Object::cast_to<ConcavePolygonShape3D>(p_shape.ptr()) || Object::cast_to<ConvexPolygonShape3D>(p_shape.ptr()) || Object::cast_to<HeightMapShape3D>(p_shape.ptr())) {
 		const Callable changed = callable_mp(this, &PXTGI3D::_geometry_changed).bind(id);
 		if (!p_shape->is_connected("changed", changed)) {
 			p_shape->connect("changed", changed);
@@ -915,7 +918,7 @@ Node *PXTGI3D::_scan_root() const {
 	if (Engine::get_singleton()->is_editor_hint() && get_tree()->get_edited_scene_root()) {
 		return get_tree()->get_edited_scene_root();
 	}
-	return get_tree()->get_root();
+	return get_viewport();
 }
 
 void PXTGI3D::_track_all(Node *p_root) {
@@ -1918,7 +1921,8 @@ void PXTGI3D::_publish() {
 		s.probe_overrides[i] = overrides;
 	}
 	s.light_changed = fresh_frames > 0;
-	PhysXGIEffect::set_settings(get_instance_id(), s);
+	const Ref<Compositor> compositor = camera && camera->get_compositor().is_valid() ? camera->get_compositor() : get_world_3d()->get_compositor();
+	s.compositor = compositor.is_valid() ? compositor->get_rid() : RID();
 	// SDFGI is only the switch that makes surfaces read the GI buffer: on, at its cheapest (one cascade of 8 m cells,
 	// so a moving camera rarely makes it re-voxelize).
 	Ref<Environment> env = camera && camera->get_environment().is_valid() ? camera->get_environment() : get_world_3d()->get_environment();
@@ -1926,6 +1930,8 @@ void PXTGI3D::_publish() {
 		environment->set_sdfgi_enabled(environment->is_sdfgi_enabled());
 	}
 	environment = env;
+	s.environment = env.is_valid() ? env->get_rid() : RID();
+	PhysXGIEffect::set_settings(get_instance_id(), s);
 	if (env.is_valid()) {
 		RenderingServer::get_singleton()->environment_set_sdfgi(env->get_rid(), true, 1, 8.0f, RSE::ENV_SDFGI_Y_SCALE_100_PERCENT, false, 0.0f, false, 1.0f, 1.1f, 1.1f);
 	}

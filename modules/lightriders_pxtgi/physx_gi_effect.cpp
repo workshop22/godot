@@ -2696,15 +2696,25 @@ void PhysXGIEffect::_render(int p_callback_type, const RenderData *p_render_data
 }
 
 void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_render_data) {
+	const RenderDataRD *render_data = Object::cast_to<RenderDataRD>(p_render_data);
+	if (render_data == nullptr) {
+		return;
+	}
 	Snapshot s;
+	ObjectID owner;
 	{
 		MutexLock lock(mutex);
-		if (settings.is_empty()) {
-			return;
+		// Loading/calibration can draw separate worlds in one frame. Use this compositor's
+		// snapshot, never whichever PXTGI node happens to be first in the hash map.
+		for (const KeyValue<ObjectID, Snapshot> &entry : settings) {
+			if (entry.value.compositor == render_data->compositor && entry.value.environment == p_render_data->get_environment()) {
+				owner = entry.key;
+				s = entry.value;
+				break;
+			}
 		}
-		s = settings.begin()->value;
 	}
-	if (p_render_data == nullptr) {
+	if (owner.is_null()) {
 		return;
 	}
 	RenderSceneBuffersRD *buffers = Object::cast_to<RenderSceneBuffersRD>(p_render_data->get_render_scene_buffers().ptr());
@@ -2712,6 +2722,16 @@ void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_rende
 	RenderingDevice *rd = RenderingServer::get_singleton()->get_rendering_device();
 	if (buffers == nullptr || scene == nullptr || rd == nullptr || !_ensure(rd)) {
 		return;
+	}
+	if (snapshot_owner != owner) {
+		// Versions belong to one PXTGI node. A new world starts its counters again;
+		// retaining an equal-numbered old buffer can send its tree into unrelated geometry.
+		snapshot_owner = owner;
+		primitives_uploaded = UINT64_MAX;
+		geometry_uploaded = UINT64_MAX;
+		_hw_free(rd);
+		rd->buffer_clear(cache_keys, 0, CACHE_SLOTS * sizeof(uint32_t));
+		rd->buffer_clear(cache_cells, 0, CACHE_SLOTS * 5 * 4 * sizeof(float));
 	}
 	// Godot's GI step makes the buffers on its first run: nothing to write into until then.
 	static const StringName gi_scope = "rbgi", ambient_name = "ambient", reflection_name = "reflection";
@@ -2736,6 +2756,10 @@ void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_rende
 		buffers->set_custom_data(view_scope, view);
 	}
 	PhysXGIView &v = *view.ptr();
+	if (v.snapshot_owner != owner) {
+		v.free_data();
+		v.snapshot_owner = owner;
+	}
 	v.ensure(rd, size, s.reflection_resolution_scale);
 	// Last frame's scene: as PhysXGISourceEffect copied it, before motion blur and the lens effects; else the colour
 	// buffer itself (still last frame's image: the opaque pass hasn't run yet), which holds them.

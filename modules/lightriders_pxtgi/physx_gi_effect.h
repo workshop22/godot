@@ -79,6 +79,7 @@ public:
 	Size2i targets_for;
 	int current = 0;
 	bool have_history = false;
+	ObjectID snapshot_owner;
 	Transform3D prev_cam_transform;
 	Projection prev_projection;
 	Projection prev_camera_projection; // unjittered, for actual camera changes
@@ -128,6 +129,8 @@ public:
 	static constexpr int NODE_FLOATS = 8;
 
 	struct Snapshot {
+		RID compositor;
+		RID environment;
 		Vector<float> primitives;
 		Vector<uint64_t> primitive_ids; // stable shape-node identity, independent of BVH leaf order
 		int primitive_count = 0;
@@ -232,6 +235,7 @@ private:
 	int node_capacity = 0;
 	RID geometry_buffer;
 	uint64_t geometry_uploaded = UINT64_MAX;
+	ObjectID snapshot_owner;
 	bool failed = false;
 	// Hardware tracing (Snapshot::trace_mode 2, or 3 where it is safe): the shapes as acceleration structures, one
 	// bottom-level structure per mesh (and one unit box), built once; a static top-level structure rebuilt only when the
