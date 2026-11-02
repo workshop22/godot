@@ -30,6 +30,7 @@ layout(set = 0, binding = 5) uniform texture3D occlusion_texture;
 
 layout(set = 0, binding = 6) uniform sampler linear_sampler;
 layout(set = 0, binding = 7) uniform sampler linear_sampler_with_mipmaps;
+layout(set = 0, binding = 8) uniform sampler nearest_sampler;
 
 struct ProbeCascadeData {
 	vec3 position;
@@ -639,7 +640,7 @@ void process_gi(ivec2 pos, vec3 vertex, inout vec4 ambient_light, inout vec4 ref
 #ifdef SAMPLE_VOXEL_GI_NEAREST
 			uvec2 voxel_gi_tex = texelFetch(voxel_gi_buffer, pos, 0).rg;
 #else
-			uvec2 voxel_gi_tex = texelFetch(usampler2D(voxel_gi_buffer, linear_sampler), pos, 0).rg;
+			uvec2 voxel_gi_tex = texelFetch(usampler2D(voxel_gi_buffer, nearest_sampler), pos, 0).rg;
 #endif
 			roughness *= roughness;
 			//find arbitrary tangent and bitangent, then build a matrix
