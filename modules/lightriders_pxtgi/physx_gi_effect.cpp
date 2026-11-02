@@ -1527,7 +1527,7 @@ void main() {
 	float previous_depth;
 	vec2 previous = prev_pixel(virtual_point + mirrored_delta, previous_depth);
 	vec2 velocity = (previous - vec2(fp)) / vec2(f.sizes.xy);
-	bool usable = motion_valid && previous_depth > f.clip.z && !any(isnan(velocity)) && !any(isinf(velocity));
+	bool usable = motion_valid && nr.w <= 0.5 && previous_depth > f.clip.z && !any(isnan(velocity)) && !any(isinf(velocity));
 	imageStore(motion_dst, px, vec4(usable ? velocity : vec2(0.0), min(-virtual_point.z, 65000.0), usable ? 1.0 : 0.0));
 	vec4 result = found ? vec4(light, 1.0) : vec4(0.0);
 	bool bad = any(isnan(result)) || any(isinf(result));
@@ -3139,7 +3139,9 @@ void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_rende
 
 	int32_t out[4] = { out_size.x, out_size.y, v.reflect_size.x, v.reflect_size.y };
 	_dispatch(rd, PASS_RESOLVE, { sampled(0, nearest_sampler, light_in), sampled(1, nearest_sampler, v.accum_depth[v.current]), sampled(2, nearest_sampler, depth), sampled(3, nearest_sampler, normal), sampled(6, linear_sampler, color), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 4, ambient), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 5, reflection), sampled(7, nearest_sampler, reflect_result), sampled(8, nearest_sampler, v.reflect_depth[v.current]), sampled(12, mip_sampler, probe_atlas), sampled(13, nearest_sampler, v.reflect_motion), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 14, reflection_motion) }, out_size, out, sizeof(out));
-	buffers->set_reflection_motion_frame(RSG::rasterizer->get_frame_number());
+	if (s.reflection_mode != 0 && s.debug == 0) {
+		buffers->set_reflection_motion_frame(RSG::rasterizer->get_frame_number());
+	}
 
 	rd->capture_timestamp("PXTGI end");
 	v.have_history = true;

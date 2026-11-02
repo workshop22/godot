@@ -961,7 +961,6 @@ void RenderForwardClustered::_fill_render_list(RenderListType p_render_list, con
 		scene_state.used_normal_texture = false;
 		scene_state.used_depth_texture = false;
 		scene_state.used_lightmap = false;
-		scene_state.used_transparent_motion_vectors = false;
 		scene_state.used_opaque_stencil = false;
 	}
 	uint32_t lightmap_captures_used = 0;
@@ -1182,9 +1181,6 @@ void RenderForwardClustered::_fill_render_list(RenderListType p_render_list, con
 				if (force_alpha || (surf->flags & GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA)) {
 					surf->color_pass_inclusion_mask = COLOR_PASS_FLAG_TRANSPARENT;
 					render_list[RENDER_LIST_ALPHA].add_element(surf);
-					if (surf->flags & GeometryInstanceSurfaceDataCache::FLAG_USES_TRANSPARENT_MOTION_VECTORS) {
-						scene_state.used_transparent_motion_vectors = true;
-					}
 					if (uses_gi) {
 						surf->sort.uses_forward_gi = 1;
 					}
@@ -2468,12 +2464,8 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 
 	{
 		uint32_t transparent_color_pass_flags = (color_pass_flags | uint32_t(COLOR_PASS_FLAG_TRANSPARENT)) & ~uint32_t(COLOR_PASS_FLAG_SEPARATE_SPECULAR);
-		// Motion vectors are overwritten only by transparent materials that write them (render_mode
-		// transparent_motion_vectors: light walls that should blur with their own motion); the
-		// others' pipelines mask the attachment.
-		if (separate_transparency || !scene_state.used_transparent_motion_vectors) {
-			transparent_color_pass_flags &= ~uint32_t(COLOR_PASS_FLAG_MOTION_VECTORS);
-		}
+		// Alpha layers have their own color/transmission, never the opaque receiver's motion.
+		transparent_color_pass_flags &= ~uint32_t(COLOR_PASS_FLAG_MOTION_VECTORS);
 
 		if (separate_transparency) {
 			transparent_color_pass_flags |= COLOR_PASS_FLAG_SEPARATE_TRANSPARENCY;
@@ -4280,10 +4272,6 @@ void RenderForwardClustered::_geometry_instance_add_surface_with_material(Geomet
 
 	if (p_material->shader_data->stencil_enabled) {
 		flags |= GeometryInstanceSurfaceDataCache::FLAG_USES_STENCIL;
-	}
-
-	if (p_material->shader_data->uses_transparent_motion_vectors) {
-		flags |= GeometryInstanceSurfaceDataCache::FLAG_USES_TRANSPARENT_MOTION_VECTORS;
 	}
 
 	if (p_material->shader_data->uses_alpha_pass()) {

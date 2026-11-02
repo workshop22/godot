@@ -430,7 +430,6 @@ private:
 		bool used_sss = false;
 		bool used_lightmap = false;
 		bool used_opaque_stencil = false;
-		bool used_transparent_motion_vectors = false;
 
 		struct ShadowPass {
 			uint32_t element_from;
@@ -511,7 +510,6 @@ private:
 			FLAG_USES_PARTICLE_TRAILS = 65536,
 			FLAG_USES_MOTION_VECTOR = 131072,
 			FLAG_USES_STENCIL = 262144,
-			FLAG_USES_TRANSPARENT_MOTION_VECTORS = 524288,
 		};
 
 		union {
