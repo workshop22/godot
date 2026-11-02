@@ -96,7 +96,10 @@
 		<constant name="EFFECT_CALLBACK_TYPE_POST_UPSCALE" value="5" enum="EffectCallbackType">
 			The callback is called after TAA or a temporal upscaler has resolved the frame, before depth of field, glow and tonemapping. The frame is [method RenderSceneBuffersRD.get_output_texture], at [method RenderSceneBuffersRD.get_output_size]; depth and motion vectors stay at the internal size.
 		</constant>
-		<constant name="EFFECT_CALLBACK_TYPE_MAX" value="6" enum="EffectCallbackType">
+		<constant name="EFFECT_CALLBACK_TYPE_POST_TRANSPARENCY_COMPOSITE" value="6" enum="EffectCallbackType">
+			Called after post-upscale effects and optional transparent-layer composition, before glow and tonemapping. Use [method RenderSceneBuffersRD.get_output_texture] and [method RenderSceneBuffersRD.get_output_size] for full-frame effects; depth and normals remain at internal resolution. This callback also runs when separate transparency is disabled.
+		</constant>
+		<constant name="EFFECT_CALLBACK_TYPE_MAX" value="7" enum="EffectCallbackType">
 			Represents the size of the [enum EffectCallbackType] enum.
 		</constant>
 	</constants>

@@ -5683,6 +5683,9 @@
 		<constant name="COMPOSITOR_EFFECT_FLAG_NEEDS_SEPARATE_SPECULAR" value="16" enum="CompositorEffectFlags">
 			The rendering effect requires specular data to be separated out (Forward+ only).
 		</constant>
+		<constant name="COMPOSITOR_EFFECT_FLAG_NEEDS_SEPARATE_TRANSPARENCY" value="32" enum="CompositorEffectFlags">
+			Separates alpha-blended geometry from opaque temporal processing and composites it after post-upscale effects (Forward+ only).
+		</constant>
 		<constant name="COMPOSITOR_EFFECT_CALLBACK_TYPE_PRE_OPAQUE" value="0" enum="CompositorEffectCallbackType">
 			The callback is called before our opaque rendering pass, but after depth prepass (if applicable).
 		</constant>
@@ -5700,6 +5703,9 @@
 		</constant>
 		<constant name="COMPOSITOR_EFFECT_CALLBACK_TYPE_POST_UPSCALE" value="5" enum="CompositorEffectCallbackType">
 			The callback is called after TAA or a temporal upscaler has resolved the frame, before depth of field, glow and tonemapping.
+		</constant>
+		<constant name="COMPOSITOR_EFFECT_CALLBACK_TYPE_POST_TRANSPARENCY_COMPOSITE" value="6" enum="CompositorEffectCallbackType">
+			Called after post-upscale effects and optional transparent-layer composition, before glow and tonemapping.
 		</constant>
 		<constant name="COMPOSITOR_EFFECT_CALLBACK_TYPE_ANY" value="-1" enum="CompositorEffectCallbackType">
 		</constant>

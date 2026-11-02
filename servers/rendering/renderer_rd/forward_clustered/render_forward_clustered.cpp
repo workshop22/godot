@@ -2603,6 +2603,9 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		}
 	}
 
+	// Full-frame effects (underwater and distortion) must include the late transparent layer.
+	_process_compositor_effects(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_POST_TRANSPARENCY_COMPOSITE, p_render_data);
+
 	if (rb_data.is_valid()) {
 		_debug_draw_cluster(rb);
 
