@@ -1151,8 +1151,9 @@ void PXTGI3D::_layout_geometry() {
 			signature = hash_murmur3_one_64(entry.geometry_key, signature);
 		}
 	}
-	const bool rebuild = signature != geometry_signature;
+	const bool rebuild = geometry_layout_dirty || signature != geometry_signature;
 	geometry_signature = signature;
+	geometry_layout_dirty = false;
 	if (rebuild) {
 		geometry.clear();
 	}
@@ -1238,6 +1239,7 @@ void PXTGI3D::_refresh_geometry() {
 			// moving any existing geometry or invalidating the static city's tree.
 			block.offset = geometry.size() / 4;
 			block.words = words;
+			geometry_layout_dirty = true;
 			geometry.append_array(block.planes);
 			geometry.append_array(block.nodes);
 			geometry.append_array(block.triangles);
