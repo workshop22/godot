@@ -113,6 +113,7 @@ class PXTGI3D : public Node3D {
 	Vector<float> geometry;
 	uint64_t geometry_version = 0;
 	uint32_t geometry_signature = 0;
+	bool geometry_layout_dirty = false; // appended ranges differ from the cached canonical layout
 
 	const GeometryBlock *_geometry_for(const Ref<Shape3D> &p_shape);
 	void _geometry_changed(ObjectID p_shape);
