@@ -45,6 +45,7 @@ public:
 	// rebuild camera motion from depth, such as motion blur).
 	virtual Transform3D get_prev_cam_transform() const { return Transform3D(); }
 	virtual Projection get_prev_cam_projection() const { return Projection(); }
+	virtual Vector2 get_taa_jitter() const { return Vector2(); }
 
 	virtual uint32_t get_view_count() const = 0;
 	virtual Vector3 get_view_eye_offset(uint32_t p_view) const = 0;

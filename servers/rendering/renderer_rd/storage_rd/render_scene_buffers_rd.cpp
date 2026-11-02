@@ -75,6 +75,7 @@ void RenderSceneBuffersRD::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_target_size"), &RenderSceneBuffersRD::get_target_size);
 	ClassDB::bind_method(D_METHOD("get_output_texture"), static_cast<RID (RenderSceneBuffersRD::*)() const>(&RenderSceneBuffersRD::get_output_texture));
 	ClassDB::bind_method(D_METHOD("get_output_size"), &RenderSceneBuffersRD::get_output_size);
+	ClassDB::bind_method(D_METHOD("has_separate_reflections"), &RenderSceneBuffersRD::has_separate_reflections);
 	ClassDB::bind_method(D_METHOD("get_scaling_3d_mode"), &RenderSceneBuffersRD::get_scaling_3d_mode);
 	ClassDB::bind_method(D_METHOD("get_fsr_sharpness"), &RenderSceneBuffersRD::get_fsr_sharpness);
 	ClassDB::bind_method(D_METHOD("get_msaa_3d"), &RenderSceneBuffersRD::get_msaa_3d);
@@ -127,6 +128,9 @@ void RenderSceneBuffersRD::update_samplers() {
 }
 
 void RenderSceneBuffersRD::cleanup() {
+	reflection_motion_frame = UINT64_MAX;
+	separate_reflections_active = false;
+	separate_transparency_active = false;
 	// Free our data buffers (but don't destroy them)
 	for (KeyValue<StringName, Ref<RenderBufferCustomDataRD>> &E : data_buffers) {
 		E.value->free_data();

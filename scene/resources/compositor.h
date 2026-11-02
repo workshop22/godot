@@ -60,6 +60,7 @@ private:
 	bool access_resolved_depth = false;
 	bool needs_motion_vectors = false;
 	bool needs_separate_transparency = false;
+	bool needs_separate_reflections = false;
 	bool needs_normal_roughness = false;
 	bool needs_separate_specular = false;
 
@@ -88,6 +89,8 @@ public:
 
 	void set_needs_separate_transparency(bool p_enabled);
 	bool get_needs_separate_transparency() const;
+	void set_needs_separate_reflections(bool p_enabled);
+	bool get_needs_separate_reflections() const;
 
 	void set_needs_motion_vectors(bool p_enabled);
 	bool get_needs_motion_vectors() const;

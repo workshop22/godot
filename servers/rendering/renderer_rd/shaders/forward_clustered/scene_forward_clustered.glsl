@@ -3079,6 +3079,11 @@ void fragment_shader(in SceneData scene_data) {
 #endif
 	diffuse_buffer = vec4(emission + diffuse_light + ambient_light, sss_strength);
 	specular_buffer = vec4(direct_specular_light + indirect_specular_light, metallic);
+	if (implementation_data.late_indirect_specular != 0u) {
+		// Receiver lighting follows its geometry; the reflected scene has separate motion.
+		diffuse_buffer.rgb += direct_specular_light;
+		specular_buffer.rgb = indirect_specular_light;
+	}
 #endif
 
 #ifndef FOG_DISABLED

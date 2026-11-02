@@ -124,6 +124,8 @@ private:
 		COPY_MODE_OCTMAP_TO_PANORAMA,
 		COPY_MODE_OCTMAP_ARRAY_TO_PANORAMA,
 		COPY_MODE_MERGE_TRANSPARENCY,
+		COPY_MODE_SCENE_LAYERS,
+		COPY_MODE_MERGE_REFLECTION,
 		COPY_MODE_MAX,
 
 	};
@@ -399,6 +401,9 @@ public:
 	void octmap_roughness_raster(RID p_source_rd_texture, RID p_dest_framebuffer, uint32_t p_sample_count, float p_roughness, uint32_t p_source_size, uint32_t p_dest_size, float p_border_size);
 
 	void merge_transparency(RID p_color, RID p_transmission, RID p_destination, const Size2i &p_size, const Vector2 &p_jitter);
+	// Copy the complete unblurred scene without changing any source layer.
+	void copy_scene_layers(RID p_base, RID p_reflection, RID p_transparency, RID p_transmission, RID p_destination, const Size2i &p_size, const Vector2 &p_jitter = Vector2());
+	void merge_reflection(RID p_reflection, RID p_destination, const Size2i &p_size);
 	void merge_specular(RID p_dest_framebuffer, RID p_specular, RID p_base, RID p_reflection, uint32_t p_view_count);
 };
 

@@ -326,7 +326,7 @@ struct ImplementationData {
 	uint ss_effects_flags;
 	float ssao_light_affect;
 	float ssao_ao_affect;
-	uint pad1;
+	uint late_indirect_specular;
 
 	mat4 sdf_to_bounds;
 

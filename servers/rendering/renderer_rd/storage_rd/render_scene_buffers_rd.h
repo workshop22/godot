@@ -73,6 +73,9 @@ private:
 	RD::DataFormat preferred_data_format = RD::DATA_FORMAT_MAX;
 	RendererRD::VRS *vrs = nullptr;
 	uint64_t auto_exposure_version = 1;
+	uint64_t reflection_motion_frame = UINT64_MAX;
+	bool separate_reflections_active = false;
+	bool separate_transparency_active = false;
 	RSE::ViewportVRSMode vrs_mode = RSE::VIEWPORT_VRS_DISABLED;
 
 	// Our render target represents our final destination that we display on screen.
@@ -233,6 +236,13 @@ public:
 	Ref<RenderBufferCustomDataRD> get_custom_data(const StringName &p_name) const;
 
 	// Getters
+	// A reflection producer stamps this only after publishing the current frame's motion.
+	void set_reflection_motion_frame(uint64_t p_frame) { reflection_motion_frame = p_frame; }
+	uint64_t get_reflection_motion_frame() const { return reflection_motion_frame; }
+	void set_separate_reflections_active(bool p_active) { separate_reflections_active = p_active; }
+	bool has_separate_reflections() const { return separate_reflections_active; }
+	void set_separate_transparency_active(bool p_active) { separate_transparency_active = p_active; }
+	bool has_separate_transparency() const { return separate_transparency_active; }
 
 	_FORCE_INLINE_ RID get_render_target() const { return render_target; }
 	_FORCE_INLINE_ uint32_t get_view_count() const { return view_count; }

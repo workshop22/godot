@@ -756,6 +756,7 @@ uint32_t RenderForwardClustered::_setup_environment(const RenderDataRD *p_render
 
 	scene_state.ubo.gi_upscale_for_msaa = false;
 	scene_state.ubo.volumetric_fog_enabled = false;
+	scene_state.ubo.late_indirect_specular = p_opaque_render_buffers && rd.is_valid() && rd->has_separate_reflections();
 
 	if (rd.is_valid()) {
 		if (rd->get_msaa_3d() != RSE::VIEWPORT_MSAA_DISABLED) {
@@ -1747,6 +1748,9 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	Ref<RenderSceneBuffersRD> rb = p_render_data->render_buffers;
 	ERR_FAIL_COND(rb.is_null());
 	Ref<RenderBufferDataForwardClustered> rb_data;
+	rb->set_reflection_motion_frame(UINT64_MAX);
+	rb->set_separate_reflections_active(false);
+	rb->set_separate_transparency_active(false);
 	if (rb->has_custom_data(RB_SCOPE_FORWARD_CLUSTERED)) {
 		// Our forward clustered custom data buffer will only be available when we're rendering our normal view.
 		// This will not be available when rendering reflection probes.
@@ -1763,9 +1767,12 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 
 	// get info about our rendering effects
 	bool ce_needs_motion_vectors = _compositor_effects_has_flag(p_render_data, RSE::COMPOSITOR_EFFECT_FLAG_NEEDS_MOTION_VECTORS);
-	bool separate_transparency = rb_data.is_valid() && _compositor_effects_has_flag(p_render_data, RSE::COMPOSITOR_EFFECT_FLAG_NEEDS_SEPARATE_TRANSPARENCY);
+	bool ce_needs_separate_reflections = rb_data.is_valid() && _compositor_effects_has_flag(p_render_data, RSE::COMPOSITOR_EFFECT_FLAG_NEEDS_SEPARATE_REFLECTIONS);
+	// A late reflected layer must still pass through transparent transmission.
+	bool separate_transparency = rb_data.is_valid() && (ce_needs_separate_reflections || _compositor_effects_has_flag(p_render_data, RSE::COMPOSITOR_EFFECT_FLAG_NEEDS_SEPARATE_TRANSPARENCY));
+	rb->set_separate_transparency_active(separate_transparency);
 	bool ce_needs_normal_roughness = _compositor_effects_has_flag(p_render_data, RSE::COMPOSITOR_EFFECT_FLAG_NEEDS_ROUGHNESS);
-	bool ce_needs_separate_specular = _compositor_effects_has_flag(p_render_data, RSE::COMPOSITOR_EFFECT_FLAG_NEEDS_SEPARATE_SPECULAR);
+	bool ce_needs_separate_specular = ce_needs_separate_reflections || _compositor_effects_has_flag(p_render_data, RSE::COMPOSITOR_EFFECT_FLAG_NEEDS_SEPARATE_SPECULAR);
 
 	// sdfgi first
 	_update_sdfgi(p_render_data);
@@ -2209,6 +2216,12 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		RENDER_TIMESTAMP("Process Pre Opaque Compositor Effects");
 		_process_compositor_effects(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_PRE_OPAQUE, p_render_data);
 	}
+	// The producer can decline a frame (first use, unavailable buffers, unsupported view).
+	// Texture existence alone is insufficient: it may belong to an earlier frame or scene.
+	bool separate_reflections = ce_needs_separate_reflections && !using_sss && !using_ssr && !using_ssil && !load_color && !is_reflection_probe && rb->get_can_be_storage() && rb->get_view_count() == 1 &&
+			get_debug_draw_mode() != RSE::VIEWPORT_DEBUG_DRAW_UNSHADED && rb->get_reflection_motion_frame() == RSG::rasterizer->get_frame_number() &&
+			rb->has_texture(SNAME("pxtgi"), SNAME("reflection_motion"));
+	rb->set_separate_reflections_active(separate_reflections);
 
 	RID normal_roughness_views[RendererSceneRender::MAX_RENDER_VIEWS];
 	if (rb_data.is_valid() && rb_data->has_normal_roughness()) {
@@ -2377,14 +2390,14 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			RD::get_singleton()->draw_command_end_label();
 		}
 
-		{
-			//just mix specular back
+		if (!separate_reflections) {
+			// The ordinary path includes direct and indirect specular.
 			RENDER_TIMESTAMP("Merge Specular");
 			copy_effects->merge_specular(color_only_framebuffer, rb_data->get_specular(), !use_msaa ? RID() : rb->get_internal_texture(), RID(), p_render_data->scene_data->view_count);
 		}
 	}
 
-	if (using_separate_specular && is_environment(p_render_data->environment) && (environment_get_background(p_render_data->environment) == RSE::ENV_BG_CANVAS)) {
+	if (using_separate_specular && !separate_reflections && is_environment(p_render_data->environment) && (environment_get_background(p_render_data->environment) == RSE::ENV_BG_CANVAS)) {
 		// Canvas background mode does not clear the color buffer, but copies over it. If screen-space specular effects are enabled and the background is blank,
 		// this results in ghosting due to the separate specular buffer copy. Need to explicitly clear the specular buffer once we're done with it to fix it.
 		RENDER_TIMESTAMP("Clear Separate Specular (Canvas Background Mode)");
@@ -2591,9 +2604,26 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		}
 	}
 
+	if (separate_reflections) {
+		// Seed a complete layer even when a consumer suppresses blur for a camera cut.
+		// It is independent of TAA/FSR's receiver history and uses the producer's own history.
+		rb->create_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_REFLECTION_OUTPUT, RD::DATA_FORMAT_R16G16B16A16_SFLOAT,
+				RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT, RD::TEXTURE_SAMPLES_1, rb->get_output_size());
+		for (uint32_t v = 0; v < rb->get_view_count(); v++) {
+			copy_effects->copy_scene_layers(rb_data->get_specular(v), RID(), RID(), RID(), rb->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_REFLECTION_OUTPUT, v, 0), rb->get_output_size(), p_render_data->scene_data->taa_jitter * 0.5);
+		}
+	}
+
 	{
 		RENDER_TIMESTAMP("Process Post Upscale Compositor Effects");
 		_process_compositor_effects(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_POST_UPSCALE, p_render_data);
+	}
+
+	if (separate_reflections) {
+		RENDER_TIMESTAMP("Composite Reflected Layer");
+		for (uint32_t v = 0; v < rb->get_view_count(); v++) {
+			copy_effects->merge_reflection(rb->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_REFLECTION_OUTPUT, v, 0), rb->get_output_texture(v), rb->get_output_size());
+		}
 	}
 
 	if (separate_transparency) {
