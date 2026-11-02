@@ -101,19 +101,24 @@ class PXTGI3D : public Node3D {
 	struct GeometryBlock {
 		int type = 0;
 		uint64_t key = 0;
+		int offset = -1; // allocated range in the packed geometry buffer, in vec4s
+		int words = 0;
 		Vector<float> planes; // hull: normal, offset
 		Vector<float> nodes; // mesh: its tree (8 floats a node; indices relative to the mesh)
 		Vector<float> triangles; // mesh: 12 floats a triangle (three corners, padded)
 		AABB bounds;
 	};
 	HashMap<ObjectID, GeometryBlock> geometry_blocks;
-	bool geometry_dirty = false;
+	HashSet<ObjectID> geometry_dirty;
+	HashMap<ObjectID, LocalVector<int>> geometry_entries;
 	Vector<float> geometry;
 	uint64_t geometry_version = 0;
 	uint32_t geometry_signature = 0;
 
 	const GeometryBlock *_geometry_for(const Ref<Shape3D> &p_shape);
 	void _geometry_changed(ObjectID p_shape);
+	void _layout_geometry();
+	void _refresh_geometry();
 	LocalVector<ShapeEntry> shapes;
 	LocalVector<ObjectID> suns; // every DirectionalLight3D: the brightest one drawn on surfaces is the sun, chosen each frame
 	Ref<Environment> environment; // the one whose SDFGI is the switch, given its own settings back on leaving

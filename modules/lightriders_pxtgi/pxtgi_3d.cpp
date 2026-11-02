@@ -830,16 +830,20 @@ int build_triangle_tree(LocalVector<TriangleItem> &p_items, uint32_t p_from, uin
 // The planes of a convex hull, or a triangle mesh's (or height map's) tree and triangles, in the shape's local space;
 // rebuilt after the shape changes. Software trees and hardware structures share the same revision.
 void PXTGI3D::_geometry_changed(ObjectID p_shape) {
-	geometry_blocks.erase(p_shape);
-	geometry_dirty = true;
+	geometry_dirty.insert(p_shape);
 }
 
 const PXTGI3D::GeometryBlock *PXTGI3D::_geometry_for(const Ref<Shape3D> &p_shape) {
 	const ObjectID id = p_shape->get_instance_id();
-	if (const GeometryBlock *known = geometry_blocks.getptr(id)) {
-		return known->type ? known : nullptr;
-	}
 	GeometryBlock block;
+	if (const GeometryBlock *known = geometry_blocks.getptr(id)) {
+		if (!geometry_dirty.has(id)) {
+			return known->type ? known : nullptr;
+		}
+		block.offset = known->offset;
+		block.words = known->words;
+	}
+	geometry_dirty.erase(id);
 	Vector<Vector3> corners;
 	if (Ref<ConvexPolygonShape3D> convex = p_shape; convex.is_valid()) {
 		const Vector<Vector3> points = convex->get_points();
@@ -1047,7 +1051,6 @@ void PXTGI3D::_rescan() {
 		_track_all(root);
 	}
 	tracked_changed = false;
-	geometry_dirty = false;
 	frames_since_rescan = 0;
 	shapes.clear();
 	suns.clear();
@@ -1056,6 +1059,7 @@ void PXTGI3D::_rescan() {
 	probes.clear();
 	look_order.clear();
 	entry_of.clear();
+	geometry_entries.clear();
 	for (const ObjectID &id : tracked) {
 		Node *n = ObjectDB::get_instance<Node>(id);
 		if (n == nullptr || !is_tracked(n)) {
@@ -1100,6 +1104,7 @@ void PXTGI3D::_rescan() {
 			entry.moving = !entry.fixed;
 			if (cs->get_shape().is_valid()) {
 				entry.shape_resource = cs->get_shape()->get_instance_id();
+				geometry_entries[entry.shape_resource].push_back(shapes.size());
 				if (const GeometryBlock *block = _geometry_for(cs->get_shape())) {
 					entry.geometry_type = block->type;
 					entry.geometry_key = block->key;
@@ -1133,6 +1138,11 @@ void PXTGI3D::_rescan() {
 			shape_signature = hash_murmur3_one_64(cs->get_shape().is_valid() ? uint64_t(cs->get_shape()->get_instance_id()) : 0, shape_signature);
 		}
 	}
+	_layout_geometry();
+	geometry_dirty.clear();
+}
+
+void PXTGI3D::_layout_geometry() {
 	// The geometry buffer: each hull's planes, each mesh's tree and triangles, laid end to end (in vec4s); rebuilt only
 	// when the set of shapes with geometry changes.
 	uint32_t signature = 0;
@@ -1152,14 +1162,13 @@ void PXTGI3D::_rescan() {
 		if (!entry.geometry_type) {
 			continue;
 		}
-		CollisionShape3D *cs = ObjectDB::get_instance<CollisionShape3D>(entry.shape_node);
-		const ObjectID shape_id = cs->get_shape()->get_instance_id();
+		const ObjectID shape_id = entry.shape_resource;
 		if (const Vector2i *at = placed.getptr(shape_id)) {
 			entry.geometry_a = at->x;
 			entry.geometry_b = at->y;
 			continue;
 		}
-		const GeometryBlock &block = geometry_blocks[shape_id];
+		GeometryBlock &block = geometry_blocks[shape_id];
 		const int base = cursor;
 		if (block.type == 4) {
 			entry.geometry_a = base;
@@ -1178,6 +1187,8 @@ void PXTGI3D::_rescan() {
 				geometry.append_array(block.triangles);
 			}
 		}
+		block.offset = base;
+		block.words = cursor - base;
 		placed.insert(shape_id, Vector2i(entry.geometry_a, entry.geometry_b));
 	}
 	// Streamed cells and released shapes must leave both CPU and GPU geometry caches.
@@ -1192,6 +1203,83 @@ void PXTGI3D::_rescan() {
 	}
 	if (rebuild) {
 		geometry_version++;
+	}
+}
+
+// Shape edits keep their scene membership and packed range when their topology has the same
+// size (normal wall growth/trimming). Only a size change compacts the geometry layout.
+void PXTGI3D::_refresh_geometry() {
+	if (geometry_dirty.is_empty()) {
+		return;
+	}
+	LocalVector<ObjectID> pending;
+	for (const ObjectID &id : geometry_dirty) {
+		pending.push_back(id);
+	}
+	LocalVector<int> changed;
+	LocalVector<ObjectID> blocks;
+	bool relayout = false;
+	for (const ObjectID &id : pending) {
+		const LocalVector<int> *entries = geometry_entries.getptr(id);
+		if (entries == nullptr || entries->is_empty()) {
+			geometry_dirty.erase(id);
+			continue;
+		}
+		Ref<Shape3D> resource = ObjectDB::get_instance<Shape3D>(id);
+		if (resource.is_null()) {
+			geometry_dirty.erase(id);
+			continue;
+		}
+		_geometry_for(resource);
+		const GeometryBlock &block = geometry_blocks[id];
+		const int words = (block.planes.size() + block.nodes.size() + block.triangles.size()) / 4;
+		relayout |= words != block.words || (words > 0 && block.offset < 0);
+		blocks.push_back(id);
+		for (int i : *entries) {
+			ShapeEntry &entry = shapes[i];
+			entry.geometry_type = block.type;
+			entry.geometry_key = block.key;
+			entry.local_bounds = block.bounds;
+			entry.geometry_a = block.offset;
+			entry.geometry_b = block.type == 4 ? block.planes.size() / 4 : block.offset + block.nodes.size() / 4;
+			changed.push_back(i);
+		}
+	}
+	if (blocks.is_empty()) {
+		return;
+	}
+	if (relayout) {
+		_layout_geometry();
+		// Compaction may move other shapes' offsets; retain their poses and bounds.
+		for (uint32_t i = 0; i < shapes.size(); i++) {
+			if (shapes[i].geometry_type) {
+				store_int(&entry_floats[i * PhysXGIEffect::PRIMITIVE_FLOATS + 13], shapes[i].geometry_a);
+				store_int(&entry_floats[i * PhysXGIEffect::PRIMITIVE_FLOATS + 14], shapes[i].geometry_b);
+			}
+		}
+		static_dirty = true;
+		moving_dirty = true;
+	} else {
+		float *packed_geometry = geometry.ptrw();
+		for (const ObjectID &id : blocks) {
+			const GeometryBlock &block = geometry_blocks[id];
+			if (block.words == 0) {
+				continue;
+			}
+			float *destination = packed_geometry + block.offset * 4;
+			if (block.type == 4) {
+				memcpy(destination, block.planes.ptr(), block.planes.size() * sizeof(float));
+			} else {
+				memcpy(destination, block.nodes.ptr(), block.nodes.size() * sizeof(float));
+				memcpy(destination + block.nodes.size(), block.triangles.ptr(), block.triangles.size() * sizeof(float));
+			}
+		}
+		geometry_version++;
+	}
+	for (int i : changed) {
+		entry_valid[i] = _refresh_entry(i, &entry_floats[i * PhysXGIEffect::PRIMITIVE_FLOATS], entry_bounds[i]);
+		(shapes[i].moving ? moving_dirty : static_dirty) = true;
+		records_changed++;
 	}
 }
 
@@ -1543,7 +1631,7 @@ void PXTGI3D::_update_primitives(PhysXGIEffect::Snapshot &r_snapshot) {
 	pending_meshes.clear();
 	// The shapes found again when tracked nodes came or went, at most every 10 frames (a stream of spawned debris
 	// doesn't rescan every frame).
-	if (tracked_root.is_null() || geometry_dirty || (tracked_changed && ++frames_since_rescan >= 10)) {
+	if (tracked_root.is_null() || (tracked_changed && ++frames_since_rescan >= 10)) {
 		const uint64_t since = OS::get_singleton()->get_ticks_usec();
 		const LocalVector<ShapeEntry> was(shapes);
 		const HashMap<ObjectID, int> was_index(entry_of);
@@ -1558,6 +1646,7 @@ void PXTGI3D::_update_primitives(PhysXGIEffect::Snapshot &r_snapshot) {
 			last_change = String();
 		}
 	}
+	_refresh_geometry();
 	const int n = shapes.size();
 	moving_entries.clear();
 	for (int i = 0; i < n; i++) {
