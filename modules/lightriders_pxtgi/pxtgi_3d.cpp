@@ -336,6 +336,9 @@ void PXTGI3D::_deactivate() {
 	get_tree()->disconnect("node_removed", callable_mp(this, &PXTGI3D::_node_removed));
 	tracked.clear();
 	looks.clear();
+	look_order.clear();
+	look_slots.clear();
+	pending_membership.clear();
 	pending_meshes.clear();
 	tracked_root = ObjectID();
 	_detach();
@@ -840,11 +843,31 @@ int build_triangle_tree(LocalVector<TriangleItem> &p_items, uint32_t p_from, uin
 // The planes of a convex hull, or a triangle mesh's (or height map's) tree and triangles, in the shape's local space;
 // rebuilt after the shape changes. Software trees and hardware structures share the same revision.
 void PXTGI3D::_geometry_changed(ObjectID p_shape) {
+	if (const GeometryBlock *block = geometry_blocks.getptr(p_shape)) {
+		const Shape3D *shape = ObjectDB::get_instance<Shape3D>(p_shape);
+		// CollisionShape3D initializes debug color/fill on first attachment. That
+		// emits changed without changing geometry, including after CPU preparation.
+		// Held COW inputs keep identity stable; real edits detach their storage.
+		if (const ConcavePolygonShape3D *concave = Object::cast_to<ConcavePolygonShape3D>(shape)) {
+			if (block->source_vertices.ptr() == concave->get_faces().ptr()) {
+				return;
+			}
+		} else if (const ConvexPolygonShape3D *convex = Object::cast_to<ConvexPolygonShape3D>(shape)) {
+			if (block->source_vertices.ptr() == convex->get_points().ptr()) {
+				return;
+			}
+		} else if (const HeightMapShape3D *height = Object::cast_to<HeightMapShape3D>(shape)) {
+			if (block->source_width == height->get_map_width() && block->source_depth == height->get_map_depth() && block->source_heights.ptr() == height->get_map_data().ptr()) {
+				return;
+			}
+		}
+	}
 	geometry_dirty.insert(p_shape);
 }
 
 const PXTGI3D::GeometryBlock *PXTGI3D::_geometry_for(const Ref<Shape3D> &p_shape) {
 	const ObjectID id = p_shape->get_instance_id();
+	const bool had_block = geometry_blocks.has(id);
 	GeometryBlock block;
 	if (const GeometryBlock *known = geometry_blocks.getptr(id)) {
 		if (!geometry_dirty.has(id)) {
@@ -854,9 +877,15 @@ const PXTGI3D::GeometryBlock *PXTGI3D::_geometry_for(const Ref<Shape3D> &p_shape
 		block.words = known->words;
 	}
 	geometry_dirty.erase(id);
+	if (!Object::cast_to<ConcavePolygonShape3D>(p_shape.ptr()) && !Object::cast_to<ConvexPolygonShape3D>(p_shape.ptr()) && !Object::cast_to<HeightMapShape3D>(p_shape.ptr())) {
+		return nullptr;
+	}
+	const uint64_t build_since = OS::get_singleton()->get_ticks_usec();
+	const Callable changed = callable_mp(this, &PXTGI3D::_geometry_changed).bind(id);
 	Vector<Vector3> corners;
 	if (Ref<ConvexPolygonShape3D> convex = p_shape; convex.is_valid()) {
 		const Vector<Vector3> points = convex->get_points();
+		block.source_vertices = points;
 		Geometry3D::MeshData hull;
 		if (points.size() >= 4 && ConvexHullComputer::convex_hull(points, hull) == OK && hull.faces.size() >= 4) {
 			block.type = 4;
@@ -873,11 +902,15 @@ const PXTGI3D::GeometryBlock *PXTGI3D::_geometry_for(const Ref<Shape3D> &p_shape
 		}
 	} else if (Ref<ConcavePolygonShape3D> concave = p_shape; concave.is_valid()) {
 		corners = concave->get_faces();
+		block.source_vertices = corners;
 	} else if (Ref<HeightMapShape3D> height = p_shape; height.is_valid()) {
 		// Godot's height map: a grid one unit apart, centred on the shape's origin.
 		const int w = height->get_map_width();
 		const int d = height->get_map_depth();
 		const Vector<real_t> heights = height->get_map_data();
+		block.source_heights = heights;
+		block.source_width = w;
+		block.source_depth = d;
 		if (w >= 2 && d >= 2 && heights.size() >= w * d) {
 			auto corner = [&](int x, int z) {
 				return Vector3(x - (w - 1) * 0.5f, heights[z * w + x], z - (d - 1) * 0.5f);
@@ -917,7 +950,7 @@ const PXTGI3D::GeometryBlock *PXTGI3D::_geometry_for(const Ref<Shape3D> &p_shape
 		block.key = next_key.increment();
 	}
 	if (Object::cast_to<ConcavePolygonShape3D>(p_shape.ptr()) || Object::cast_to<ConvexPolygonShape3D>(p_shape.ptr()) || Object::cast_to<HeightMapShape3D>(p_shape.ptr())) {
-		const Callable changed = callable_mp(this, &PXTGI3D::_geometry_changed).bind(id);
+		_stage(had_block ? STAGE_GEOMETRY_EDITED : (p_shape->is_connected("changed", changed) ? STAGE_GEOMETRY_RETIRED : STAGE_GEOMETRY_FIRST), build_since);
 		if (!p_shape->is_connected("changed", changed)) {
 			p_shape->connect("changed", changed);
 		}
@@ -941,7 +974,10 @@ void PXTGI3D::_track_all(Node *p_root) {
 	texture_averages.clear();
 	collect(p_root, tracked);
 	tracked_root = p_root->get_instance_id();
-	tracked_changed = true;
+	pending_membership.clear();
+	for (const ObjectID &id : tracked) {
+		pending_membership.insert(id);
+	}
 }
 
 void PXTGI3D::_node_added(Node *p_node) {
@@ -973,22 +1009,27 @@ void PXTGI3D::_node_added(Node *p_node) {
 			probes.push_back(id);
 		}
 	} else if (Object::cast_to<MeshInstance3D>(p_node)) {
+		_observe(id);
 		pending_meshes.push_back(id);
 	} else if (!Object::cast_to<Light3D>(p_node)) {
-		tracked_changed = true;
+		pending_membership.insert(id);
 		last_change = "added " + String(p_node->get_path());
 	}
 }
 
-// A light or probe gone is skipped where it's used (no longer an object) until the next rescan drops it; only a shape
-// the tree holds means finding the shapes again.
+// Retirement invalidates cached pointers immediately; dense membership changes are
+// applied together at publication, after node_added has completed any reparenting.
 void PXTGI3D::_node_removed(Node *p_node) {
 	const ObjectID id = p_node->get_instance_id();
 	if (tracked.erase(id)) {
-		looks.erase(id);
+		_unobserve(id);
+		suns.erase(id);
+		omnis.erase(id);
+		spots.erase(id);
+		probes.erase(id);
 		if (const int *index = entry_of.getptr(id)) {
-			shapes[*index].collision_node = nullptr; // leaving/re-entering must revalidate the node and its look
-			tracked_changed = true;
+			pending_membership.insert(id);
+			shapes[*index].collision_node = nullptr;
 			last_change = "removed " + String(p_node->get_path());
 		}
 	}
@@ -1005,256 +1046,373 @@ Pair<Color, Color> PXTGI3D::_look_of(Node *p_node) const {
 	return look;
 }
 
-// The looks of a slice of the tracked shapes and meshes, worked out again: a shape whose look changed is rewritten
-// (r_changed); one that starts or stops giving off light, or a collision shape given another Shape3D, means finding
-// the shapes again.
+// Bounded observation retains live authoring edits without revisiting the whole city
+// whenever a streamed cell arrives. Ignored existing nodes stay observed for restoration.
 void PXTGI3D::_restyle_slice(LocalVector<int> &r_changed) {
 	const uint32_t count = look_order.size();
-	// About a second for all of them, but never more than 48 a frame however many there are.
 	for (uint32_t k = 0; k < MIN(count / 60 + 1, 48u) && count > 0; k++) {
 		const ObjectID id = look_order[look_cursor++ % count];
 		Node *node = ObjectDB::get_instance<Node>(id);
-		Pair<Color, Color> *known = looks.getptr(id);
-		if (node == nullptr || known == nullptr) {
+		if (node == nullptr || !node->is_inside_tree()) {
+			continue;
+		}
+		const int *index = entry_of.getptr(id);
+		if (_membership_changed(node, index ? &shapes[*index] : nullptr)) {
+			pending_membership.insert(id);
+			last_change = "classification " + String(node->get_path());
+		}
+		if (!is_tracked(node)) {
 			continue;
 		}
 		Pair<Color, Color> look = _look_of(node);
-		const int *index = entry_of.getptr(id);
+		Pair<Color, Color> *known = looks.getptr(id);
 		if (index && shapes[*index].driven) {
-			look.second = known->second; // its glow comes from update_emitter_group
+			look.second = shapes[*index].emission;
 		}
-		if (index) {
-			const CollisionShape3D *cs = Object::cast_to<CollisionShape3D>(node);
-			if (cs && (cs->get_shape().is_valid() ? cs->get_shape()->get_instance_id() : ObjectID()) != shapes[*index].shape_resource) {
-				tracked_changed = true;
-				last_change = "new shape " + String(node->get_path());
+		if (index == nullptr && look.second.get_luminance() > 0.0f) {
+			const MeshInstance3D *mesh = Object::cast_to<MeshInstance3D>(node);
+			if (mesh && mesh->get_mesh().is_valid() && mesh->get_gi_mode() != GeometryInstance3D::GI_MODE_DISABLED) {
+				pending_membership.insert(id);
 			}
 		}
-		if (look.first == known->first && look.second == known->second) {
+		if (known && look.first == known->first && look.second == known->second) {
 			continue;
 		}
-		// Starting to glow only puts a shape among the emitters (a mesh outside any body joins the tree); nothing is
-		// found again. One that goes dark stays where it is, unsampled.
-		const bool glows = look.second.get_luminance() > 0.0f;
-		if (glows && known->second.get_luminance() <= 0.0f) {
-			if (index == nullptr) {
-				if (MeshInstance3D *mesh = Object::cast_to<MeshInstance3D>(node)) {
-					*known = look;
-					_append_mesh(mesh, look);
-					continue;
-				}
-			} else if (emissive_entries.find(*index) < 0) {
+		if (index) {
+			ShapeEntry &entry = shapes[*index];
+			if (entry.emissive_slot < 0 && look.second.get_luminance() > 0.0f) {
+				entry.emissive_slot = emissive_entries.size();
 				emissive_entries.push_back(*index);
 			}
-		}
-		*known = look;
-		if (index) {
-			shapes[*index].albedo = look.first;
-			shapes[*index].emission = look.second;
+			entry.albedo = look.first;
+			entry.emission = look.second;
 			r_changed.push_back(*index);
+		}
+		looks.insert(id, look);
+	}
+}
+
+void PXTGI3D::_observe(ObjectID p_id) {
+	if (!look_slots.has(p_id)) {
+		look_slots.insert(p_id, look_order.size());
+		look_order.push_back(p_id);
+	}
+}
+
+void PXTGI3D::_unobserve(ObjectID p_id) {
+	if (const int *slot = look_slots.getptr(p_id)) {
+		const int at = *slot;
+		const ObjectID last = look_order[look_order.size() - 1];
+		look_order.remove_at_unordered(at);
+		look_slots.erase(p_id);
+		if (uint32_t(at) < look_order.size()) {
+			look_slots[last] = at;
+		}
+	}
+	looks.erase(p_id);
+}
+
+void PXTGI3D::_register_entry(ShapeEntry &r_entry, int p_index) {
+	if (r_entry.mesh_proxy) {
+		r_entry.proxy_slot = proxy_entries.size();
+		proxy_entries.push_back(p_index);
+	} else {
+		r_entry.body_indices = &body_entries[r_entry.body_node];
+		r_entry.body_slot = r_entry.body_indices->size();
+		r_entry.body_indices->push_back(p_index);
+		if (r_entry.shape_resource.is_valid()) {
+			r_entry.geometry_indices = &geometry_entries[r_entry.shape_resource];
+			r_entry.geometry_slot = r_entry.geometry_indices->size();
+			r_entry.geometry_indices->push_back(p_index);
+		}
+		if (!r_entry.fixed && !r_entry.manual_updates) {
+			r_entry.dynamic_slot = dynamic_entries.size();
+			dynamic_entries.push_back(p_index);
+		}
+	}
+	if (r_entry.emission.get_luminance() > 0.0f) {
+		r_entry.emissive_slot = emissive_entries.size();
+		emissive_entries.push_back(p_index);
+	}
+}
+
+void PXTGI3D::_unregister_entry(const ShapeEntry &p_entry) {
+	auto remove = [&](LocalVector<int> &r_list, int p_slot, int ShapeEntry::*p_slot_field) {
+		if (p_slot < 0) {
+			return;
+		}
+		const int last = r_list[r_list.size() - 1];
+		r_list.remove_at_unordered(p_slot);
+		if (uint32_t(p_slot) < r_list.size()) {
+			shapes[last].*p_slot_field = p_slot;
+		}
+	};
+	remove(dynamic_entries, p_entry.dynamic_slot, &ShapeEntry::dynamic_slot);
+	remove(proxy_entries, p_entry.proxy_slot, &ShapeEntry::proxy_slot);
+	remove(emissive_entries, p_entry.emissive_slot, &ShapeEntry::emissive_slot);
+	if (p_entry.body_indices) {
+		remove(*p_entry.body_indices, p_entry.body_slot, &ShapeEntry::body_slot);
+		if (p_entry.body_indices->is_empty()) {
+			body_entries.erase(p_entry.body_node);
+		}
+	}
+	if (p_entry.geometry_indices) {
+		remove(*p_entry.geometry_indices, p_entry.geometry_slot, &ShapeEntry::geometry_slot);
+		if (p_entry.geometry_indices->is_empty()) {
+			geometry_entries.erase(p_entry.shape_resource);
+			if (const GeometryBlock *block = geometry_blocks.getptr(p_entry.shape_resource); block && block->type == 0) {
+				geometry_blocks.erase(p_entry.shape_resource);
+			}
 		}
 	}
 }
 
-void PXTGI3D::_rescan(const LocalVector<ShapeEntry> &p_was) {
+void PXTGI3D::_remove_entry(int p_index) {
+	constexpr int PF = PhysXGIEffect::PRIMITIVE_FLOATS;
+	const ShapeEntry removed = shapes[p_index];
+	_unregister_entry(removed);
+	entry_of.erase(removed.shape_node);
+	(removed.moving ? moving_dirty : static_dirty) = true;
+	const int last = shapes.size() - 1;
+	if (p_index != last) {
+		shapes[p_index] = shapes[last];
+		ShapeEntry &moved = shapes[p_index];
+		entry_of[moved.shape_node] = p_index;
+		if (moved.body_indices) {
+			(*moved.body_indices)[moved.body_slot] = p_index;
+		}
+		if (moved.geometry_indices) {
+			(*moved.geometry_indices)[moved.geometry_slot] = p_index;
+		}
+		if (moved.dynamic_slot >= 0) {
+			dynamic_entries[moved.dynamic_slot] = p_index;
+		}
+		if (moved.proxy_slot >= 0) {
+			proxy_entries[moved.proxy_slot] = p_index;
+		}
+		if (moved.emissive_slot >= 0) {
+			emissive_entries[moved.emissive_slot] = p_index;
+		}
+		memcpy(&entry_floats[p_index * PF], &entry_floats[last * PF], PF * sizeof(float));
+		entry_bounds[p_index] = entry_bounds[last];
+		entry_valid[p_index] = entry_valid[last];
+		entry_slot[p_index] = entry_slot[last];
+		if (entry_slot[p_index] >= 0) {
+			leaf_order[entry_slot[p_index]] = p_index;
+		}
+	}
+	shapes.resize(last);
+	entry_floats.resize(last * PF);
+	entry_bounds.resize(last);
+	entry_valid.resize(last);
+	entry_slot.resize(last);
+}
+
+// Classification changes use the same bounded observation as material authoring. Explicit
+// notify_body_changed calls enqueue the affected body/children for the next publication.
+bool PXTGI3D::_membership_changed(Node *p_node, const ShapeEntry *p_entry) const {
+	if (!is_tracked(p_node)) {
+		return p_entry != nullptr;
+	}
+	if (const CollisionShape3D *cs = Object::cast_to<CollisionShape3D>(p_node)) {
+		const Node *body = cs->get_parent();
+		return p_entry == nullptr || p_entry->collision_node == nullptr ||
+				body->get_instance_id() != p_entry->body_node ||
+				(cs->get_shape().is_valid() ? cs->get_shape()->get_instance_id() : ObjectID()) != p_entry->shape_resource ||
+				bool(body->get_meta(meta_sample_emission(), true)) != p_entry->sample_emission ||
+				bool(body->get_meta(meta_manual_updates(), false)) != p_entry->manual_updates;
+	}
+	const MeshInstance3D *mesh = Object::cast_to<MeshInstance3D>(p_node);
+	return p_entry && mesh && (mesh->get_mesh().is_null() || mesh->get_gi_mode() == GeometryInstance3D::GI_MODE_DISABLED);
+}
+
+// Apply one membership delta. Existing records and list positions are untouched unless
+// this particular node changed classification. Returns whether packed geometry needs layout.
+bool PXTGI3D::_sync_member(ObjectID p_id) {
+	constexpr int PF = PhysXGIEffect::PRIMITIVE_FLOATS;
+	const int *known_index = entry_of.getptr(p_id);
+	int index = known_index ? *known_index : -1;
+	Node *node = tracked.has(p_id) ? ObjectDB::get_instance<Node>(p_id) : nullptr;
+	const bool eligible = node && node->is_inside_tree() && is_tracked(node);
+	if (!eligible) {
+		if (index >= 0) {
+			const bool geometry = shapes[index].geometry_type != 0;
+			_remove_entry(index);
+			return geometry;
+		}
+		return false;
+	}
+	if (Object::cast_to<Light3D>(node) || Object::cast_to<ReflectionProbe>(node)) {
+		return false;
+	}
+	_observe(p_id);
+	const uint64_t look_since = OS::get_singleton()->get_ticks_usec();
+	Pair<Color, Color> look = _look_of(node);
+	if (index >= 0 && shapes[index].driven) {
+		look.second = shapes[index].emission;
+	}
+	looks.insert(p_id, look);
+	_stage(STAGE_SCAN_LOOK, look_since);
+	ShapeEntry entry;
+	entry.shape_node = p_id;
+	entry.albedo = look.first;
+	entry.emission = look.second;
+	bool same = false;
+	if (MeshInstance3D *mesh = Object::cast_to<MeshInstance3D>(node)) {
+		if (mesh->get_mesh().is_null() || mesh->get_gi_mode() == GeometryInstance3D::GI_MODE_DISABLED || (index < 0 && look.second.get_luminance() <= 0.0f)) {
+			if (index >= 0) {
+				_remove_entry(index);
+			}
+			return false;
+		}
+		entry.mesh_proxy = true;
+		entry.moving = true;
+		same = index >= 0 && shapes[index].mesh_proxy;
+	} else {
+		CollisionShape3D *cs = Object::cast_to<CollisionShape3D>(node);
+		Node *body = cs->get_parent();
+		const Ref<Shape3D> shape = cs->get_shape();
+		entry.collision_node = cs;
+		entry.body_node = body->get_instance_id();
+		entry.shape_resource = shape.is_valid() ? shape->get_instance_id() : ObjectID();
+		entry.fixed = Object::cast_to<StaticBody3D>(body) && !Object::cast_to<AnimatableBody3D>(body);
+		entry.moving = !entry.fixed;
+		entry.sample_emission = bool(body->get_meta(meta_sample_emission(), true));
+		entry.manual_updates = bool(body->get_meta(meta_manual_updates(), false));
+		same = index >= 0 && shapes[index].collision_node && shapes[index].body_node == entry.body_node && shapes[index].shape_resource == entry.shape_resource;
+		if (!same && shape.is_valid()) {
+			const uint64_t geometry_since = OS::get_singleton()->get_ticks_usec();
+			if (const GeometryBlock *block = _geometry_for(shape)) {
+				entry.geometry_type = block->type;
+				entry.geometry_key = block->key;
+				entry.geometry_a = block->offset;
+				entry.geometry_b = block->type == 4 ? block->planes.size() / 4 : block->offset + block->nodes.size() / 4;
+				entry.local_bounds = block->bounds;
+			}
+			_stage(STAGE_SCAN_GEOMETRY, geometry_since);
+		}
+	}
+	if (same) {
+		scan_retained++;
+		ShapeEntry &current = shapes[index];
+		current.sample_emission = entry.sample_emission;
+		current.manual_updates = entry.manual_updates;
+		const bool dynamic = !current.mesh_proxy && !current.fixed && !current.manual_updates;
+		if (dynamic && current.dynamic_slot < 0) {
+			current.dynamic_slot = dynamic_entries.size();
+			dynamic_entries.push_back(index);
+		} else if (!dynamic && current.dynamic_slot >= 0) {
+			const int slot = current.dynamic_slot;
+			const int last = dynamic_entries[dynamic_entries.size() - 1];
+			dynamic_entries.remove_at_unordered(slot);
+			if (uint32_t(slot) < dynamic_entries.size()) {
+				shapes[last].dynamic_slot = slot;
+			}
+			current.dynamic_slot = -1;
+		}
+		if (current.emissive_slot < 0 && look.second.get_luminance() > 0.0f) {
+			current.emissive_slot = emissive_entries.size();
+			emissive_entries.push_back(index);
+		}
+		current.albedo = look.first;
+		_set_glow(index, look.second);
+		float *record = &entry_floats[index * PF];
+		if (record[16] != look.first.r || record[17] != look.first.g || record[18] != look.first.b) {
+			record[16] = look.first.r;
+			record[17] = look.first.g;
+			record[18] = look.first.b;
+			if (entry_slot[index] >= 0) {
+				memcpy(&ordered_floats[entry_slot[index] * PF + 16], &record[16], 3 * sizeof(float));
+			}
+			radiance_dirty = true;
+		}
+		return false;
+	}
+	bool geometry_changed = entry.geometry_type != 0;
+	if (index >= 0) {
+		geometry_changed |= shapes[index].geometry_type != 0;
+		_remove_entry(index);
+	}
+	const uint64_t register_since = OS::get_singleton()->get_ticks_usec();
+	index = shapes.size();
+	_register_entry(entry, index);
+	entry_of.insert(p_id, index);
+	shapes.push_back(entry);
+	entry_floats.resize((index + 1) * PF);
+	entry_bounds.resize(index + 1);
+	entry_valid.resize(index + 1);
+	entry_slot.push_back(-1);
+	memset(&entry_floats[index * PF], 0, PF * sizeof(float));
+	entry_valid[index] = _refresh_entry(index, &entry_floats[index * PF], entry_bounds[index]);
+	(entry.moving ? moving_dirty : static_dirty) = true;
+	scan_fresh++;
+	_stage(STAGE_SCAN_REGISTER, register_since);
+	return geometry_changed;
+}
+
+void PXTGI3D::_rescan() {
 	const uint64_t members_since = OS::get_singleton()->get_ticks_usec();
 	Node *root = _scan_root();
 	const bool fresh_root = root->get_instance_id() != tracked_root;
 	if (fresh_root) {
+		shapes.clear();
+		entry_of.clear();
+		body_entries.clear();
+		geometry_entries.clear();
+		dynamic_entries.clear();
+		proxy_entries.clear();
+		emissive_entries.clear();
+		moving_entries.clear();
+		entry_floats.clear();
+		entry_bounds.clear();
+		entry_valid.clear();
+		entry_slot.clear();
+		look_order.clear();
+		look_slots.clear();
+		suns.clear();
+		omnis.clear();
+		spots.clear();
+		probes.clear();
+		static_dirty = true;
+		moving_dirty = true;
 		_track_all(root);
+		for (const ObjectID &id : tracked) {
+			Node *node = ObjectDB::get_instance<Node>(id);
+			if (Object::cast_to<DirectionalLight3D>(node)) {
+				suns.push_back(id);
+			} else if (Object::cast_to<OmniLight3D>(node)) {
+				omnis.push_back(id);
+			} else if (Object::cast_to<SpotLight3D>(node)) {
+				spots.push_back(id);
+			} else if (Object::cast_to<ReflectionProbe>(node)) {
+				probes.push_back(id);
+			}
+		}
 	}
-	tracked_changed = false;
-	frames_since_rescan = 0;
-	shapes.clear();
-	suns.clear();
-	omnis.clear();
-	spots.clear();
-	probes.clear();
-	look_order.clear();
-	// Keep the hash entries and small per-body/resource arrays for retained city
-	// shapes. Reallocating tens of thousands of them on every streamed cell stalls
-	// the main thread even when almost every shape is unchanged.
-	for (KeyValue<ObjectID, LocalVector<int>> &entry : geometry_entries) {
-		entry.value.clear();
-	}
-	for (KeyValue<ObjectID, LocalVector<int>> &entry : body_entries) {
-		entry.value.clear();
-	}
-	dynamic_entries.clear();
-	proxy_entries.clear();
-	emissive_entries.clear();
-	shape_signature = 0;
 	_stage(STAGE_SCAN_PREPARE, members_since);
 	const uint64_t walk_since = OS::get_singleton()->get_ticks_usec();
-	static const bool detailed_timing = OS::get_singleton()->has_environment("PXTGI_SCAN_TIMING");
-	for (const ObjectID &id : tracked) {
-		uint64_t step_since = detailed_timing ? OS::get_singleton()->get_ticks_usec() : 0;
-		const int *known = entry_of.getptr(id);
-		const ShapeEntry *before = !fresh_root && known && uint32_t(*known) < p_was.size() && p_was[*known].shape_node == id ? &p_was[*known] : nullptr;
-		// node_removed invalidates cached pointers before a tracked node can die.
-		// Retained collision shapes therefore need no global ObjectDB lock/cast.
-		CollisionShape3D *cs = before ? before->collision_node : nullptr;
-		Node *n = cs ? static_cast<Node *>(cs) : ObjectDB::get_instance<Node>(id);
-		if (n == nullptr) {
-			continue;
-		}
-		ShapeEntry entry;
-		Node *body = nullptr;
-		Ref<Shape3D> shape;
-		bool retained = false;
-		if (cs) {
-			body = cs->get_parent();
-			shape = cs->get_shape();
-			const ObjectID shape_id = shape.is_valid() ? shape->get_instance_id() : ObjectID();
-			retained = body && body->get_instance_id() == before->body_node && shape_id == before->shape_resource;
-		}
-		if (retained) {
-			// A node's class and its unchanged parent's class cannot change. Keep
-			// the cached classification, while authoring metadata remains live.
-			if (n->has_meta(meta_ignore()) && bool(n->get_meta(meta_ignore()))) {
-				continue;
-			}
-			entry = *before;
-			entry.sample_emission = !body->has_meta(meta_sample_emission()) || bool(body->get_meta(meta_sample_emission()));
-		} else {
-			if (!is_tracked(n)) {
-				continue;
-			}
-			if (Object::cast_to<DirectionalLight3D>(n)) {
-				suns.push_back(id);
-				continue;
-			} else if (Object::cast_to<OmniLight3D>(n)) {
-				omnis.push_back(id);
-				continue;
-			} else if (Object::cast_to<SpotLight3D>(n)) {
-				spots.push_back(id);
-				continue;
-			} else if (Object::cast_to<ReflectionProbe>(n)) {
-				probes.push_back(id);
-				continue;
-			} else if (Object::cast_to<Light3D>(n)) {
-				continue;
-			}
-		}
-		if (detailed_timing) {
-			_stage(STAGE_SCAN_CHECK, step_since);
-			step_since = OS::get_singleton()->get_ticks_usec();
-		}
-		if (!retained) {
-			const Pair<Color, Color> *look = looks.getptr(id);
-			if (look == nullptr) {
-				look = &looks.insert(id, _look_of(n))->value;
-			}
-			entry.albedo = look->first;
-			entry.emission = look->second;
-		}
-		look_order.push_back(id);
-		entry.shape_node = id;
-		if (detailed_timing) {
-			_stage(STAGE_SCAN_LOOK, step_since);
-			step_since = OS::get_singleton()->get_ticks_usec();
-		}
-		if (retained) {
-			// Dirty shared resources were refreshed before copying p_was. Restyle
-			// and driven-emission updates likewise keep the retained record current.
-		} else if (MeshInstance3D *mesh = Object::cast_to<MeshInstance3D>(n)) {
-			// A mesh outside any body only counts while it gives off light (and not when it's kept out of GI, as
-			// Godot's own GI leaves it out).
-			if (mesh->get_mesh().is_null() || entry.emission.get_luminance() <= 0.0f || mesh->get_gi_mode() == GeometryInstance3D::GI_MODE_DISABLED) {
-				continue;
-			}
-			entry.mesh_proxy = true;
-			entry.moving = true;
-		} else {
-			cs = Object::cast_to<CollisionShape3D>(n);
-			entry.collision_node = cs;
-			body = cs->get_parent();
-			shape = cs->get_shape();
-			entry.body_node = body->get_instance_id();
-			entry.fixed = Object::cast_to<StaticBody3D>(body) && !Object::cast_to<AnimatableBody3D>(body);
-			entry.sample_emission = bool(body->get_meta(meta_sample_emission(), true));
-			entry.moving = !entry.fixed;
-			if (shape.is_valid()) {
-				entry.shape_resource = shape->get_instance_id();
-				if (const GeometryBlock *block = _geometry_for(shape)) {
-					entry.geometry_type = block->type;
-					entry.geometry_key = block->key;
-					entry.local_bounds = block->bounds;
-				}
-			}
-		}
-		if (detailed_timing) {
-			_stage(STAGE_SCAN_GEOMETRY, step_since);
-			step_since = OS::get_singleton()->get_ticks_usec();
-		}
-		const int index = shapes.size();
-		(retained ? scan_retained : scan_fresh)++;
-		if (int *previous = entry_of.getptr(id)) {
-			entry.previous_index = *previous;
-			*previous = index;
-		} else {
-			entry_of.insert(id, index);
-		}
-		if (entry.emission.get_luminance() > 0.0f) {
-			emissive_entries.push_back(index);
-		}
-		shape_signature = hash_murmur3_one_64(uint64_t(id), shape_signature);
-		if (entry.mesh_proxy) {
-			proxy_entries.push_back(index);
-		} else {
-			if (!retained) {
-				entry.body_indices = &body_entries[entry.body_node];
-				entry.geometry_indices = entry.shape_resource.is_valid() ? &geometry_entries[entry.shape_resource] : nullptr;
-			}
-			entry.body_indices->push_back(index);
-			if (entry.shape_resource.is_valid()) {
-				entry.geometry_indices->push_back(index);
-			}
-			if (!entry.fixed && (!body->has_meta(meta_manual_updates()) || !bool(body->get_meta(meta_manual_updates())))) {
-				dynamic_entries.push_back(index);
-			}
-			shape_signature = hash_murmur3_one_64(uint64_t(entry.shape_resource), shape_signature);
-		}
-		shapes.push_back(entry);
-		if (detailed_timing) {
-			_stage(STAGE_SCAN_REGISTER, step_since);
-		}
+	bool geometry_changed = fresh_root;
+	for (const ObjectID &id : pending_membership) {
+		geometry_changed |= _sync_member(id);
 	}
+	pending_membership.clear();
+	frames_since_rescan = 0;
+	membership_immediate = false;
 	_stage(STAGE_SCAN_WALK, walk_since);
-	const uint64_t prune_since = OS::get_singleton()->get_ticks_usec();
-	LocalVector<ObjectID> retired;
-	for (const KeyValue<ObjectID, int> &entry : entry_of) {
-		if (uint32_t(entry.value) >= shapes.size() || shapes[entry.value].shape_node != entry.key) {
-			retired.push_back(entry.key);
-		}
-	}
-	for (const ObjectID &id : retired) {
-		entry_of.erase(id);
-	}
-	retired.clear();
-	for (const KeyValue<ObjectID, LocalVector<int>> &entry : geometry_entries) {
-		if (entry.value.is_empty()) {
-			retired.push_back(entry.key);
-		}
-	}
-	for (const ObjectID &id : retired) {
-		geometry_entries.erase(id);
-	}
-	retired.clear();
-	for (const KeyValue<ObjectID, LocalVector<int>> &entry : body_entries) {
-		if (entry.value.is_empty()) {
-			retired.push_back(entry.key);
-		}
-	}
-	for (const ObjectID &id : retired) {
-		body_entries.erase(id);
-	}
-	_stage(STAGE_SCAN_PRUNE, prune_since);
 	_stage(STAGE_SCAN_MEMBERS, members_since);
-	const uint64_t layout_since = OS::get_singleton()->get_ticks_usec();
-	_layout_geometry();
-	geometry_dirty.clear();
-	_stage(STAGE_SCAN_LAYOUT, layout_since);
+	if (geometry_changed) {
+		const uint64_t layout_since = OS::get_singleton()->get_ticks_usec();
+		_layout_geometry();
+		// Stable live ranges mean only new/replaced records differ, but patching
+		// packed offsets is cheap and also covers a fresh world's retained blocks.
+		for (uint32_t i = 0; i < shapes.size(); i++) {
+			if (shapes[i].geometry_type) {
+				store_int(&entry_floats[i * PhysXGIEffect::PRIMITIVE_FLOATS + 13], shapes[i].geometry_a);
+				store_int(&entry_floats[i * PhysXGIEffect::PRIMITIVE_FLOATS + 14], shapes[i].geometry_b);
+			}
+		}
+		_stage(STAGE_SCAN_LAYOUT, layout_since);
+	}
 }
 
 void PXTGI3D::_layout_geometry() {
@@ -1314,11 +1472,17 @@ void PXTGI3D::_layout_geometry() {
 			entry.geometry_b = block.type == 4 ? block.planes.size() / 4 : block.offset + block.nodes.size() / 4;
 		}
 	}
-	// Streamed cells and released shapes must leave both CPU and GPU geometry caches.
+	// A streamed owner releases its GPU range immediately. The game may keep its
+	// Shape3D alive for a later cell visit, so retain immutable CPU geometry by
+	// weak ID until the resource dies; do not rebuild the same BVH every lap.
 	LocalVector<ObjectID> retired;
-	for (const KeyValue<ObjectID, GeometryBlock> &entry : geometry_blocks) {
+	for (KeyValue<ObjectID, GeometryBlock> &entry : geometry_blocks) {
 		if (!live.has(entry.key)) {
-			retired.push_back(entry.key);
+			entry.value.offset = -1;
+			entry.value.words = 0;
+			if (ObjectDB::get_instance<Shape3D>(entry.key) == nullptr) {
+				retired.push_back(entry.key);
+			}
 		}
 	}
 	for (const ObjectID &id : retired) {
@@ -1344,6 +1508,9 @@ void PXTGI3D::_refresh_geometry() {
 	for (const ObjectID &id : pending) {
 		const LocalVector<int> *entries = geometry_entries.getptr(id);
 		if (entries == nullptr || entries->is_empty()) {
+			// Inactive edits must not leave an old CPU revision available when
+			// this resource is attached again. There is no GPU range to update.
+			geometry_blocks.erase(id);
 			geometry_dirty.erase(id);
 			continue;
 		}
@@ -1515,84 +1682,6 @@ bool PXTGI3D::_refresh_entry(int p_index, float *r_out, AABB &r_bounds) {
 	return true;
 }
 
-// After a rescan: each shape still there (the same Shape3D) keeps its record, pose and tree slot from before, with its
-// look and geometry offsets rewritten; only new shapes are read from their nodes. The static part of the tree is kept
-// when it holds the same shapes, so a ribbon or a streamed cell coming and going doesn't rebuild the whole scene.
-void PXTGI3D::_keep_records(const LocalVector<ShapeEntry> &p_was, const LocalVector<float> &p_was_floats, const LocalVector<AABB> &p_was_bounds, const LocalVector<uint8_t> &p_was_valid) {
-	constexpr int PF = PhysXGIEffect::PRIMITIVE_FLOATS;
-	const int n = shapes.size();
-	entry_floats.resize(n * PF);
-	entry_bounds.resize(n);
-	entry_valid.resize(n);
-	LocalVector<int> now_index; // a former shape's index now, or -1
-	now_index.resize(p_was.size());
-	for (uint32_t i = 0; i < p_was.size(); i++) {
-		now_index[i] = -1;
-	}
-	for (int i = 0; i < n; i++) {
-		ShapeEntry &entry = shapes[i];
-		const int was = entry.previous_index;
-		if (uint32_t(was) >= p_was.size() || p_was[was].shape_node != entry.shape_node || p_was[was].body_node != entry.body_node || p_was[was].shape_resource != entry.shape_resource || p_was[was].geometry_key != entry.geometry_key || p_was[was].mesh_proxy != entry.mesh_proxy || (!entry.mesh_proxy && p_was[was].collision_node == nullptr)) {
-			entry_valid[i] = _refresh_entry(i, &entry_floats[i * PF], entry_bounds[i]);
-			continue;
-		}
-		const ShapeEntry &before = p_was[was];
-		now_index[was] = i;
-		entry.motion_generation = before.motion_generation;
-		entry.posed = before.posed;
-		entry.in_body = before.in_body;
-		entry.type = before.type;
-		entry.extents = before.extents;
-		entry.moving = entry.moving || before.moving;
-		entry.driven = before.driven;
-		if (entry.driven) {
-			entry.emission = before.emission;
-		}
-		float *record = &entry_floats[i * PF];
-		memcpy(record, &p_was_floats[was * PF], PF * sizeof(float));
-		if (entry.geometry_type) {
-			store_int(&record[13], entry.geometry_a);
-			store_int(&record[14], entry.geometry_b);
-		}
-		record[16] = entry.albedo.r;
-		record[17] = entry.albedo.g;
-		record[18] = entry.albedo.b;
-		record[20] = entry.emission.r;
-		record[21] = entry.emission.g;
-		record[22] = entry.emission.b;
-		entry_bounds[i] = p_was_bounds[was];
-		entry_valid[i] = p_was_valid[was];
-	}
-	// The static part stays when every static shape in it is still there and still static, and no other static shape
-	// is waiting to join it; its leaves then point at the shapes' new indices and take their rewritten records.
-	uint32_t static_count = 0;
-	for (int i = 0; i < n; i++) {
-		static_count += (!shapes[i].moving && entry_valid[i]) ? 1 : 0;
-	}
-	if (static_count != static_leaves) {
-		static_dirty = true;
-	}
-	for (uint32_t k = 0; k < static_leaves && !static_dirty; k++) {
-		const int i = now_index[leaf_order[k]];
-		if (i < 0 || shapes[i].moving || !entry_valid[i]) {
-			static_dirty = true;
-			break;
-		}
-		leaf_order[k] = i;
-		memcpy(&ordered_floats[k * PF], &entry_floats[i * PF], PF * sizeof(float));
-	}
-	leaf_order.resize(static_leaves);
-	// Slots for the kept static leaves; the moving part's come with its rebuild this frame.
-	entry_slot.resize(n);
-	for (int i = 0; i < n; i++) {
-		entry_slot[i] = -1;
-	}
-	for (uint32_t k = 0; k < static_leaves && !static_dirty; k++) {
-		entry_slot[leaf_order[k]] = k;
-	}
-	moving_dirty = true;
-}
-
 // The tree for the shapes as they are: the static part rebuilt only when it changed (or the root joining it to the
 // moving part comes or goes), the moving part every time.
 void PXTGI3D::_build_tree() {
@@ -1677,7 +1766,7 @@ void PXTGI3D::_build_tree() {
 void PXTGI3D::_append_mesh(MeshInstance3D *p_mesh, const Pair<Color, Color> &p_look) {
 	constexpr int PF = PhysXGIEffect::PRIMITIVE_FLOATS;
 	const ObjectID id = p_mesh->get_instance_id();
-	if (entry_of.has(id) || p_mesh->get_mesh().is_null() || p_mesh->get_gi_mode() == GeometryInstance3D::GI_MODE_DISABLED) {
+	if (entry_of.has(id) || !is_tracked(p_mesh) || p_mesh->get_mesh().is_null() || p_mesh->get_gi_mode() == GeometryInstance3D::GI_MODE_DISABLED) {
 		return;
 	}
 	ShapeEntry entry;
@@ -1687,14 +1776,14 @@ void PXTGI3D::_append_mesh(MeshInstance3D *p_mesh, const Pair<Color, Color> &p_l
 	entry.mesh_proxy = true;
 	entry.moving = true;
 	const int i = shapes.size();
+	_register_entry(entry, i);
 	entry_of.insert(id, i);
 	shapes.push_back(entry);
-	proxy_entries.push_back(i);
-	emissive_entries.push_back(i);
-	moving_entries.push_back(i);
 	entry_floats.resize((i + 1) * PF);
 	entry_bounds.resize(i + 1);
 	entry_valid.resize(i + 1);
+	entry_slot.push_back(-1);
+	memset(&entry_floats[i * PF], 0, PF * sizeof(float));
 	entry_valid[i] = _refresh_entry(i, &entry_floats[i * PF], entry_bounds[i]);
 	moving_dirty = true;
 }
@@ -1703,6 +1792,10 @@ void PXTGI3D::_append_mesh(MeshInstance3D *p_mesh, const Pair<Color, Color> &p_l
 void PXTGI3D::_set_glow(int p_index, const Color &p_glow) {
 	constexpr int PF = PhysXGIEffect::PRIMITIVE_FLOATS;
 	ShapeEntry &entry = shapes[p_index];
+	if (entry.emissive_slot < 0 && p_glow.get_luminance() > 0.0f) {
+		entry.emissive_slot = emissive_entries.size();
+		emissive_entries.push_back(p_index);
+	}
 	if (entry.emission == p_glow) {
 		return;
 	}
@@ -1722,15 +1815,15 @@ void PXTGI3D::_set_glow(int p_index, const Color &p_glow) {
 	}
 }
 
-// The shapes' records and their tree, refreshed for what changed. Shapes found again (when tracked nodes came or
-// went) keep their records; otherwise only the moving shapes, those whose look changed and a slice of every shape each
-// frame (to catch shapes edited, hidden or disabled) are read from their nodes. A record whose pose or shape changed
+// Membership deltas preserve every unaffected record. Moving shapes, changed looks and a bounded verification
+// slice (to catch shapes edited, hidden or disabled) are read from their nodes. A record whose pose or shape changed
 // rebuilds its part of the tree (a static shape that moves joins the moving part); a look alone is rewritten in place.
 void PXTGI3D::_update_primitives(PhysXGIEffect::Snapshot &r_snapshot) {
 	constexpr int PF = PhysXGIEffect::PRIMITIVE_FLOATS;
 	for (const ObjectID &id : pending_meshes) {
 		MeshInstance3D *mesh = ObjectDB::get_instance<MeshInstance3D>(id);
-		if (mesh && tracked.has(id) && mesh->get_mesh().is_valid() && mesh->get_gi_mode() != GeometryInstance3D::GI_MODE_DISABLED) {
+		if (mesh && tracked.has(id) && is_tracked(mesh) && mesh->get_mesh().is_valid() && mesh->get_gi_mode() != GeometryInstance3D::GI_MODE_DISABLED) {
+			_observe(id);
 			const Pair<Color, Color> look = _look_of(mesh);
 			looks.insert(id, look);
 			if (look.second.get_luminance() > 0.0f) {
@@ -1739,22 +1832,13 @@ void PXTGI3D::_update_primitives(PhysXGIEffect::Snapshot &r_snapshot) {
 		}
 	}
 	pending_meshes.clear();
-	// The shapes found again when tracked nodes came or went, at most every 10 frames (a stream of spawned debris
-	// doesn't rescan every frame).
-	if (tracked_root.is_null() || (tracked_changed && ++frames_since_rescan >= 10)) {
+	// Batch lifecycle changes over at most ten frames. An explicit notification
+	// applies its affected membership before this publication.
+	if (tracked_root.is_null() || (!pending_membership.is_empty() && (membership_immediate || ++frames_since_rescan >= 10))) {
 		const uint64_t since = OS::get_singleton()->get_ticks_usec();
-		// Shape edits already identify every affected instance. Apply those once
-		// before retaining records, rather than rediscovering their geometry in
-		// every instance visited by the membership scan.
+		// Refresh shared geometry before membership edits consume its current revision.
 		_refresh_geometry();
-		const LocalVector<ShapeEntry> was(shapes);
-		const LocalVector<float> was_floats(entry_floats);
-		const LocalVector<AABB> was_bounds(entry_bounds);
-		const LocalVector<uint8_t> was_valid(entry_valid);
-		_rescan(was);
-		const uint64_t keep_since = OS::get_singleton()->get_ticks_usec();
-		_keep_records(was, was_floats, was_bounds, was_valid);
-		_stage(STAGE_SCAN_KEEP, keep_since);
+		_rescan();
 		_stage(STAGE_RESCAN, since);
 		if (!last_change.is_empty()) {
 			rescan_causes.push_back(last_change);
@@ -1796,7 +1880,7 @@ void PXTGI3D::_update_primitives(PhysXGIEffect::Snapshot &r_snapshot) {
 						look.second = shapes[i].emission;
 					}
 					shapes[i].albedo = look.first;
-					shapes[i].emission = look.second;
+					_set_glow(i, look.second);
 					looks.insert(shapes[i].shape_node, look);
 				}
 				candidates.push_back({ i, nullptr });
@@ -1889,7 +1973,7 @@ void PXTGI3D::_update_primitives(PhysXGIEffect::Snapshot &r_snapshot) {
 			published_block_keys.clear();
 			published_block_triangles.clear();
 			for (const KeyValue<ObjectID, GeometryBlock> &E : geometry_blocks) {
-				if (E.value.type == 5) {
+				if (E.value.type == 5 && E.value.words > 0 && E.value.offset >= 0) {
 					published_block_keys.push_back(E.value.key);
 					published_block_triangles.push_back(E.value.triangles);
 				}
@@ -1913,9 +1997,51 @@ void PXTGI3D::_update_primitives(PhysXGIEffect::Snapshot &r_snapshot) {
 	moved_poses.clear();
 }
 
+// Prepare an inactive resource behind loading, without scene admission or GPU
+// allocation. Active revisions must remain on the normal refresh path so their
+// records, bounds and software/hardware keys change together at publication.
+void PXTGI3D::prepare_geometry(const Ref<Shape3D> &p_shape) {
+	ERR_FAIL_COND(p_shape.is_null());
+	const LocalVector<int> *entries = geometry_entries.getptr(p_shape->get_instance_id());
+	if (entries && !entries->is_empty()) {
+		return;
+	}
+	_geometry_for(p_shape);
+}
+
 void PXTGI3D::notify_body_changed(Node3D *p_body) {
 	ERR_FAIL_NULL(p_body);
 	moved_poses.insert(p_body->get_instance_id(), p_body->get_global_transform());
+	if (tracked_root.is_null() || !p_body->is_inside_tree()) {
+		return;
+	}
+	const Node *root = ObjectDB::get_instance<Node>(tracked_root);
+	if (root == nullptr || (root != p_body && !root->is_ancestor_of(p_body))) {
+		return;
+	}
+	auto queue = [&](Node *p_node) {
+		const ObjectID id = p_node->get_instance_id();
+		tracked.insert(id);
+		_observe(id);
+		const int *index = entry_of.getptr(id);
+		const MeshInstance3D *mesh = Object::cast_to<MeshInstance3D>(p_node);
+		// Ignoring an unregistered source mesh changes no membership. Keep it
+		// observed, but do not flush an unrelated streamed-cell batch for it.
+		const bool mesh_update = mesh && (index || (is_tracked(mesh) && mesh->get_mesh().is_valid() && mesh->get_gi_mode() != GeometryInstance3D::GI_MODE_DISABLED));
+		if (mesh_update || (!mesh && _membership_changed(p_node, index ? &shapes[*index] : nullptr))) {
+			pending_membership.insert(id);
+			membership_immediate = true;
+		}
+	};
+	if (Object::cast_to<MeshInstance3D>(p_body) || Object::cast_to<CollisionShape3D>(p_body)) {
+		queue(p_body);
+	}
+	for (int i = 0; i < p_body->get_child_count(); i++) {
+		Node *child = p_body->get_child(i);
+		if (Object::cast_to<CollisionShape3D>(child)) {
+			queue(child);
+		}
+	}
 }
 
 // Batched bridge for the underground pulse material. Parameters are shared by a group; each body's glow is written
@@ -1984,7 +2110,7 @@ void PXTGI3D::_stage(Stage p_stage, uint64_t p_since) {
 // Each stage's time since the last reset: total and worst microseconds, and calls (frames for the whole update); the
 // shapes, emitters and moving records it keeps.
 Dictionary PXTGI3D::get_stats(bool p_reset) {
-	static const char *names[STAGE_MAX] = { "publish", "emitters", "rescan", "records", "static_tree", "moving_tree", "select", "copy", "scan_members", "scan_layout", "scan_keep", "scan_prepare", "scan_walk", "scan_prune", "scan_check", "scan_look", "scan_geometry", "scan_register" };
+	static const char *names[STAGE_MAX] = { "publish", "emitters", "rescan", "records", "static_tree", "moving_tree", "select", "copy", "scan_members", "scan_layout", "scan_keep", "scan_prepare", "scan_walk", "scan_prune", "scan_check", "scan_look", "scan_geometry", "scan_register", "geometry_first", "geometry_retired", "geometry_edited" };
 	Dictionary stats;
 	for (int i = 0; i < STAGE_MAX; i++) {
 		Dictionary stage;
@@ -2258,6 +2384,7 @@ PackedStringArray PXTGI3D::get_configuration_warnings() const {
 }
 
 void PXTGI3D::_bind_methods() {
+	ClassDB::bind_method(D_METHOD("prepare_geometry", "shape"), &PXTGI3D::prepare_geometry);
 	ClassDB::bind_method(D_METHOD("notify_body_changed", "body"), &PXTGI3D::notify_body_changed);
 	ClassDB::bind_method(D_METHOD("update_emitter_group", "bodies", "stations", "values", "time"), &PXTGI3D::update_emitter_group);
 	ClassDB::bind_method(D_METHOD("get_stats", "reset"), &PXTGI3D::get_stats, DEFVAL(true));

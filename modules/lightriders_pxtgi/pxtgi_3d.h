@@ -70,7 +70,7 @@ class PXTGI3D : public Node3D {
 	float reflection_cutoff = 0.5f;
 	ObjectID attached_world;
 
-	// The collision shapes found in the scene (rescanned now and then), each with its body's albedo and emission;
+	// The live collision shapes, each with its body's albedo and emission;
 	// and emissive meshes outside any body, which stand in as their bounding box (mesh_proxy).
 	struct ShapeEntry {
 		ObjectID shape_node;
@@ -78,7 +78,13 @@ class PXTGI3D : public Node3D {
 		CollisionShape3D *collision_node = nullptr; // valid only while this ID is tracked in the tree
 		LocalVector<int> *body_indices = nullptr; // stable HashMap values, reused until this owner retires
 		LocalVector<int> *geometry_indices = nullptr;
-		int previous_index = -1; // preceding scan's record, before entry_of is updated in place
+		// Positions in the small owner lists; swap removal never searches retained city membership.
+		int body_slot = -1;
+		int geometry_slot = -1;
+		int dynamic_slot = -1;
+		int proxy_slot = -1;
+		int emissive_slot = -1;
+		bool manual_updates = false;
 		uint64_t motion_generation = 0; // pooled proxy identity, independent of geometry revisions
 		Color albedo;
 		Color emission;
@@ -104,6 +110,7 @@ class PXTGI3D : public Node3D {
 		Vector3 extents;
 	};
 	// Hull planes, or a mesh's tree and triangles, rebuilt when the shape resource changes.
+	// Inactive resources retain CPU blocks by weak ID; only allocated ranges reach the renderer.
 	struct GeometryBlock {
 		int type = 0;
 		uint64_t key = 0;
@@ -113,6 +120,12 @@ class PXTGI3D : public Node3D {
 		Vector<float> nodes; // mesh: its tree (8 floats a node; indices relative to the mesh)
 		Vector<float> triangles; // mesh: 12 floats a triangle (three corners, padded)
 		AABB bounds;
+		// COW input references distinguish geometry edits from debug-style changed
+		// signals without copying source data or keeping the Shape3D alive.
+		Vector<Vector3> source_vertices;
+		Vector<real_t> source_heights;
+		int source_width = 0;
+		int source_depth = 0;
 	};
 	HashMap<ObjectID, GeometryBlock> geometry_blocks;
 	HashSet<ObjectID> geometry_dirty;
@@ -137,22 +150,23 @@ class PXTGI3D : public Node3D {
 	LocalVector<ObjectID> omnis;
 	LocalVector<ObjectID> spots;
 	LocalVector<ObjectID> probes; // ReflectionProbes: where they override the GI, it isn't traced
-	uint32_t shape_signature = 0; // the shapes found by the last rescan: a change means rebuilding the tree
 
 	// The nodes the GI keeps track of (lights, reflection probes, the collision shapes of bodies, meshes outside any
 	// body): found by one walk of the scene when PXTGI starts, then kept up to date from the scene tree's node_added and
-	// node_removed, so finding the shapes again never walks the whole scene.
+	// node_removed. Only pending membership deltas are classified after initial discovery.
 	HashSet<ObjectID> tracked;
 	ObjectID tracked_root; // the node they were found under (the edited scene in the editor); none: walk again
-	bool tracked_changed = true; // a tracked node came or went (or a look or shape changed): find the shapes again
+	HashSet<ObjectID> pending_membership; // only nodes whose classification or lifetime changed
+	bool membership_immediate = false; // explicit notifications are applied at the next publication
 	// Meshes outside any body that came since the last update: only one that glows means finding the shapes again
 	// (effects add and drop plain meshes all the time).
 	LocalVector<ObjectID> pending_meshes;
 	int frames_since_rescan = 0;
-	// Each tracked shape's and mesh's look (albedo, emission), worked out once and then a slice of them each frame
-	// (all in about a second), so a changed material reaches the GI without a pause.
+	// Each tracked shape's and mesh's look (albedo, emission), with a bounded slice checked
+	// each frame for unnotified authoring edits. Explicit notifications apply at the next publication.
 	HashMap<ObjectID, Pair<Color, Color>> looks;
 	LocalVector<ObjectID> look_order;
+	HashMap<ObjectID, int> look_slots;
 	uint32_t look_cursor = 0;
 	HashMap<ObjectID, int> entry_of; // a shape node's index in shapes
 	uint32_t verify_cursor = 0;
@@ -204,8 +218,14 @@ class PXTGI3D : public Node3D {
 	uint64_t published_blocks_version = UINT64_MAX;
 	uint64_t primitives_version = 0;
 
-	void _rescan(const LocalVector<ShapeEntry> &p_was);
-	void _keep_records(const LocalVector<ShapeEntry> &p_was, const LocalVector<float> &p_was_floats, const LocalVector<AABB> &p_was_bounds, const LocalVector<uint8_t> &p_was_valid);
+	void _rescan();
+	bool _sync_member(ObjectID p_id);
+	bool _membership_changed(Node *p_node, const ShapeEntry *p_entry) const;
+	void _observe(ObjectID p_id);
+	void _unobserve(ObjectID p_id);
+	void _register_entry(ShapeEntry &r_entry, int p_index);
+	void _unregister_entry(const ShapeEntry &p_entry);
+	void _remove_entry(int p_index);
 	bool _shape_frame(int p_index, Transform3D &r_to_world, float &r_type, Vector3 &r_extents) const;
 	void _pack_entry(int p_index, const Transform3D &p_to_world, float p_type, const Vector3 &p_extents, float *r_out, AABB &r_bounds) const;
 	bool _refresh_entry(int p_index, float *r_out, AABB &r_bounds);
@@ -239,6 +259,9 @@ class PXTGI3D : public Node3D {
 		STAGE_SCAN_LOOK,
 		STAGE_SCAN_GEOMETRY,
 		STAGE_SCAN_REGISTER,
+		STAGE_GEOMETRY_FIRST,
+		STAGE_GEOMETRY_RETIRED,
+		STAGE_GEOMETRY_EDITED,
 		STAGE_MAX,
 	};
 	struct StageTime {
@@ -256,6 +279,7 @@ class PXTGI3D : public Node3D {
 
 public:
 	static void free_shared();
+	void prepare_geometry(const Ref<Shape3D> &p_shape);
 	void notify_body_changed(Node3D *p_body);
 	void update_emitter_group(const PackedInt64Array &p_bodies, const PackedFloat32Array &p_stations, const Dictionary &p_values, double p_time);
 	Dictionary get_stats(bool p_reset = true);

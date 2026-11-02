@@ -75,7 +75,7 @@ void Shape3D::set_debug_color(const Color &p_color) {
 #ifdef DEBUG_ENABLED
 	debug_properties_edited = true;
 #endif // DEBUG_ENABLED
-	_update_shape();
+	Shape3D::_update_shape(); // Debug styling does not change the derived physics geometry.
 }
 
 Color Shape3D::get_debug_color() const {
@@ -91,7 +91,7 @@ void Shape3D::set_debug_fill(bool p_fill) {
 #ifdef DEBUG_ENABLED
 	debug_properties_edited = true;
 #endif // DEBUG_ENABLED
-	_update_shape();
+	Shape3D::_update_shape(); // Debug styling does not change the derived physics geometry.
 }
 
 bool Shape3D::get_debug_fill() const {
