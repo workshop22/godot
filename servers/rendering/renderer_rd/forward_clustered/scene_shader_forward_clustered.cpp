@@ -309,6 +309,10 @@ uint16_t SceneShaderForwardClustered::ShaderData::_get_shader_version(PipelineVe
 				shader_flags |= SHADER_COLOR_PASS_FLAG_SEPARATE_SPECULAR;
 			}
 
+			if (p_color_pass_flags & PIPELINE_COLOR_PASS_FLAG_SEPARATE_TRANSPARENCY) {
+				shader_flags |= SHADER_COLOR_PASS_FLAG_SEPARATE_TRANSPARENCY;
+			}
+
 			if (p_color_pass_flags & PIPELINE_COLOR_PASS_FLAG_MOTION_VECTORS) {
 				shader_flags |= SHADER_COLOR_PASS_FLAG_MOTION_VECTORS;
 			}
@@ -444,6 +448,22 @@ void SceneShaderForwardClustered::ShaderData::_create_pipeline(PipelineKey p_pip
 			}
 
 			blend_state = blend_state_color_blend;
+			if (p_pipeline_key.color_pass_flags & PIPELINE_COLOR_PASS_FLAG_SEPARATE_TRANSPARENCY) {
+				// Color starts at zero: this stores the transparent contribution E. The second
+				// attachment starts at one and stores the remaining background transmission T.
+				// Compose E + T * background after the requested post-upscale effects. Keeping
+				// RGB transmission also preserves multiply materials and mixed blend ordering.
+				RD::PipelineColorBlendState::Attachment transmission = blend_attachment;
+				transmission.src_color_blend_factor = RD::BLEND_FACTOR_ZERO;
+				transmission.src_alpha_blend_factor = RD::BLEND_FACTOR_ZERO;
+				transmission.color_blend_op = RD::BLEND_OP_ADD;
+				transmission.alpha_blend_op = RD::BLEND_OP_ADD;
+				if (blend_mode == BLEND_MODE_MUL) {
+					transmission.dst_color_blend_factor = RD::BLEND_FACTOR_SRC_COLOR;
+					transmission.dst_alpha_blend_factor = RD::BLEND_FACTOR_SRC_ALPHA;
+				}
+				blend_state.attachments.write[1] = transmission;
+			}
 			if (!uses_transparent_motion_vectors) {
 				// The transparent pass binds motion vectors only for materials that write them
 				// (render_mode transparent_motion_vectors); the rest leave the surface behind them.
@@ -670,6 +690,7 @@ void SceneShaderForwardClustered::init(const String p_defines) {
 			"\n#define USE_LIGHTMAP\n", // SHADER_COLOR_PASS_FLAG_LIGHTMAP
 			"\n#define USE_MULTIVIEW\n", // SHADER_COLOR_PASS_FLAG_MULTIVIEW
 			"\n#define MOTION_VECTORS\n", // SHADER_COLOR_PASS_FLAG_MOTION_VECTORS
+			"\n#define MODE_SEPARATE_TRANSPARENCY\n", // SHADER_COLOR_PASS_FLAG_SEPARATE_TRANSPARENCY
 		};
 
 		for (int i = 0; i < SHADER_COLOR_PASS_FLAG_COUNT; i++) {

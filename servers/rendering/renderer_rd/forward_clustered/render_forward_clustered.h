@@ -48,6 +48,12 @@
 
 #define RB_SCOPE_FORWARD_CLUSTERED SNAME("forward_clustered")
 
+#define RB_TEX_TRANSPARENCY SNAME("transparency")
+#define RB_TEX_TRANSMISSION SNAME("transmission")
+#define RB_TEX_TRANSPARENCY_MSAA SNAME("transparency_msaa")
+#define RB_TEX_TRANSMISSION_MSAA SNAME("transmission_msaa")
+#define RB_TEX_TRANSPARENCY_DEPTH SNAME("transparency_depth")
+
 #define RB_TEX_SPECULAR SNAME("specular")
 #define RB_TEX_SPECULAR_MSAA SNAME("specular_msaa")
 #define RB_TEX_NORMAL_ROUGHNESS SNAME("normal_roughness")
@@ -214,6 +220,7 @@ private:
 		COLOR_PASS_FLAG_SEPARATE_SPECULAR = 1 << 1,
 		COLOR_PASS_FLAG_MULTIVIEW = 1 << 2,
 		COLOR_PASS_FLAG_MOTION_VECTORS = 1 << 3,
+		COLOR_PASS_FLAG_SEPARATE_TRANSPARENCY = 1 << 4,
 	};
 
 	struct GeometryInstanceSurfaceDataCache;

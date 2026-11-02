@@ -195,6 +195,32 @@ RID RenderForwardClustered::RenderBufferDataForwardClustered::get_color_pass_fb(
 	}
 
 	RID depth = use_msaa ? render_buffers->get_texture(RB_SCOPE_BUFFERS, RB_TEX_DEPTH_MSAA) : render_buffers->get_depth_texture();
+	if (p_color_pass_flags & COLOR_PASS_FLAG_SEPARATE_TRANSPARENCY) {
+		RD *rd = RD::get_singleton();
+		uint32_t usage = RD::TEXTURE_USAGE_COLOR_ATTACHMENT_BIT | RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT | RD::TEXTURE_USAGE_CAN_COPY_TO_BIT;
+		RD::TextureSamples samples = use_msaa ? render_buffers->get_texture_format(RB_SCOPE_BUFFERS, RB_TEX_COLOR_MSAA).samples : RD::TEXTURE_SAMPLES_1;
+		for (StringName name : { RB_TEX_TRANSPARENCY, RB_TEX_TRANSMISSION }) {
+			if (!render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, name)) {
+				render_buffers->create_texture(RB_SCOPE_FORWARD_CLUSTERED, name, render_buffers->get_base_data_format(), usage);
+			}
+		}
+		if (use_msaa && !render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSPARENCY_MSAA)) {
+			render_buffers->create_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSPARENCY_MSAA, render_buffers->get_base_data_format(), usage, samples);
+			render_buffers->create_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSMISSION_MSAA, render_buffers->get_base_data_format(), usage, samples);
+		}
+		if (!render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSPARENCY_DEPTH)) {
+			render_buffers->create_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSPARENCY_DEPTH, render_buffers->get_depth_format(false, use_msaa, render_buffers->get_can_be_storage()), RD::TEXTURE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | RD::TEXTURE_USAGE_CAN_COPY_TO_BIT, samples);
+		}
+		RID layer_depth = render_buffers->get_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSPARENCY_DEPTH);
+		Size2i size = render_buffers->get_internal_size();
+		for (int v = 0; v < v_count; v++) {
+			rd->texture_copy(depth, layer_depth, Vector3(), Vector3(), Vector3(size.x, size.y, 1), 0, 0, v, v);
+		}
+		depth = layer_depth;
+		color = render_buffers->get_texture(RB_SCOPE_FORWARD_CLUSTERED, use_msaa ? RB_TEX_TRANSPARENCY_MSAA : RB_TEX_TRANSPARENCY);
+		specular = render_buffers->get_texture(RB_SCOPE_FORWARD_CLUSTERED, use_msaa ? RB_TEX_TRANSMISSION_MSAA : RB_TEX_TRANSMISSION);
+	}
+
 
 	if (render_buffers->has_texture(RB_SCOPE_VRS, RB_TEXTURE)) {
 		RID vrs_texture = render_buffers->get_texture(RB_SCOPE_VRS, RB_TEXTURE);
@@ -444,6 +470,10 @@ void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p
 					pipeline_key.color_pass_flags |= SceneShaderForwardClustered::PIPELINE_COLOR_PASS_FLAG_SEPARATE_SPECULAR;
 				}
 
+				if constexpr ((p_color_pass_flags & COLOR_PASS_FLAG_SEPARATE_TRANSPARENCY) != 0) {
+					pipeline_key.color_pass_flags |= SceneShaderForwardClustered::PIPELINE_COLOR_PASS_FLAG_SEPARATE_TRANSPARENCY;
+				}
+
 				if constexpr ((p_color_pass_flags & COLOR_PASS_FLAG_MOTION_VECTORS) != 0) {
 					pipeline_key.color_pass_flags |= SceneShaderForwardClustered::PIPELINE_COLOR_PASS_FLAG_MOTION_VECTORS;
 				}
@@ -636,6 +666,8 @@ void RenderForwardClustered::_render_list(RenderingDevice::DrawListID p_draw_lis
 			switch (p_params->color_pass_flags) {
 				VALID_FLAG_COMBINATION(0);
 				VALID_FLAG_COMBINATION(COLOR_PASS_FLAG_TRANSPARENT);
+				VALID_FLAG_COMBINATION(COLOR_PASS_FLAG_TRANSPARENT | COLOR_PASS_FLAG_SEPARATE_TRANSPARENCY);
+				VALID_FLAG_COMBINATION(COLOR_PASS_FLAG_TRANSPARENT | COLOR_PASS_FLAG_SEPARATE_TRANSPARENCY | COLOR_PASS_FLAG_MULTIVIEW);
 				VALID_FLAG_COMBINATION(COLOR_PASS_FLAG_TRANSPARENT | COLOR_PASS_FLAG_MULTIVIEW);
 				VALID_FLAG_COMBINATION(COLOR_PASS_FLAG_TRANSPARENT | COLOR_PASS_FLAG_MOTION_VECTORS);
 				VALID_FLAG_COMBINATION(COLOR_PASS_FLAG_SEPARATE_SPECULAR);
@@ -1731,6 +1763,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 
 	// get info about our rendering effects
 	bool ce_needs_motion_vectors = _compositor_effects_has_flag(p_render_data, RSE::COMPOSITOR_EFFECT_FLAG_NEEDS_MOTION_VECTORS);
+	bool separate_transparency = rb_data.is_valid() && _compositor_effects_has_flag(p_render_data, RSE::COMPOSITOR_EFFECT_FLAG_NEEDS_SEPARATE_TRANSPARENCY);
 	bool ce_needs_normal_roughness = _compositor_effects_has_flag(p_render_data, RSE::COMPOSITOR_EFFECT_FLAG_NEEDS_ROUGHNESS);
 	bool ce_needs_separate_specular = _compositor_effects_has_flag(p_render_data, RSE::COMPOSITOR_EFFECT_FLAG_NEEDS_SEPARATE_SPECULAR);
 
@@ -2425,13 +2458,17 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		// Motion vectors are overwritten only by transparent materials that write them (render_mode
 		// transparent_motion_vectors: light walls that should blur with their own motion); the
 		// others' pipelines mask the attachment.
-		if (!scene_state.used_transparent_motion_vectors) {
+		if (separate_transparency || !scene_state.used_transparent_motion_vectors) {
 			transparent_color_pass_flags &= ~uint32_t(COLOR_PASS_FLAG_MOTION_VECTORS);
+		}
+
+		if (separate_transparency) {
+			transparent_color_pass_flags |= COLOR_PASS_FLAG_SEPARATE_TRANSPARENCY;
 		}
 
 		RID alpha_framebuffer = rb_data.is_valid() ? rb_data->get_color_pass_fb(transparent_color_pass_flags) : color_only_framebuffer;
 		RenderListParameters render_list_params(render_list[RENDER_LIST_ALPHA].elements.ptr(), render_list[RENDER_LIST_ALPHA].element_info.ptr(), render_list[RENDER_LIST_ALPHA].elements.size(), reverse_cull, PASS_MODE_COLOR, transparent_color_pass_flags, rb_data.is_null(), p_render_data->directional_light_soft_shadows, rp_uniform_set, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_WIREFRAME, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count, 0, base_specialization);
-		_render_list_with_draw_list(&render_list_params, alpha_framebuffer, RD::DRAW_DEFAULT_ALL, Vector<Color>(), 0.0f, 0u, p_render_data->render_region);
+		_render_list_with_draw_list(&render_list_params, alpha_framebuffer, separate_transparency ? RD::DRAW_CLEAR_COLOR_0 | RD::DRAW_CLEAR_COLOR_1 : RD::DRAW_DEFAULT_ALL, separate_transparency ? Vector<Color>({Color(0, 0, 0, 0), Color(1, 1, 1, 1)}) : Vector<Color>(), 0.0f, 0u, p_render_data->render_region);
 	}
 
 	RD::get_singleton()->draw_command_end_label();
@@ -2445,6 +2482,10 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		for (uint32_t v = 0; v < rb->get_view_count(); v++) {
 			RD::get_singleton()->texture_resolve_multisample(rb->get_color_msaa(v), rb->get_internal_texture(v));
 			resolve_effects->resolve_depth(rb->get_depth_msaa(v), rb->get_depth_texture(v), rb->get_internal_size(), texture_multisamples[msaa]);
+			if (separate_transparency) {
+				RD::get_singleton()->texture_resolve_multisample(rb->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSPARENCY_MSAA, v, 0), rb->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSPARENCY, v, 0));
+				RD::get_singleton()->texture_resolve_multisample(rb->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSMISSION_MSAA, v, 0), rb->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSMISSION, v, 0));
+			}
 
 			if (resolve_velocity_buffer) {
 				RD::get_singleton()->texture_resolve_multisample(rb->get_velocity_buffer(true, v), rb->get_velocity_buffer(false, v));
@@ -2553,6 +2594,13 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	{
 		RENDER_TIMESTAMP("Process Post Upscale Compositor Effects");
 		_process_compositor_effects(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_POST_UPSCALE, p_render_data);
+	}
+
+	if (separate_transparency) {
+		RENDER_TIMESTAMP("Composite Transparent Layer");
+		for (uint32_t v = 0; v < rb->get_view_count(); v++) {
+			copy_effects->merge_transparency(rb->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSPARENCY, v, 0), rb->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSMISSION, v, 0), rb->get_output_texture(v), rb->get_output_size(), p_render_data->scene_data->taa_jitter * 0.5);
+		}
 	}
 
 	if (rb_data.is_valid()) {
