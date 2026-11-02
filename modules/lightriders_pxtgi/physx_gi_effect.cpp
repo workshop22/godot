@@ -128,6 +128,7 @@ layout(set = 0, binding = 9, std140) uniform Frame {
 	vec4 src_border; // x: the atlas maps' border, y: the scale inside it, z: the roughest level
 	vec4 trace_settings; // x: reflection reach, y: filtered mirror rays, z: previous colour is valid, w: reflection softness
 	vec4 polish; // x: blue noise, y: GI history clamp, z: the source's mip levels for screen hits (0: level 0 only), w: frame pixels a reflection texel spans
+	vec4 jitter; // current and previous raster shifts, in UV
 	vec4 hw; // hardware trace spike: x: the moving part's root node (-1: none)
 }
 f;
@@ -883,7 +884,12 @@ vec3 world_light(vec3 x, vec3 n, int hit, sampler2D depth_tex, sampler2D color_t
 			float surface = sd > 0.0 ? linear_depth(sd, f.clip.x, f.clip.y) : 1e9;
 			if (abs(surface + v.z) < 0.1 + 0.02 * surface) {
 				float pd;
+#ifdef REFLECTION_MOTION
+				vec3 previous_view = (f.world_to_view * vec4(previous_world(x, hit), 1.0)).xyz;
+				vec2 pp = prev_pixel(previous_view, pd);
+#else
 				vec2 pp = prev_pixel(v, pd);
+#endif
 				if (on_screen(pp)) {
 					float lod = reflect_path > 0.0 ? reflected_lod(reflect_path, -v.z) : min(2.0, max(f.polish.z - 1.0, 0.0));
 					vec3 seen = textureLod(color_tex, (pp + 0.5) / vec2(f.sizes.xy), lod).rgb;
@@ -1322,6 +1328,22 @@ layout(rgba16f, set = 0, binding = 3) uniform restrict writeonly image2D dst;
 layout(set = 0, binding = 12) uniform sampler2DArray probe_atlas;
 layout(r32f, set = 0, binding = 13) uniform restrict writeonly image2D hit_dst;
 
+#define REFLECTION_MOTION
+struct PrimitiveMotion {
+	vec4 r0;
+	vec4 r1;
+	vec4 r2;
+	vec4 info;
+};
+layout(std430, set = 0, binding = 17) restrict readonly buffer PrimitiveMotions {
+	PrimitiveMotion p[];
+} motions;
+layout(rgba16f, set = 0, binding = 18) uniform restrict writeonly image2D motion_dst;
+vec3 previous_world(vec3 world, int hit) {
+	PrimitiveMotion m = motions.p[hit];
+	return vec3(dot(m.r0, vec4(world, 1.0)), dot(m.r1, vec4(world, 1.0)), dot(m.r2, vec4(world, 1.0)));
+}
+
 #define PROBE_SOURCES
 bool probe_source(vec3 x, vec3 n, int hit, out vec3 seen);
 // Whether this texel's ray may take its colour from a probe's capture: always on mirror-like surfaces, never past
@@ -1381,6 +1403,7 @@ void main() {
 	if (depth <= 0.0 || int(f.reflect.x) == 0 || rough > f.reflect.y) {
 		imageStore(dst, px, vec4(0.0));
 		imageStore(hit_dst, px, vec4(0.0));
+		imageStore(motion_dst, px, vec4(0.0));
 		return;
 	}
 	vec3 n = normalize(nr.xyz * 2.0 - 1.0);
@@ -1388,6 +1411,7 @@ void main() {
 	if (probe_overrides((f.view_to_world * vec4(p, 1.0)).xyz, 2)) {
 		imageStore(dst, px, vec4(0.0));
 		imageStore(hit_dst, px, vec4(0.0));
+		imageStore(motion_dst, px, vec4(0.0));
 		return;
 	}
 	vec3 v = normalize(p);
@@ -1425,6 +1449,8 @@ void main() {
 	// that isn't static in the world): the history follows the reflected point by it.
 	float hit_t = 0.0;
 	bool hit_moves = false;
+	vec3 hit_delta = vec3(0.0);
+	bool motion_valid = true;
 	float last = 0.0;
 	for (int s = 0; s < (f.trace_settings.z > 0.5 ? STEPS : 0); s++) {
 		float along = reach * pow((float(s) + jitter) / float(STEPS), 2.0);
@@ -1450,8 +1476,24 @@ void main() {
 			vec2 hp = clamp(pixel_from_view(origin + dir * t, f.proj_info), vec2(0.0), vec2(f.sizes.xy) - 1.0);
 			float hd = texelFetch(depth_tex, ivec2(hp), 0).r;
 			vec3 hv = view_from_pixel(floor(hp), hd > 0.0 ? hd : sd, f.proj_info, f.clip.x, f.clip.y);
+			hit_moves = texelFetch(normal_tex, ivec2(hp), 0).w > 0.5;
+			if (hit_moves) {
+				// The current scene velocity is written later, in the opaque pass. Match
+				// a moving screen hit to its presentation proxy instead of reading old velocity.
+				vec3 wo = (f.view_to_world * vec4(origin, 1.0)).xyz;
+				vec3 wd = mat3(f.view_to_world) * dir;
+				float distance = t + max(0.1, 0.05 * t);
+				vec3 wn;
+				int proxy = trace_world(wo, wd, distance, wn);
+				motion_valid = proxy >= 0 && abs(distance - t) < max(0.1, 0.05 * t);
+				if (motion_valid) {
+					vec3 hit_world = wo + wd * distance;
+					hit_delta = previous_world(hit_world, proxy) - hit_world;
+					motion_valid = motions.p[proxy].info.x > 0.5;
+				}
+			}
 			float pd;
-			vec2 pp = prev_pixel(hv, pd);
+			vec2 pp = prev_pixel(hv + mat3(f.world_to_view) * hit_delta, pd);
 			if (on_screen(pp)) {
 				light = textureLod(color_tex, (pp + 0.5) / vec2(f.sizes.xy), reflected_lod(length(p) + t, length(hv))).rgb;
 				found = true;
@@ -1473,8 +1515,20 @@ void main() {
 			found = true;
 			hit_t = far;
 			hit_moves = prims.p[hit].emission.w < 0.5;
+			vec3 hit_world = world_origin + world_dir * far;
+			hit_delta = previous_world(hit_world, hit) - hit_world;
+			motion_valid = motions.p[hit].info.x > 0.5;
 		}
 	}
+	// A tangent-plane mirror maps hit motion through the same reflection as the ray.
+	// Store actual previous screen position for temporal reuse and the blur's separate layer.
+	vec3 virtual_point = p + normalize(p) * (found ? hit_t : 65000.0);
+	vec3 mirrored_delta = reflect(mat3(f.world_to_view) * hit_delta, n);
+	float previous_depth;
+	vec2 previous = prev_pixel(virtual_point + mirrored_delta, previous_depth);
+	vec2 velocity = (previous - vec2(fp)) / vec2(f.sizes.xy);
+	bool usable = motion_valid && previous_depth > f.clip.z && !any(isnan(velocity)) && !any(isinf(velocity));
+	imageStore(motion_dst, px, vec4(usable ? velocity : vec2(0.0), min(-virtual_point.z, 65000.0), usable ? 1.0 : 0.0));
 	vec4 result = found ? vec4(light, 1.0) : vec4(0.0);
 	bool bad = any(isnan(result)) || any(isinf(result));
 	imageStore(dst, px, bad ? vec4(0.0) : result);
@@ -1506,6 +1560,7 @@ layout(rgba16f, set = 0, binding = 5) uniform restrict writeonly image2D accum;
 layout(r32f, set = 0, binding = 6) uniform restrict writeonly image2D accum_depth;
 layout(set = 0, binding = 7) uniform sampler2D hit_tex;
 layout(set = 0, binding = 8) uniform sampler2D prev_info;
+layout(set = 0, binding = 11) uniform sampler2D motion_tex;
 layout(rgba16f, set = 0, binding = 10) uniform restrict writeonly image2D info;
 
 void main() {
@@ -1542,14 +1597,14 @@ void main() {
 	vec3 sigma = sqrt(max(m2 / 9.0 - m1 * m1, vec3(0.0)));
 	vec4 result = now;
 	vec4 state = vec4(1.0, hit_distance, hit < 0.0 ? 1.0 : 0.0, 0.0); // frames, hit distance, motion seen (decaying)
-	if (pc.size.z != 0) {
+	vec4 reflection_motion = texelFetch(motion_tex, px, 0);
+	if (pc.size.z != 0 && reflection_motion.w > 0.5) {
 		float expected;
 		vec2 surface = prev_pixel(p, expected);
 		bool mirror = hit_distance > 0.0 && (rough < 0.3 || f.trace_settings.y > 0.5);
 		vec2 from = surface;
 		if (mirror) {
-			float mirror_depth;
-			from = prev_pixel(p + normalize(p) * hit_distance, mirror_depth);
+			from = vec2(fp) + reflection_motion.xy * vec2(f.sizes.xy);
 		}
 		if (on_screen(surface) && on_screen(from)) {
 			float was = texture(prev_depth_tex, (surface + 0.5) / vec2(f.sizes.xy)).r;
@@ -1695,6 +1750,8 @@ layout(set = 0, binding = 3) uniform sampler2D normal_tex;
 layout(set = 0, binding = 6) uniform sampler2D color_tex;
 layout(rgba16f, set = 0, binding = 4) uniform restrict writeonly image2D ambient_buffer;
 layout(rgba16f, set = 0, binding = 5) uniform restrict writeonly image2D reflection_buffer;
+layout(set = 0, binding = 13) uniform sampler2D reflection_motion_tex;
+layout(rgba16f, set = 0, binding = 14) uniform restrict writeonly image2D reflection_motion_out;
 layout(set = 0, binding = 7) uniform sampler2D reflect_tex;
 layout(set = 0, binding = 8) uniform sampler2D reflect_depth_tex;
 layout(set = 0, binding = 12) uniform sampler2DArray probe_atlas;
@@ -1751,6 +1808,7 @@ void main() {
 	if (depth <= 0.0) {
 		imageStore(ambient_buffer, px, vec4(0.0));
 		imageStore(reflection_buffer, px, vec4(0.0));
+		imageStore(reflection_motion_out, px, vec4(0.0));
 		return;
 	}
 	vec3 p = view_from_pixel(vec2(fp), depth, f.proj_info, f.clip.x, f.clip.y);
@@ -1808,6 +1866,13 @@ void main() {
 		}
 	}
 	imageStore(reflection_buffer, px, reflection);
+	ivec2 motion_at = clamp(ivec2((vec2(fp) + 0.5) * vec2(pc.out_size.zw) / vec2(f.sizes.xy)), ivec2(0), pc.out_size.zw - 1);
+	vec4 motion = texelFetch(reflection_motion_tex, motion_at, 0);
+	motion.xy -= f.jitter.zw - f.jitter.xy;
+	// A moving receiver needs its previous reflecting plane; keep its reflection sharp
+	// until that plane is known, rather than borrowing road or reflected-hit motion.
+	motion.w *= nr.w <= 0.5 && rough <= f.reflect.y ? 1.0 : 0.0;
+	imageStore(reflection_motion_out, px, motion);
 
 	int debug = int(f.misc.w);
 	if (debug == 1) {
@@ -1928,6 +1993,7 @@ struct FrameData {
 	float src_border[4];
 	float trace_settings[4];
 	float polish[4];
+	float jitter[4];
 	float hw[4];
 };
 
@@ -1999,7 +2065,14 @@ void PhysXGISourceEffect::_render(int p_callback_type, const RenderData *p_rende
 	}
 	rd->capture_timestamp("PXTGI source");
 	RendererRD::CopyEffects *copy = RendererRD::CopyEffects::get_singleton();
-	copy->copy_to_rect(color, view->source_levels[0], Rect2i(Point2i(), size));
+	const RID specular = buffers->has_separate_reflections() ? buffers->get_texture("forward_clustered", "specular") : RID();
+	const RID transparent = buffers->has_separate_transparency() ? buffers->get_texture("forward_clustered", "transparency") : RID();
+	const RID transmission = transparent.is_valid() ? buffers->get_texture("forward_clustered", "transmission") : RID();
+	if (specular.is_valid() || transparent.is_valid()) {
+		copy->copy_scene_layers(color, specular, transparent, transmission, view->source_levels[0], size);
+	} else {
+		copy->copy_to_rect(color, view->source_levels[0], Rect2i(Point2i(), size));
+	}
 	Size2i level_size = size;
 	for (uint32_t m = 1; m < view->source_levels.size(); m++) {
 		level_size = Size2i(MAX(1, level_size.x >> 1), MAX(1, level_size.y >> 1));
@@ -2498,12 +2571,14 @@ void PhysXGIView::free_data() {
 		}
 	}
 	source_levels.clear();
-	for (RID *r : { &trace, &accum[0], &accum[1], &accum_depth[0], &accum_depth[1], &moments[0], &moments[1], &variance, &filtered[0], &filtered[1], &filtered_variance[0], &filtered_variance[1], &reflect_filtered, &reflect_trace, &reflect_hit, &reflect_accum[0], &reflect_accum[1], &reflect_info[0], &reflect_info[1], &reflect_depth[0], &reflect_depth[1], &source }) {
+	for (RID *r : { &trace, &accum[0], &accum[1], &accum_depth[0], &accum_depth[1], &moments[0], &moments[1], &variance, &filtered[0], &filtered[1], &filtered_variance[0], &filtered_variance[1], &reflect_filtered, &reflect_trace, &reflect_hit, &reflect_motion, &primitive_motion, &reflect_accum[0], &reflect_accum[1], &reflect_info[0], &reflect_info[1], &reflect_depth[0], &reflect_depth[1], &source }) {
 		if (r->is_valid()) {
 			rd->free_rid(*r);
 			*r = RID();
 		}
 	}
+	previous_shapes.clear();
+	primitive_motion_capacity = 0;
 	targets_for = Size2i();
 	source_size = Size2i();
 	source_frame = UINT64_MAX;
@@ -2544,6 +2619,7 @@ void PhysXGIView::ensure(RenderingDevice *p_rd, const Size2i &p_frame, float p_r
 	}
 	reflect_hit = p_rd->texture_create(tf, RD::TextureView());
 	tf.format = RD::DATA_FORMAT_R16G16B16A16_SFLOAT;
+	reflect_motion = p_rd->texture_create(tf, RD::TextureView());
 	reflect_trace = p_rd->texture_create(tf, RD::TextureView());
 	reflect_filtered = p_rd->texture_create(tf, RD::TextureView());
 	for (int i = 0; i < 2; i++) {
@@ -2633,6 +2709,8 @@ void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_rende
 	const RID depth = buffers->get_depth_texture();
 	const RD::TextureFormat out_format = rd->texture_get_format(ambient);
 	const Size2i out_size(out_format.width, out_format.height);
+	const RID reflection_motion = buffers->create_texture("pxtgi", "reflection_motion", RD::DATA_FORMAT_R16G16B16A16_SFLOAT,
+			RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT, RD::TEXTURE_SAMPLES_1, out_size);
 	// This viewport's targets and history.
 	static const StringName view_scope = "pxtgi";
 	Ref<PhysXGIView> view = buffers->has_custom_data(view_scope) ? Ref<PhysXGIView>(buffers->get_custom_data(view_scope)) : Ref<PhysXGIView>();
@@ -2668,12 +2746,59 @@ void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_rende
 		v.prev_cam_transform = cam_transform;
 		v.prev_projection = projection;
 	}
+	// Track poses consumed by this viewport, not the last main-thread publication: Separate
+	// rendering may skip publications, and a BVH rebuild may reorder every primitive slot.
+	HashMap<uint64_t, Transform3D> current_shapes;
+	Vector<float> motion;
+	motion.resize(MAX(s.primitive_count, 1) * 16);
+	motion.fill(0.0f);
+	for (int i = 0; i < s.primitive_count; i++) {
+		const float *record = &s.primitives[i * PRIMITIVE_FLOATS];
+		Transform3D local;
+		for (int r = 0; r < 3; r++) {
+			local.basis.rows[r] = Vector3(record[r * 4], record[r * 4 + 1], record[r * 4 + 2]);
+			local.origin[r] = record[r * 4 + 3];
+		}
+		const Transform3D world = local.affine_inverse();
+		const uint64_t id = s.primitive_ids[i];
+		const Transform3D *previous = v.have_history ? v.previous_shapes.getptr(id) : nullptr;
+		// New shapes and teleports cannot supply trustworthy reflection history.
+		const bool valid = previous && previous->origin.distance_squared_to(world.origin) < 400.0f;
+		const Transform3D delta = valid ? *previous * local : Transform3D();
+		float *out = &motion.ptrw()[i * 16];
+		for (int r = 0; r < 3; r++) {
+			out[r * 4] = delta.basis.rows[r].x;
+			out[r * 4 + 1] = delta.basis.rows[r].y;
+			out[r * 4 + 2] = delta.basis.rows[r].z;
+			out[r * 4 + 3] = delta.origin[r];
+		}
+		out[12] = valid ? 1.0f : 0.0f;
+		current_shapes.insert(id, world);
+	}
+	v.previous_shapes = current_shapes;
+	const uint32_t motion_bytes = motion.size() * sizeof(float);
+	if (v.primitive_motion_capacity < motion_bytes) {
+		if (v.primitive_motion.is_valid()) {
+			rd->free_rid(v.primitive_motion);
+		}
+		v.primitive_motion_capacity = Math::next_power_of_2(motion_bytes);
+		v.primitive_motion = rd->storage_buffer_create(v.primitive_motion_capacity);
+	}
+	rd->buffer_update(v.primitive_motion, 0, motion_bytes, motion.ptr());
 	FrameData data = {};
 	RendererRD::MaterialStorage::store_transform(cam_transform, data.view_to_world);
 	RendererRD::MaterialStorage::store_transform(cam_transform.affine_inverse(), data.world_to_view);
 	RendererRD::MaterialStorage::store_transform(v.prev_cam_transform.affine_inverse(), data.world_to_prev_view);
 	projection_info(projection, size, data.proj_info);
 	projection_info(v.prev_projection, size, data.prev_proj_info);
+	float plain[4], previous_plain[4];
+	projection_info(scene_rd->cam_projection, size, plain);
+	projection_info(v.have_history ? v.prev_camera_projection : scene_rd->cam_projection, size, previous_plain);
+	for (int axis = 0; axis < 2; axis++) {
+		const float extent = axis == 0 ? size.x : size.y;
+		data.jitter[axis] = (-data.proj_info[axis + 2] / data.proj_info[axis] + plain[axis + 2] / plain[axis]) / extent;
+		data.jitter[axis + 2] = (-data.prev_proj_info[axis + 2] / data.prev_proj_info[axis] + previous_plain[axis + 2] / previous_plain[axis]) / extent;
+	}
 	data.clip[0] = projection.get_z_near();
 	data.clip[1] = projection.get_z_far();
 	data.clip[2] = v.prev_projection.get_z_near();
@@ -2955,9 +3080,9 @@ void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_rende
 
 	{
 		int32_t size[4] = { v.reflect_size.x, v.reflect_size.y, 0, 0 };
-		_dispatch(rd, PASS_REFLECT, { sampled(0, nearest_sampler, depth), sampled(1, nearest_sampler, normal), sampled(2, mip_sampler, color), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 3, v.reflect_trace), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 4, primitive_buffer), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 5, node_buffer), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 6, cache_keys), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 7, cache_cells), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 10, geometry_buffer), sampled(11, linear_sampler, sky_map), sampled(12, linear_sampler, probe_atlas), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 13, v.reflect_hit), sampled(14, nearest_sampler, blue_noise) }, v.reflect_size, size, sizeof(size));
+		_dispatch(rd, PASS_REFLECT, { sampled(0, nearest_sampler, depth), sampled(1, nearest_sampler, normal), sampled(2, mip_sampler, color), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 3, v.reflect_trace), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 4, primitive_buffer), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 5, node_buffer), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 6, cache_keys), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 7, cache_cells), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 10, geometry_buffer), sampled(11, linear_sampler, sky_map), sampled(12, linear_sampler, probe_atlas), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 13, v.reflect_hit), sampled(14, nearest_sampler, blue_noise), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 17, v.primitive_motion), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 18, v.reflect_motion) }, v.reflect_size, size, sizeof(size));
 		size[2] = v.have_history ? 1 : 0;
-		_dispatch(rd, PASS_REFLECT_TEMPORAL, { sampled(0, nearest_sampler, v.reflect_trace), sampled(1, linear_sampler, v.reflect_accum[prev]), sampled(2, nearest_sampler, v.reflect_depth[prev]), sampled(3, nearest_sampler, depth), sampled(4, nearest_sampler, normal), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 5, v.reflect_accum[v.current]), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 6, v.reflect_depth[v.current]), sampled(7, nearest_sampler, v.reflect_hit), sampled(8, linear_sampler, v.reflect_info[prev]), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 10, v.reflect_info[v.current]) }, v.reflect_size, size, sizeof(size));
+		_dispatch(rd, PASS_REFLECT_TEMPORAL, { sampled(0, nearest_sampler, v.reflect_trace), sampled(1, linear_sampler, v.reflect_accum[prev]), sampled(2, nearest_sampler, v.reflect_depth[prev]), sampled(3, nearest_sampler, depth), sampled(4, nearest_sampler, normal), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 5, v.reflect_accum[v.current]), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 6, v.reflect_depth[v.current]), sampled(7, nearest_sampler, v.reflect_hit), sampled(8, linear_sampler, v.reflect_info[prev]), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 10, v.reflect_info[v.current]), sampled(11, nearest_sampler, v.reflect_motion) }, v.reflect_size, size, sizeof(size));
 	}
 
 	RID reflect_result = v.reflect_accum[v.current];
@@ -2972,7 +3097,8 @@ void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_rende
 	}
 
 	int32_t out[4] = { out_size.x, out_size.y, v.reflect_size.x, v.reflect_size.y };
-	_dispatch(rd, PASS_RESOLVE, { sampled(0, nearest_sampler, light_in), sampled(1, nearest_sampler, v.accum_depth[v.current]), sampled(2, nearest_sampler, depth), sampled(3, nearest_sampler, normal), sampled(6, linear_sampler, color), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 4, ambient), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 5, reflection), sampled(7, nearest_sampler, reflect_result), sampled(8, nearest_sampler, v.reflect_depth[v.current]), sampled(12, mip_sampler, probe_atlas) }, out_size, out, sizeof(out));
+	_dispatch(rd, PASS_RESOLVE, { sampled(0, nearest_sampler, light_in), sampled(1, nearest_sampler, v.accum_depth[v.current]), sampled(2, nearest_sampler, depth), sampled(3, nearest_sampler, normal), sampled(6, linear_sampler, color), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 4, ambient), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 5, reflection), sampled(7, nearest_sampler, reflect_result), sampled(8, nearest_sampler, v.reflect_depth[v.current]), sampled(12, mip_sampler, probe_atlas), sampled(13, nearest_sampler, v.reflect_motion), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 14, reflection_motion) }, out_size, out, sizeof(out));
+	buffers->set_reflection_motion_frame(RSG::rasterizer->get_frame_number());
 
 	rd->capture_timestamp("PXTGI end");
 	v.have_history = true;

@@ -1621,6 +1621,10 @@ void PXTGI3D::_update_primitives(PhysXGIEffect::Snapshot &r_snapshot) {
 			memcpy(published_primitives.ptrw(), ordered_floats.ptr(), ordered_floats.size() * sizeof(float));
 		}
 		if (rebuilt) {
+			published_ids.resize(leaf_order.size());
+			for (uint32_t k = 0; k < leaf_order.size(); k++) {
+				published_ids.ptrw()[k] = uint64_t(shapes[leaf_order[k]].shape_node);
+			}
 			published_nodes.resize(tree_nodes.size());
 			if (tree_nodes.size()) {
 				memcpy(published_nodes.ptrw(), tree_nodes.ptr(), tree_nodes.size() * sizeof(float));
@@ -1658,6 +1662,7 @@ void PXTGI3D::_update_primitives(PhysXGIEffect::Snapshot &r_snapshot) {
 		r_snapshot.blocks_version = published_blocks_version;
 	}
 	r_snapshot.primitives = published_primitives;
+	r_snapshot.primitive_ids = published_ids;
 	r_snapshot.primitive_count = published_count;
 	r_snapshot.nodes = published_nodes;
 	r_snapshot.node_count = published_nodes.size() / PhysXGIEffect::NODE_FLOATS;

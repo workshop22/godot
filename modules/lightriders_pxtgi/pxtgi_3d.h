@@ -177,6 +177,7 @@ class PXTGI3D : public Node3D {
 	bool moving_dirty = true;
 	bool radiance_dirty = false; // only glow changed: the records in place, not the tree
 	Vector<float> published_primitives;
+	Vector<uint64_t> published_ids;
 	Vector<float> published_nodes;
 	int published_count = 0;
 	// Hardware tracing: each leaf's mesh (its Shape3D's id; 0 for a box), and every mesh's triangles by that id.

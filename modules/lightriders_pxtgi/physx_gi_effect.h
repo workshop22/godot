@@ -61,6 +61,10 @@ public:
 	RID reflect_filtered; // softened output; temporal history remains sharp
 	RID reflect_trace; // reflection size: this frame's reflection rays (light, found)
 	RID reflect_hit; // reflection size: how far each ray went to what it found (negative: a moving object; 0: none)
+	RID reflect_motion; // previous minus current UV of the reflected point, virtual depth, valid
+	RID primitive_motion; // current world point -> its previous rendered world point, by primitive slot
+	uint32_t primitive_motion_capacity = 0;
+	HashMap<uint64_t, Transform3D> previous_shapes;
 	RID reflect_accum[2]; // reflection size: accumulated, ping-ponged
 	RID reflect_info[2]; // reflection size: frames of history, hit distance, motion in the reflection
 	RID reflect_depth[2];
@@ -125,6 +129,7 @@ public:
 
 	struct Snapshot {
 		Vector<float> primitives;
+		Vector<uint64_t> primitive_ids; // stable shape-node identity, independent of BVH leaf order
 		int primitive_count = 0;
 		uint64_t primitives_version = 0; // primitives and nodes: uploaded only when this changes
 		int trace_mode = 0; // PXTGI3D.trace_mode: 0 software, 1 world misses, 2 hardware, 3 hardware where safe
