@@ -2482,6 +2482,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 
 	rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_ALPHA, p_render_data, radiance_texture, samplers, transparent_pass_uniform_buffer_index, true);
 
+	bool opaque_color_resolved_for_source = false;
 	{
 		uint32_t transparent_color_pass_flags = (color_pass_flags | uint32_t(COLOR_PASS_FLAG_TRANSPARENT)) & ~uint32_t(COLOR_PASS_FLAG_SEPARATE_SPECULAR);
 		// Alpha layers have their own color/transmission, never the opaque receiver's motion.
@@ -2494,6 +2495,8 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		RenderListParameters render_list_params(render_list[RENDER_LIST_ALPHA].elements.ptr(), render_list[RENDER_LIST_ALPHA].element_info.ptr(), render_list[RENDER_LIST_ALPHA].elements.size(), reverse_cull, PASS_MODE_COLOR, transparent_color_pass_flags, rb_data.is_null(), p_render_data->directional_light_soft_shadows, rp_uniform_set, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_WIREFRAME, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count, 0, base_specialization);
 		uint64_t source_policy = rb->get_reflection_source_request();
 		bool filtered_source = false;
+		bool source_depth_unchanged = get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_DISABLED;
+		RID alpha_framebuffer;
 		if (source_policy != 0 && !separate_transparency) {
 			ERR_PRINT_ONCE("A reflection source producer must request separate transparency.");
 			source_policy = 0;
@@ -2501,8 +2504,17 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		if (source_policy != 0) {
 			for (uint32_t i = 0; i < render_list[RENDER_LIST_ALPHA].elements.size(); i++) {
 				const GeometryInstanceSurfaceDataCache *surface = render_list[RENDER_LIST_ALPHA].elements[i];
-				if (surface->reflection_source_excluded && surface->owner->instance_count != 0) {
+				if (surface->owner->instance_count == 0) {
+					continue;
+				}
+				if (surface->reflection_source_excluded) {
 					filtered_source = true;
+				} else if (surface->shader->depth_draw == SceneShaderForwardClustered::ShaderData::DEPTH_DRAW_ALWAYS || surface->shader->stencil_enabled) {
+					// Opaque-only and disabled depth modes do not write in the alpha
+					// pipeline. Keep the reset for depth writers and all stencil users.
+					source_depth_unchanged = false;
+				}
+				if (filtered_source && !source_depth_unchanged) {
 					break;
 				}
 			}
@@ -2515,6 +2527,9 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			render_list_params.exclude_reflection_sources = true;
 			RID source_framebuffer = rb_data->get_color_pass_fb(transparent_color_pass_flags);
 			_render_list_with_draw_list(&render_list_params, source_framebuffer, RD::DRAW_CLEAR_COLOR_0 | RD::DRAW_CLEAR_COLOR_1, Vector<Color>({ Color(0, 0, 0, 0), Color(1, 1, 1, 1) }), 0.0f, 0u, p_render_data->render_region);
+			if (source_depth_unchanged) {
+				alpha_framebuffer = source_framebuffer;
+			}
 			RENDER_TIMESTAMP("Reflection Source Resolve");
 			render_list_params.exclude_reflection_sources = false;
 			if (use_msaa) {
@@ -2526,6 +2541,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 					RD::get_singleton()->texture_resolve_multisample(rb->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSPARENCY_MSAA, v, 0), rb->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSPARENCY, v, 0));
 					RD::get_singleton()->texture_resolve_multisample(rb->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSMISSION_MSAA, v, 0), rb->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSMISSION, v, 0));
 				}
+				opaque_color_resolved_for_source = !ce_pre_transparent_resolved_color;
 			}
 			static const StringName source_name = "reflection_source";
 			const Size2i source_size = rb->get_internal_size();
@@ -2548,10 +2564,12 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 				}
 			}
 		}
-		// This call copies opaque depth again, removing every depth write from the
-		// filtered pass. Visible color/transmission and the full GI source are normal.
+		// Reset private depth if the filtered pass could have changed it. Otherwise
+		// reuse the same framebuffer, still clearing E/T and replaying the full list.
 		RENDER_TIMESTAMP("Render 3D Alpha Replay");
-		RID alpha_framebuffer = rb_data.is_valid() ? rb_data->get_color_pass_fb(transparent_color_pass_flags) : color_only_framebuffer;
+		if (alpha_framebuffer.is_null()) {
+			alpha_framebuffer = rb_data.is_valid() ? rb_data->get_color_pass_fb(transparent_color_pass_flags) : color_only_framebuffer;
+		}
 		_render_list_with_draw_list(&render_list_params, alpha_framebuffer, separate_transparency ? RD::DRAW_CLEAR_COLOR_0 | RD::DRAW_CLEAR_COLOR_1 : RD::DRAW_DEFAULT_ALL, separate_transparency ? Vector<Color>({Color(0, 0, 0, 0), Color(1, 1, 1, 1)}) : Vector<Color>(), 0.0f, 0u, p_render_data->render_region);
 		rb->set_reflection_source_complete(RSG::rasterizer->get_frame_number(), source_policy, filtered_source);
 	}
@@ -2565,7 +2583,11 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	if (rb_data.is_valid() && use_msaa) {
 		bool resolve_velocity_buffer = (using_taa || using_upscaling || ce_needs_motion_vectors) && rb->has_velocity_buffer(true);
 		for (uint32_t v = 0; v < rb->get_view_count(); v++) {
-			RD::get_singleton()->texture_resolve_multisample(rb->get_color_msaa(v), rb->get_internal_texture(v));
+			// Separate alpha only writes E/T and private depth. A color resolve made
+			// for this frame's filtered source is still current after that replay.
+			if (!opaque_color_resolved_for_source) {
+				RD::get_singleton()->texture_resolve_multisample(rb->get_color_msaa(v), rb->get_internal_texture(v));
+			}
 			resolve_effects->resolve_depth(rb->get_depth_msaa(v), rb->get_depth_texture(v), rb->get_internal_size(), texture_multisamples[msaa]);
 			if (separate_transparency) {
 				RD::get_singleton()->texture_resolve_multisample(rb->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSPARENCY_MSAA, v, 0), rb->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSPARENCY, v, 0));
