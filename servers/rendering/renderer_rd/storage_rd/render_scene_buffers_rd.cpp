@@ -131,6 +131,10 @@ void RenderSceneBuffersRD::cleanup() {
 	reflection_motion_frame = UINT64_MAX;
 	separate_reflections_active = false;
 	separate_transparency_active = false;
+	reflection_source_request = 0;
+	reflection_source_frame = UINT64_MAX;
+	reflection_source_policy = 0;
+	filtered_reflection_source = false;
 	// Free our data buffers (but don't destroy them)
 	for (KeyValue<StringName, Ref<RenderBufferCustomDataRD>> &E : data_buffers) {
 		E.value->free_data();

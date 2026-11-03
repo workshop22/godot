@@ -1387,6 +1387,16 @@ void LightStorage::reflection_probe_set_reflection_mask(RID p_probe, uint32_t p_
 	reflection_probe->dependency.changed_notify(Dependency::DEPENDENCY_CHANGED_REFLECTION_PROBE);
 }
 
+void LightStorage::reflection_probe_set_reflection_source_policy(RID p_probe, uint64_t p_policy) {
+	ReflectionProbe *probe = reflection_probe_owner.get_or_null(p_probe);
+	ERR_FAIL_NULL(probe);
+	if (probe->reflection_source_policy == p_policy) {
+		return;
+	}
+	probe->reflection_source_policy = p_policy;
+	probe->dependency.changed_notify(Dependency::DEPENDENCY_CHANGED_REFLECTION_PROBE);
+}
+
 void LightStorage::reflection_probe_set_resolution(RID p_probe, int p_resolution) {
 	WARN_PRINT_ONCE("reflection_probe_set_resolution is not available in Godot 4. ReflectionProbe size is configured in the project settings with the rendering/reflections/reflection_atlas/reflection_size setting.");
 }
@@ -1653,7 +1663,7 @@ bool LightStorage::reflection_probe_has_atlas_index(RID p_instance) {
 		return false;
 	}
 
-	return rpi->atlas_index >= 0;
+	return (rpi->rendering ? rpi->capture_atlas_index : rpi->atlas_index) >= 0;
 }
 
 void LightStorage::reflection_probe_release_atlas_index(RID p_instance) {
@@ -1661,15 +1671,16 @@ void LightStorage::reflection_probe_release_atlas_index(RID p_instance) {
 	ERR_FAIL_NULL(rpi);
 	rpi->capture_valid = false;
 
-	if (rpi->atlas.is_null()) {
-		return; //nothing to release
-	}
 	ReflectionAtlas *atlas = reflection_atlas_owner.get_or_null(rpi->atlas);
-	ERR_FAIL_NULL(atlas);
-	ERR_FAIL_INDEX(rpi->atlas_index, atlas->reflections.size());
-	atlas->reflections.write[rpi->atlas_index].owner = RID();
-
-	// TODO investigate if this is enough? shouldn't we be freeing our textures and framebuffers?
+	if (atlas) {
+		// A source probe may own both its completed layer and a pending capture.
+		// Ownership checks also make atlas reset/eviction safe for either slot.
+		for (int index : { rpi->atlas_index, rpi->capture_atlas_index }) {
+			if (index >= 0 && index < atlas->reflections.size() && atlas->reflections[index].owner == p_instance) {
+				atlas->reflections.write[index].owner = RID();
+			}
+		}
+	}
 
 	if (rpi->rendering) {
 		// We were cancelled mid rendering, trigger refresh.
@@ -1679,6 +1690,7 @@ void LightStorage::reflection_probe_release_atlas_index(RID p_instance) {
 	}
 
 	rpi->atlas_index = -1;
+	rpi->capture_atlas_index = -1;
 	rpi->atlas = RID();
 }
 
@@ -1705,7 +1717,15 @@ bool LightStorage::reflection_probe_instance_has_reflection(RID p_instance) {
 	ReflectionProbeInstance *rpi = reflection_probe_instance_owner.get_or_null(p_instance);
 	ERR_FAIL_NULL_V(rpi, false);
 
-	return rpi->atlas.is_valid();
+	if (rpi->atlas.is_null() || rpi->atlas_index < 0) {
+		return false;
+	}
+	const ReflectionProbe *probe = reflection_probe_owner.get_or_null(rpi->probe);
+	ERR_FAIL_NULL_V(probe, false);
+	// Ordinary probes keep their existing raster behavior. Source captures must
+	// never expose an old membership policy, including when returning to zero.
+	return (probe->reflection_source_policy == 0 && rpi->captured_source_policy == 0) ||
+			(rpi->capture_valid && rpi->captured_source_policy == probe->reflection_source_policy);
 }
 
 bool LightStorage::reflection_probe_instance_begin_render(RID p_instance, RID p_reflection_atlas) {
@@ -1718,6 +1738,20 @@ bool LightStorage::reflection_probe_instance_begin_render(RID p_instance, RID p_
 
 	ReflectionProbeInstance *rpi = reflection_probe_instance_owner.get_or_null(p_instance);
 	ERR_FAIL_NULL_V(rpi, false);
+	if (rpi->atlas.is_valid() && rpi->atlas != p_reflection_atlas) {
+		reflection_probe_release_atlas_index(p_instance);
+	}
+	if (rpi->rendering) {
+		// Changing UPDATE_ONCE to UPDATE_ALWAYS can restart at step zero while
+		// filtering is pending. Release that pending layer, never its completion.
+		const int pending = rpi->capture_atlas_index;
+		if (pending >= 0 && pending != rpi->atlas_index && pending < atlas->reflections.size() && atlas->reflections[pending].owner == p_instance) {
+			atlas->reflections.write[pending].owner = RID();
+		}
+		rpi->capture_atlas_index = -1;
+		rpi->rendering = false;
+		rpi->processing_layer = 1;
+	}
 
 	if (atlas->render_buffers.is_null()) {
 		atlas->render_buffers.instantiate();
@@ -1802,34 +1836,34 @@ bool LightStorage::reflection_probe_instance_begin_render(RID p_instance, RID p_
 		atlas->update_always = update_always;
 	}
 
-	if (rpi->atlas_index == -1) {
+	const uint64_t source_policy = reflection_probe_owner.get_or_null(rpi->probe)->reflection_source_policy;
+	// Filter into another already allocated atlas layer. Replacing the completed
+	// layer in place would remove a moving source for every roughness-filter frame.
+	int capture_index = source_policy != 0 ? -1 : rpi->atlas_index;
+	if (capture_index == -1) {
 		for (int i = 0; i < atlas->reflections.size(); i++) {
 			if (atlas->reflections[i].owner.is_null()) {
-				rpi->atlas_index = i;
+				capture_index = i;
 				break;
 			}
 		}
-		//find the one used last
-		if (rpi->atlas_index == -1) {
-			//everything is in use, find the one least used via LRU
-			uint64_t pass_min = 0;
-
-			for (int i = 0; i < atlas->reflections.size(); i++) {
-				ReflectionProbeInstance *rpi2 = reflection_probe_instance_owner.get_or_null(atlas->reflections[i].owner);
-				if (rpi2->last_pass < pass_min) {
-					pass_min = rpi2->last_pass;
-					rpi->atlas_index = i;
-				}
-			}
-		}
 	}
-
-	if (rpi->atlas_index != -1) { // should we fail if this is still -1 ?
-		atlas->reflections.write[rpi->atlas_index].owner = p_instance;
+	if (capture_index < 0) {
+		// Do not evict the completed image or steal a slot owned by another
+		// in-flight capture. The existing dirty scheduling retries when one frees.
+		rpi->dirty = true;
+		RD::get_singleton()->draw_command_end_label();
+		return false;
+	}
+	atlas->reflections.write[capture_index].owner = p_instance;
+	rpi->capture_atlas_index = capture_index;
+	if (source_policy == 0) {
+		rpi->atlas_index = capture_index;
 	}
 
 	rpi->atlas = p_reflection_atlas;
 	rpi->capture_transform = rpi->transform;
+	rpi->capture_source_policy = source_policy;
 	rpi->rendering = true;
 	rpi->dirty = false;
 	rpi->processing_layer = 1;
@@ -1848,11 +1882,16 @@ bool LightStorage::reflection_probe_instance_end_render(RID p_instance, RID p_re
 
 	ReflectionProbeInstance *rpi = reflection_probe_instance_owner.get_or_null(p_instance);
 	ERR_FAIL_NULL_V(rpi, false);
+	ERR_FAIL_INDEX_V(rpi->capture_atlas_index, atlas->reflections.size(), false);
+	ERR_FAIL_COND_V(atlas->reflections[rpi->capture_atlas_index].owner != p_instance, false);
 
 	RD::get_singleton()->draw_command_begin_label("Convert reflection probe to octahedral");
-	copy_effects->copy_cubemap_to_octmap(atlas->color_buffer, atlas->reflections.write[rpi->atlas_index].data.layers[0].mipmaps[0].framebuffer, atlas->uv_border_size);
-	rpi->captured_transform = rpi->capture_transform;
-	rpi->capture_valid = true;
+	// In-place ordinary captures invalidate their previous completion. A source
+	// capture has a separate layer, so its completed image remains coherent.
+	if (rpi->capture_atlas_index == rpi->atlas_index) {
+		rpi->capture_valid = false;
+	}
+	copy_effects->copy_cubemap_to_octmap(atlas->color_buffer, atlas->reflections.write[rpi->capture_atlas_index].data.layers[0].mipmaps[0].framebuffer, atlas->uv_border_size);
 	RD::get_singleton()->draw_command_end_label();
 
 	return true;
@@ -1871,26 +1910,43 @@ bool LightStorage::reflection_probe_instance_postprocess_step(RID p_instance) {
 	ERR_FAIL_COND_V(!rpi->rendering, false);
 
 	ReflectionAtlas *atlas = reflection_atlas_owner.get_or_null(rpi->atlas);
-	if (!atlas || rpi->atlas_index == -1) {
+	if (!atlas || rpi->capture_atlas_index < 0 || rpi->capture_atlas_index >= atlas->reflections.size() || atlas->reflections[rpi->capture_atlas_index].owner != p_instance) {
 		// Does not belong to an atlas anymore, cancel (was removed from atlas or atlas changed while rendering).
 		rpi->rendering = false;
-		return false;
+		rpi->capture_atlas_index = -1;
+		rpi->dirty = true;
+		return true;
+	}
+	auto complete = [&]() {
+		const int previous = rpi->atlas_index;
+		rpi->atlas_index = rpi->capture_atlas_index;
+		rpi->capture_atlas_index = -1;
+		rpi->captured_transform = rpi->capture_transform;
+		rpi->captured_source_policy = rpi->capture_source_policy;
+		rpi->capture_valid = true;
+		rpi->rendering = false;
+		rpi->processing_layer = 1;
+		if (previous >= 0 && previous < atlas->reflections.size() && previous != rpi->atlas_index && atlas->reflections[previous].owner == p_instance) {
+			atlas->reflections.write[previous].owner = RID();
+		}
+	};
+	if (rpi->processing_layer >= (int)atlas->reflections[rpi->capture_atlas_index].data.layers[0].mipmaps.size()) {
+		complete(); // A one-level atlas has no roughness work to schedule.
+		return true;
 	}
 
 	if (LightStorage::get_singleton()->reflection_probe_get_update_mode(rpi->probe) == RSE::REFLECTION_PROBE_UPDATE_ALWAYS) {
 		// Using real time reflections, all roughness is done in one step
-		atlas->reflections.write[rpi->atlas_index].data.create_reflection_fast_filter(false);
-		rpi->rendering = false;
-		rpi->processing_layer = 1;
+		atlas->reflections.write[rpi->capture_atlas_index].data.create_reflection_fast_filter(false);
+		complete();
 		return true;
 	}
 
-	atlas->reflections.write[rpi->atlas_index].data.create_reflection_importance_sample(false, rpi->processing_layer, RendererSceneRenderRD::get_singleton()->get_sky()->sky_ggx_samples_quality);
+	atlas->reflections.write[rpi->capture_atlas_index].data.create_reflection_importance_sample(false, rpi->processing_layer, RendererSceneRenderRD::get_singleton()->get_sky()->sky_ggx_samples_quality);
 
 	rpi->processing_layer++;
-	if (rpi->processing_layer == (int)atlas->reflections[rpi->atlas_index].data.layers[0].mipmaps.size()) {
-		rpi->rendering = false;
-		rpi->processing_layer = 1;
+	if (rpi->processing_layer == (int)atlas->reflections[rpi->capture_atlas_index].data.layers[0].mipmaps.size()) {
+		complete();
 		return true;
 	}
 
@@ -1913,7 +1969,7 @@ RID LightStorage::reflection_probe_instance_get_framebuffer(RID p_instance, int 
 
 	ReflectionAtlas *atlas = reflection_atlas_owner.get_or_null(rpi->atlas);
 	ERR_FAIL_NULL_V(atlas, RID());
-	ERR_FAIL_COND_V_MSG(rpi->atlas_index < 0, RID(), "Reflection probe atlas index invalid. Maximum amount of reflection probes in use (" + itos(atlas->count) + ") may have been exceeded, reflections will not display properly. Consider increasing Rendering > Reflections > Reflection Atlas > Reflection Count in the Project Settings.");
+	ERR_FAIL_COND_V_MSG(rpi->capture_atlas_index < 0, RID(), "Reflection probe capture has no atlas layer.");
 
 	return atlas->color_fbs[p_index];
 }
@@ -2047,7 +2103,7 @@ void LightStorage::update_reflection_probe_buffer(RenderDataRD *p_render_data, c
 		reflection_ubo.ambient[1] = ambient_linear.g * interior_ambient_energy;
 		reflection_ubo.ambient[2] = ambient_linear.b * interior_ambient_energy;
 
-		Transform3D transform = rpi->transform;
+		Transform3D transform = probe->reflection_source_policy != 0 && rpi->capture_valid ? rpi->captured_transform : rpi->transform;
 		Transform3D proj = (p_camera_inverse_transform * transform).inverse();
 		MaterialStorage::store_transform(proj, reflection_ubo.local_matrix);
 

@@ -245,6 +245,7 @@ private:
 		bool enable_shadows = false;
 		uint32_t cull_mask = (1 << 20) - 1;
 		uint32_t reflection_mask = (1 << 20) - 1;
+		uint64_t reflection_source_policy = 0; // Zero retains ordinary capture content.
 		float mesh_lod_threshold = 0.01;
 		float baked_exposure = 1.0;
 
@@ -289,6 +290,7 @@ private:
 	struct ReflectionProbeInstance {
 		RID probe;
 		int atlas_index = -1;
+		int capture_atlas_index = -1; // Pending source capture; completed atlas_index stays readable.
 		RID atlas;
 
 		bool dirty = true;
@@ -303,6 +305,8 @@ private:
 		Transform3D transform;
 		Transform3D capture_transform;
 		Transform3D captured_transform;
+		uint64_t capture_source_policy = 0;
+		uint64_t captured_source_policy = 0;
 		bool capture_valid = false;
 	};
 
@@ -879,6 +883,7 @@ public:
 	virtual void reflection_probe_set_enable_shadows(RID p_probe, bool p_enable) override;
 	virtual void reflection_probe_set_cull_mask(RID p_probe, uint32_t p_layers) override;
 	virtual void reflection_probe_set_reflection_mask(RID p_probe, uint32_t p_layers) override;
+	virtual void reflection_probe_set_reflection_source_policy(RID p_probe, uint64_t p_policy) override;
 	virtual void reflection_probe_set_resolution(RID p_probe, int p_resolution) override;
 	virtual void reflection_probe_set_mesh_lod_threshold(RID p_probe, float p_ratio) override;
 
@@ -998,11 +1003,24 @@ public:
 	_FORCE_INLINE_ bool reflection_probe_instance_get_captured_transform(RID p_instance, Transform3D &r_transform) {
 		ReflectionProbeInstance *rpi = reflection_probe_instance_owner.get_or_null(p_instance);
 		ERR_FAIL_NULL_V(rpi, false);
-		if (!rpi->capture_valid || rpi->atlas_index < 0) {
+		const ReflectionProbe *probe = reflection_probe_owner.get_or_null(rpi->probe);
+		if (!rpi->capture_valid || rpi->atlas_index < 0 || !probe || rpi->captured_source_policy != probe->reflection_source_policy) {
 			return false;
 		}
 		r_transform = rpi->captured_transform;
 		return true;
+	}
+
+	_FORCE_INLINE_ uint64_t reflection_probe_instance_get_capture_source_policy(RID p_instance) const {
+		const ReflectionProbeInstance *rpi = reflection_probe_instance_owner.get_or_null(p_instance);
+		ERR_FAIL_NULL_V(rpi, 0);
+		return rpi->capture_source_policy;
+	}
+
+	_FORCE_INLINE_ uint64_t reflection_probe_instance_get_captured_source_policy(RID p_instance) const {
+		const ReflectionProbeInstance *rpi = reflection_probe_instance_owner.get_or_null(p_instance);
+		ERR_FAIL_NULL_V(rpi, 0);
+		return rpi->captured_source_policy;
 	}
 
 	_FORCE_INLINE_ int reflection_probe_instance_get_atlas_index(RID p_instance) {

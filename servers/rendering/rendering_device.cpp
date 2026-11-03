@@ -528,10 +528,13 @@ Error RenderingDevice::tlas_build(RID p_tlas, Span<AccelerationStructureInstance
 
 	AccelerationStructure::InstanceBuffer &instance_buffer = tlas->instance_buffers[instance_buffer_index];
 
-	_tlas_remove_blas_dependencies(tlas, p_tlas);
-
 	thread_local LocalVector<RDG::ResourceTracker *> draw_trackers;
 	draw_trackers.clear();
+	thread_local HashSet<RID> dependencies;
+	dependencies.clear();
+	dependencies.reserve(p_instances.size());
+	thread_local LocalVector<Pair<RID, AccelerationStructure *>> added_dependencies;
+	added_dependencies.clear();
 
 	for (uint32_t i = 0; i < p_instances.size(); i++) {
 		const AccelerationStructureInstance &rd_instance = p_instances[i];
@@ -552,17 +555,41 @@ Error RenderingDevice::tlas_build(RID p_tlas, Span<AccelerationStructureInstance
 			ERR_FAIL_COND_V_MSG(blas->invalidated, ERR_INVALID_PARAMETER, "BLAS either has not been built yet, or has been invalidated by an operation and needs to be rebuilt.");
 			rdd_instance.blas = blas->driver_id;
 
-			if (!tlas->acceleration_structure_dependencies.has(rd_instance.blas)) {
-				tlas->acceleration_structure_dependencies.insert(rd_instance.blas);
-				blas->acceleration_structure_dependencies.insert(p_tlas);
-
+			const uint32_t previous_dependency_count = dependencies.size();
+			dependencies.insert(rd_instance.blas);
+			if (dependencies.size() != previous_dependency_count) {
 				if (blas->draw_tracker != nullptr) {
 					draw_trackers.push_back(blas->draw_tracker);
+				}
+				if (!tlas->acceleration_structure_dependencies.has(rd_instance.blas)) {
+					added_dependencies.push_back(Pair<RID, AccelerationStructure *>(rd_instance.blas, blas));
 				}
 			}
 		}
 
 		driver->acceleration_structure_instance_write(instance_buffer.data_ptr + instance_buffer_offset + (instance_size * i), rdd_instance);
+	}
+
+	// Validate the full input before changing weak links: a failed rebuild must
+	// retain the dependencies of the last successful build. Unchanged links stay
+	// resident, including the reverse sets on potentially thousands of BLASes.
+	thread_local LocalVector<Pair<RID, AccelerationStructure *>> retired_dependencies;
+	retired_dependencies.clear();
+	for (RID id : tlas->acceleration_structure_dependencies) {
+		if (!dependencies.has(id)) {
+			AccelerationStructure *blas = acceleration_structure_owner.get_or_null(id);
+			ERR_FAIL_NULL_V(blas, ERR_INVALID_PARAMETER);
+			ERR_FAIL_COND_V(blas->type != ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL, ERR_INVALID_PARAMETER);
+			retired_dependencies.push_back(Pair<RID, AccelerationStructure *>(id, blas));
+		}
+	}
+	for (const Pair<RID, AccelerationStructure *> &dependency : retired_dependencies) {
+		dependency.second->acceleration_structure_dependencies.erase(p_tlas);
+		tlas->acceleration_structure_dependencies.erase(dependency.first);
+	}
+	for (const Pair<RID, AccelerationStructure *> &dependency : added_dependencies) {
+		tlas->acceleration_structure_dependencies.insert(dependency.first);
+		dependency.second->acceleration_structure_dependencies.insert(p_tlas);
 	}
 
 	draw_graph.add_tlas_build(tlas->driver_id, tlas->scratch_buffer, instance_buffer.driver_id, instance_buffer_offset, p_instances.size(), tlas->draw_tracker, draw_trackers);

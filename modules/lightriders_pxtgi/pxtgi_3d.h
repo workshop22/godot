@@ -36,8 +36,10 @@
 #include "core/templates/hash_set.h"
 #include "core/templates/local_vector.h"
 #include "scene/3d/node_3d.h"
+#include "scene/resources/3d/concave_polygon_shape_3d.h"
 #include "scene/resources/3d/shape_3d.h"
 #include "scene/resources/environment.h"
+#include "scene/resources/texture.h"
 
 // PXTGI (experimental): the module's own per-pixel global illumination, traced on screen and then against the physics
 // shapes, delivered through Forward+'s stock GI path. With SDFGI enabled, every surface shader reads Godot's per-pixel
@@ -73,6 +75,12 @@ class PXTGI3D : public Node3D {
 	// The live collision shapes, each with its body's albedo and emission;
 	// and emissive meshes outside any body, which stand in as their bounding box (mesh_proxy).
 	struct ShapeEntry {
+		// External reflection surfaces share the scene tree, but own a collision-free
+		// history identity and immutable geometry without creating physics nodes.
+		Ref<RefCounted> item_identity;
+		Ref<ConcavePolygonShape3D> item_geometry;
+		Transform3D item_pose;
+		int item_material = -1;
 		ObjectID shape_node;
 		ObjectID body_node;
 		CollisionShape3D *collision_node = nullptr; // valid only while this ID is tracked in the tree
@@ -101,6 +109,7 @@ class PXTGI3D : public Node3D {
 		uint64_t geometry_key = 0;
 		int geometry_a = 0;
 		int geometry_b = 0;
+		int geometry_attributes = 0;
 		AABB local_bounds;
 		// Where the shape sits on its body and what it is (type, extents), read from its node when last checked: the
 		// shapes of a body PhysX moved are placed from the body's own pose, without the scene tree.
@@ -118,7 +127,8 @@ class PXTGI3D : public Node3D {
 		int words = 0;
 		Vector<float> planes; // hull: normal, offset
 		Vector<float> nodes; // mesh: its tree (8 floats a node; indices relative to the mesh)
-		Vector<float> triangles; // mesh: 12 floats a triangle (three corners, padded)
+		Vector<float> triangles; // mesh: three vec4 corners; lattice vertex brightness in w, otherwise padding
+		Vector<float> attributes; // item: two vec4s per triangle, in the same SAH order
 		AABB bounds;
 		// COW input references distinguish geometry edits from debug-style changed
 		// signals without copying source data or keeping the Shape3D alive.
@@ -138,11 +148,19 @@ class PXTGI3D : public Node3D {
 	uint64_t published_geometry_version = UINT64_MAX;
 	uint64_t geometry_version = 0;
 
-	const GeometryBlock *_geometry_for(const Ref<Shape3D> &p_shape);
+	const GeometryBlock *_geometry_for(const Ref<Shape3D> &p_shape, const PackedVector2Array *p_uv = nullptr, const PackedFloat32Array *p_vertex_red = nullptr);
 	void _geometry_changed(ObjectID p_shape);
 	void _layout_geometry(const LocalVector<ObjectID> *p_changed = nullptr);
 	void _refresh_geometry();
 	LocalVector<ShapeEntry> shapes;
+	HashMap<ObjectID, HashMap<int, ObjectID>> reflection_item_ids;
+	HashMap<String, Ref<ConcavePolygonShape3D>> reflection_item_geometry;
+	PackedFloat32Array reflection_item_materials;
+	TypedArray<Texture2D> reflection_item_masks;
+	String reflection_item_shader;
+	float reflection_item_hero = 1.0f;
+	uint64_t reflection_source_policy = 0;
+	bool reflection_items_driven = false;
 	LocalVector<ObjectID> suns; // every DirectionalLight3D: the brightest one drawn on surfaces is the sun, chosen each frame
 	Ref<Environment> environment; // the one whose SDFGI is the switch, given its own settings back on leaving
 	uint32_t last_hash = 0; // what was published last: a change means the GI has to converge again
@@ -211,6 +229,8 @@ class PXTGI3D : public Node3D {
 	bool static_dirty = true;
 	bool moving_dirty = true;
 	bool radiance_dirty = false; // only glow changed: the records in place, not the tree
+	AABB opaque_world_bounds;
+	bool have_opaque_world_bounds = false;
 	Vector<float> published_primitives;
 	Vector<Pair<uint64_t, uint64_t>> published_ids;
 	Vector<float> published_nodes;
@@ -297,13 +317,17 @@ class PXTGI3D : public Node3D {
 
 public:
 	static void free_shared();
+	void set_reflection_items_driven(bool p_enabled) { reflection_items_driven = p_enabled; }
+	void set_reflection_items(const Array &p_records, const PackedFloat32Array &p_materials, const TypedArray<Texture2D> &p_masks, const String &p_shader_source, float p_hero, int64_t p_source_policy);
 	void prepare_geometry(const Ref<Shape3D> &p_shape);
 	void notify_body_changed(Node3D *p_body);
 	void notify_bodies_changed(const Array &p_bodies);
-	void disable_bodies(const Array &p_bodies);
+	// False is for controlled pools that notify every body after re-enabling it.
+	void disable_bodies(const Array &p_bodies, bool p_check_membership = true);
 	void notify_subtree_retired(Node *p_root);
 	void set_body_look(Node3D *p_body, const Color &p_albedo, const Color &p_emission);
 	void set_bodies_look(const Array &p_bodies, const Color &p_albedo, const Color &p_emission);
+	void set_body_group_looks(const Dictionary &p_groups, const Array &p_keys, const Color &p_albedo, const Array &p_emissions);
 	void update_emitter_group(const PackedInt64Array &p_bodies, const PackedFloat32Array &p_stations, const Dictionary &p_values, double p_time);
 	Dictionary get_stats(bool p_reset = true);
 

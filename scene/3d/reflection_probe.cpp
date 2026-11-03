@@ -307,7 +307,7 @@ bool ReflectionProbe::_get(const StringName &p_name, Variant &r_property) const 
 
 ReflectionProbe::ReflectionProbe() {
 	probe = RenderingServer::get_singleton()->reflection_probe_create();
-	RS::get_singleton()->instance_set_base(get_instance(), probe);
+	set_base(probe);
 	set_disable_scale(true);
 }
 

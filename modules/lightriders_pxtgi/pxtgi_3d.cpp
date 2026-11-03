@@ -849,7 +849,7 @@ void store_int(float *r_at, int p_value) {
 // A mesh's tree over its triangles (binned SAH splits, median where SAH finds none, leaves of up to four), in the scene
 // tree's node layout; the triangles reordered to its leaves. Never deeper than 23 levels (the shader's mesh walk keeps
 // a 24-entry stack).
-int build_triangle_tree(LocalVector<TriangleItem> &p_items, uint32_t p_from, uint32_t p_to, const Vector<Vector3> &p_corners, Vector<float> &r_nodes, Vector<float> &r_triangles, int p_depth = 0) {
+int build_triangle_tree(LocalVector<TriangleItem> &p_items, uint32_t p_from, uint32_t p_to, const Vector<Vector3> &p_corners, Vector<float> &r_nodes, Vector<float> &r_triangles, int p_depth = 0, const PackedVector2Array *p_uv = nullptr, Vector<float> *r_attributes = nullptr, const PackedFloat32Array *p_vertex_red = nullptr) {
 	AABB bounds = p_items[p_from].bounds;
 	AABB centres(p_items[p_from].center, Vector3());
 	for (uint32_t i = p_from + 1; i < p_to; i++) {
@@ -888,13 +888,24 @@ int build_triangle_tree(LocalVector<TriangleItem> &p_items, uint32_t p_from, uin
 				r_triangles.push_back(v.x);
 				r_triangles.push_back(v.y);
 				r_triangles.push_back(v.z);
-				r_triangles.push_back(0.0f);
+				// BLAS positions still read XYZ at stride 16. Lattice brightness
+				// follows its vertex through exactly the same SAH permutation.
+				r_triangles.push_back(p_vertex_red ? (*p_vertex_red)[p_items[i].index * 3 + c] : 0.0f);
+			}
+			if (p_uv && r_attributes) {
+				for (int c = 0; c < 3; c++) {
+					const Vector2 uv = (*p_uv)[p_items[i].index * 3 + c];
+					r_attributes->push_back(uv.x);
+					r_attributes->push_back(uv.y);
+				}
+				r_attributes->push_back(float(p_items[i].index & 1));
+				r_attributes->push_back(0.0f);
 			}
 		}
 		return node;
 	}
-	build_triangle_tree(p_items, p_from, mid, p_corners, r_nodes, r_triangles, p_depth + 1);
-	const int right = build_triangle_tree(p_items, mid, p_to, p_corners, r_nodes, r_triangles, p_depth + 1);
+	build_triangle_tree(p_items, p_from, mid, p_corners, r_nodes, r_triangles, p_depth + 1, p_uv, r_attributes, p_vertex_red);
+	const int right = build_triangle_tree(p_items, mid, p_to, p_corners, r_nodes, r_triangles, p_depth + 1, p_uv, r_attributes, p_vertex_red);
 	out = r_nodes.ptrw() + node * 8;
 	store_int(&out[3], right);
 	store_int(&out[7], 0);
@@ -928,7 +939,7 @@ void PXTGI3D::_geometry_changed(ObjectID p_shape) {
 	geometry_dirty.insert(p_shape);
 }
 
-const PXTGI3D::GeometryBlock *PXTGI3D::_geometry_for(const Ref<Shape3D> &p_shape) {
+const PXTGI3D::GeometryBlock *PXTGI3D::_geometry_for(const Ref<Shape3D> &p_shape, const PackedVector2Array *p_uv, const PackedFloat32Array *p_vertex_red) {
 	const ObjectID id = p_shape->get_instance_id();
 	const bool had_block = geometry_blocks.has(id);
 	GeometryBlock block;
@@ -1001,7 +1012,7 @@ const PXTGI3D::GeometryBlock *PXTGI3D::_geometry_for(const Ref<Shape3D> &p_shape
 			b.expand_to(corners[i * 3 + 2]);
 			items[i] = { b, b.get_center(), int(i), b.position, b.position + b.size };
 		}
-		build_triangle_tree(items, 0, items.size(), corners, block.nodes, block.triangles);
+		build_triangle_tree(items, 0, items.size(), corners, block.nodes, block.triangles, 0, p_uv, p_uv ? &block.attributes : nullptr, p_vertex_red);
 		block.type = 5;
 		block.bounds = AABB(corners[0], Vector3());
 		for (const Vector3 &v : corners) {
@@ -1192,9 +1203,11 @@ void PXTGI3D::_register_entry(ShapeEntry &r_entry, int p_index) {
 		r_entry.proxy_slot = proxy_entries.size();
 		proxy_entries.push_back(p_index);
 	} else {
-		r_entry.body_indices = &body_entries[r_entry.body_node];
-		r_entry.body_slot = r_entry.body_indices->size();
-		r_entry.body_indices->push_back(p_index);
+		if (r_entry.item_material < 0) {
+			r_entry.body_indices = &body_entries[r_entry.body_node];
+			r_entry.body_slot = r_entry.body_indices->size();
+			r_entry.body_indices->push_back(p_index);
+		}
 		if (r_entry.shape_resource.is_valid()) {
 			r_entry.geometry_indices = &geometry_entries[r_entry.shape_resource];
 			r_entry.geometry_slot = r_entry.geometry_indices->size();
@@ -1431,6 +1444,8 @@ void PXTGI3D::_rescan() {
 	const bool fresh_root = root->get_instance_id() != tracked_root;
 	if (fresh_root) {
 		shapes.clear();
+		reflection_item_ids.clear();
+		reflection_item_geometry.clear();
 		entry_of.clear();
 		body_entries.clear();
 		geometry_entries.clear();
@@ -1512,7 +1527,7 @@ void PXTGI3D::_layout_geometry(const LocalVector<ObjectID> *p_changed) {
 		allocate.reserve(p_changed->size());
 		for (const ObjectID &id : *p_changed) {
 			GeometryBlock &block = geometry_blocks[id];
-			const int words = (block.planes.size() + block.nodes.size() + block.triangles.size()) / 4;
+			const int words = (block.planes.size() + block.nodes.size() + block.triangles.size() + block.attributes.size()) / 4;
 			if (block.words == words && block.offset >= 0) {
 				continue;
 			}
@@ -1542,7 +1557,7 @@ void PXTGI3D::_layout_geometry(const LocalVector<ObjectID> *p_changed) {
 		geometry_ranges.reserve(live.size());
 		for (const ObjectID &id : live) {
 			GeometryBlock &block = geometry_blocks[id];
-			const int words = (block.planes.size() + block.nodes.size() + block.triangles.size()) / 4;
+			const int words = (block.planes.size() + block.nodes.size() + block.triangles.size() + block.attributes.size()) / 4;
 			if (block.words != words) {
 				block.offset = -1;
 			}
@@ -1595,6 +1610,10 @@ void PXTGI3D::_layout_geometry(const LocalVector<ObjectID> *p_changed) {
 			entry.geometry_b = block.type == 4 ? block.planes.size() / 4 : block.offset + block.nodes.size() / 4;
 			store_int(&entry_floats[i * PhysXGIEffect::PRIMITIVE_FLOATS + 13], entry.geometry_a);
 			store_int(&entry_floats[i * PhysXGIEffect::PRIMITIVE_FLOATS + 14], entry.geometry_b);
+			if (entry.item_material >= 0) {
+				entry.geometry_attributes = entry.geometry_b + block.triangles.size() / 4;
+				store_int(&entry_floats[i * PhysXGIEffect::PRIMITIVE_FLOATS + 15], entry.geometry_attributes);
+			}
 		}
 	}
 	// A streamed owner releases its GPU range immediately. The game may keep its
@@ -1642,7 +1661,7 @@ void PXTGI3D::_refresh_geometry() {
 		}
 		_geometry_for(resource);
 		GeometryBlock &block = geometry_blocks[id];
-		const int words = (block.planes.size() + block.nodes.size() + block.triangles.size()) / 4;
+		const int words = (block.planes.size() + block.nodes.size() + block.triangles.size() + block.attributes.size()) / 4;
 		// First-use and restored pool slots also reuse retired ranges. Appending
 		// them forever would accumulate holes as the oldest walls expire.
 		relayout |= words != block.words || (words > 0 && block.offset < 0);
@@ -1702,6 +1721,12 @@ bool PXTGI3D::_shape_frame(int p_index, Transform3D &r_to_world, float &r_type, 
 	float type = 0.0f;
 	Vector3 extents;
 	Transform3D to_world;
+	if (entry.item_material >= 0) {
+		r_to_world = entry.item_pose;
+		r_type = 5.0f;
+		r_extents = Vector3();
+		return entry.item_geometry.is_valid();
+	}
 	if (entry.mesh_proxy) {
 		MeshInstance3D *mesh = ObjectDB::get_instance<MeshInstance3D>(entry.shape_node);
 		if (mesh == nullptr || !mesh->is_visible_in_tree() || mesh->get_mesh().is_null()) {
@@ -1762,11 +1787,14 @@ void PXTGI3D::_pack_entry(int p_index, const Transform3D &p_to_world, float p_ty
 	if (entry.geometry_type) {
 		store_int(&p[13], entry.geometry_a);
 		store_int(&p[14], entry.geometry_b);
+		if (entry.item_material >= 0) {
+			store_int(&p[15], entry.geometry_attributes);
+		}
 	}
 	p[16] = entry.albedo.r;
 	p[17] = entry.albedo.g;
 	p[18] = entry.albedo.b;
-	p[19] = 1.0f;
+	p[19] = entry.item_material >= 0 ? -float(entry.item_material + 1) : 1.0f;
 	p[20] = entry.emission.r;
 	p[21] = entry.emission.g;
 	p[22] = entry.emission.b;
@@ -1783,7 +1811,7 @@ bool PXTGI3D::_refresh_entry(int p_index, float *r_out, AABB &r_bounds) {
 	}
 	const Transform3D to_world = entry.in_body;
 	_pack_entry(p_index, to_world, entry.type, entry.extents, r_out, r_bounds);
-	if (!entry.mesh_proxy) {
+	if (!entry.mesh_proxy && entry.item_material < 0) {
 		const Node3D *body = ObjectDB::get_instance<CollisionShape3D>(entry.shape_node)->get_parent_node_3d();
 		if (body) {
 			entry.in_body = body->get_global_transform().affine_inverse() * to_world;
@@ -1869,6 +1897,25 @@ void PXTGI3D::_build_tree() {
 			store_int(&root[7], 0);
 		}
 		moving_root_node = moving_root;
+	}
+	// Transparent items expand the shared traversal tree, but cannot change whether
+	// an opaque GI ray has escaped the scene. Reuse the retained static root and
+	// this rebuild's moving entries to retain the opaque bounds separately.
+	have_opaque_world_bounds = static_leaves > 0;
+	if (have_opaque_world_bounds) {
+		const float *root = &tree_nodes[static_rooted ? NF : 0];
+		const Vector3 lo(root[0], root[1], root[2]);
+		opaque_world_bounds = AABB(lo, Vector3(root[4], root[5], root[6]) - lo);
+	}
+	for (const BuildItem &item : moving_items) {
+		if (shapes[item.index].item_material < 0) {
+			if (have_opaque_world_bounds) {
+				opaque_world_bounds.merge_with(item.bounds);
+			} else {
+				opaque_world_bounds = item.bounds;
+				have_opaque_world_bounds = true;
+			}
+		}
 	}
 	const bool reset_slots = static_rebuilt || entry_slot.size() != uint32_t(n);
 	entry_slot.resize(n);
@@ -2149,6 +2196,8 @@ void PXTGI3D::_update_primitives(PhysXGIEffect::Snapshot &r_snapshot) {
 	r_snapshot.static_count = static_leaves;
 	r_snapshot.static_version = static_version;
 	r_snapshot.moving_root = moving_root_node;
+	r_snapshot.opaque_world_bounds = opaque_world_bounds;
+	r_snapshot.have_opaque_world_bounds = have_opaque_world_bounds;
 	moved_poses.clear();
 }
 
@@ -2201,6 +2250,7 @@ void PXTGI3D::_publish_geometry(PhysXGIEffect::Snapshot &r_snapshot) {
 					upload.planes = block.planes;
 					upload.nodes = block.nodes;
 					upload.triangles = block.triangles;
+					upload.attributes = block.attributes;
 				}
 				upload.offset = block.offset * 4;
 			}
@@ -2290,7 +2340,7 @@ void PXTGI3D::notify_bodies_changed(const Array &p_bodies) {
 	}
 }
 
-void PXTGI3D::disable_bodies(const Array &p_bodies) {
+void PXTGI3D::disable_bodies(const Array &p_bodies, bool p_check_membership) {
 	for (int i = 0; i < p_bodies.size(); i++) {
 		Node3D *body = Object::cast_to<Node3D>(p_bodies[i]);
 		if (body == nullptr) {
@@ -2314,7 +2364,7 @@ void PXTGI3D::disable_bodies(const Array &p_bodies) {
 				(shapes[*index].moving ? moving_dirty : static_dirty) = true;
 				records_changed++;
 			}
-			if (index == nullptr || _membership_changed(shape, &shapes[*index])) {
+			if (index == nullptr || (p_check_membership && _membership_changed(shape, &shapes[*index]))) {
 				unchanged_membership = false;
 			}
 		}
@@ -2426,6 +2476,35 @@ void PXTGI3D::set_bodies_look(const Array &p_bodies, const Color &p_albedo, cons
 	}
 }
 
+// Repeated groups keep their bodies in the caller's existing arrays. Each position
+// shares one look, so a cohort needs neither script-side gathering nor temporary
+// arrays containing every body again.
+void PXTGI3D::set_body_group_looks(const Dictionary &p_groups, const Array &p_keys, const Color &p_albedo, const Array &p_emissions) {
+	LocalVector<Pair<Color, Color>> linear;
+	LocalVector<Color> emissions;
+	const Color albedo = p_albedo.srgb_to_linear();
+	for (int i = 0; i < p_emissions.size(); i++) {
+		const Color emission = p_emissions[i];
+		Color glow = emission.srgb_to_linear();
+		glow.a = 1.0f;
+		emissions.push_back(emission);
+		linear.push_back(Pair<Color, Color>(albedo, glow));
+	}
+	for (int key = 0; key < p_keys.size(); key++) {
+		const Variant *value = p_groups.getptr(p_keys[key]);
+		if (value == nullptr || value->get_type() != Variant::ARRAY) {
+			continue;
+		}
+		const Array bodies = *value;
+		ERR_CONTINUE_MSG(bodies.size() != p_emissions.size(), "Each body group must have one emission per body.");
+		for (int i = 0; i < bodies.size(); i++) {
+			if (Node3D *body = Object::cast_to<Node3D>(bodies[i])) {
+				_set_body_look(body, p_albedo, emissions[i], linear[i]);
+			}
+		}
+	}
+}
+
 // Batched bridge for the underground pulse material. Parameters are shared by a group; each body's glow is written
 // into its shapes' records in place (geometry and the tree stay as they are). A body no scan has found yet takes it
 // through its metadata, as any look.
@@ -2525,6 +2604,166 @@ Dictionary PXTGI3D::get_stats(bool p_reset) {
 	return stats;
 }
 
+// Called once at final pre-draw by an opted-in collector. Validate the complete
+// frame before changing membership; geometry, materials and policy publish together.
+void PXTGI3D::set_reflection_items(const Array &p_records, const PackedFloat32Array &p_materials, const TypedArray<Texture2D> &p_masks, const String &p_shader_source, float p_hero, int64_t p_source_policy) {
+	ERR_FAIL_COND(p_materials.size() % 16 != 0 || p_masks.size() > 4);
+	ERR_FAIL_COND(!p_records.is_empty() && p_shader_source.is_empty());
+	HashMap<ObjectID, HashSet<int>> admitted;
+	for (int i = 0; i < p_records.size(); i++) {
+		ERR_FAIL_COND(p_records[i].get_type() != Variant::ARRAY);
+		const Array record = p_records[i];
+		ERR_FAIL_COND(record.size() != 8 && record.size() != 9);
+		ERR_FAIL_COND(record[0].get_type() != Variant::OBJECT || record[1].get_type() != Variant::INT || record[2].get_type() != Variant::STRING || record[3].get_type() != Variant::PACKED_VECTOR3_ARRAY || record[4].get_type() != Variant::PACKED_VECTOR2_ARRAY || record[5].get_type() != Variant::TRANSFORM3D || record[6].get_type() != Variant::INT || record[7].get_type() != Variant::INT);
+		Object *object = record[0];
+		Node3D *source = Object::cast_to<Node3D>(object);
+		ERR_FAIL_NULL(source);
+		const int surface = record[1];
+		const int material = record[6];
+		const PackedVector3Array vertices = record[3];
+		const PackedVector2Array uv = record[4];
+		const Transform3D pose = record[5];
+		ERR_FAIL_COND(surface < 0 || material < 0 || material >= p_materials.size() / 16 || String(record[2]).is_empty());
+		ERR_FAIL_COND(vertices.size() < 3 || vertices.size() % 3 != 0 || uv.size() != vertices.size() || !pose.is_finite() || Math::is_zero_approx(pose.basis.determinant()));
+		const float type = p_materials[material * 16 + 1];
+		ERR_FAIL_COND(!(type >= 0.0f && type <= 5.0f) && type != 7.0f);
+		if (record.size() == 9) {
+			ERR_FAIL_COND(record[8].get_type() != Variant::PACKED_FLOAT32_ARRAY || PackedFloat32Array(record[8]).size() != vertices.size());
+		}
+		if (type == 7.0f) {
+			const float auxiliary = p_materials[material * 16 + 3];
+			ERR_FAIL_COND(record.size() != 9 || !p_shader_source.contains("lightriders_lattice"));
+			ERR_FAIL_COND(!Math::is_finite(auxiliary) || auxiliary < 0.0f || auxiliary >= float(p_materials.size() / 16) || auxiliary != Math::floor(auxiliary));
+		}
+		HashSet<int> &surfaces = admitted[source->get_instance_id()];
+		ERR_FAIL_COND(surfaces.has(surface));
+		surfaces.insert(surface);
+	}
+	if (!is_inside_tree()) {
+		return;
+	}
+	if (tracked_root.is_null() || _scan_root()->get_instance_id() != tracked_root) {
+		_rescan();
+	}
+	bool layout_changed = false;
+	for (const KeyValue<ObjectID, HashMap<int, ObjectID>> &source : reflection_item_ids) {
+		const HashSet<int> *surfaces = admitted.getptr(source.key);
+		for (const KeyValue<int, ObjectID> &surface : source.value) {
+			if (!surfaces || !surfaces->has(surface.key)) {
+				if (const int *index = entry_of.getptr(surface.value)) {
+					_remove_entry(*index);
+					layout_changed = true;
+				}
+			}
+		}
+	}
+	HashMap<ObjectID, HashMap<int, ObjectID>> next_ids;
+	HashSet<String> live_geometry;
+	constexpr int PF = PhysXGIEffect::PRIMITIVE_FLOATS;
+	for (int i = 0; i < p_records.size(); i++) {
+		const Array record = p_records[i];
+		Object *object = record[0];
+		const ObjectID source_id = object->get_instance_id();
+		const int surface = record[1];
+		const String key = record[2];
+		live_geometry.insert(key);
+		Ref<ConcavePolygonShape3D> geometry;
+		if (const Ref<ConcavePolygonShape3D> *known = reflection_item_geometry.getptr(key)) {
+			geometry = *known;
+		} else {
+			geometry.instantiate();
+			geometry->set_faces(record[3]);
+			const PackedVector2Array uv = record[4];
+			const PackedFloat32Array vertex_red = record.size() == 9 ? PackedFloat32Array(record[8]) : PackedFloat32Array();
+			_geometry_for(geometry, &uv, record.size() == 9 ? &vertex_red : nullptr);
+			reflection_item_geometry.insert(key, geometry);
+		}
+		int index = -1;
+		Ref<RefCounted> identity;
+		if (const HashMap<int, ObjectID> *surfaces = reflection_item_ids.getptr(source_id)) {
+			if (const ObjectID *id = surfaces->getptr(surface)) {
+				if (const int *known = entry_of.getptr(*id)) {
+					index = *known;
+					identity = shapes[index].item_identity;
+				}
+			}
+		}
+		const bool geometry_changed = index >= 0 && shapes[index].item_geometry != geometry;
+		if (geometry_changed) {
+			_remove_entry(index);
+			index = -1;
+			layout_changed = true;
+		}
+		if (identity.is_null()) {
+			identity.instantiate();
+		}
+		const int64_t generation = record[7];
+		const uint64_t motion_generation = generation < 0 || geometry_changed ? UINT64_MAX : uint64_t(generation);
+		if (index < 0) {
+			const GeometryBlock *block = _geometry_for(geometry);
+			ShapeEntry entry;
+			entry.item_identity = identity;
+			entry.item_geometry = geometry;
+			entry.shape_node = identity->get_instance_id();
+			entry.shape_resource = geometry->get_instance_id();
+			entry.item_material = record[6];
+			entry.item_pose = record[5];
+			entry.motion_generation = motion_generation;
+			entry.geometry_type = block->type;
+			entry.geometry_key = block->key;
+			entry.geometry_a = block->offset;
+			entry.geometry_b = block->offset + block->nodes.size() / 4;
+			entry.geometry_attributes = entry.geometry_b + block->triangles.size() / 4;
+			entry.local_bounds = block->bounds;
+			entry.moving = true;
+			entry.sample_emission = false;
+			entry.albedo = Color(0, 0, 0);
+			entry.emission = Color(0, 0, 0);
+			index = shapes.size();
+			_register_entry(entry, index);
+			entry_of.insert(entry.shape_node, index);
+			shapes.push_back(entry);
+			entry_floats.resize((index + 1) * PF);
+			entry_bounds.resize(index + 1);
+			entry_valid.resize(index + 1);
+			entry_slot.push_back(-1);
+			entry_valid[index] = _refresh_entry(index, &entry_floats[index * PF], entry_bounds[index]);
+			moving_dirty = true;
+			layout_changed |= block->offset < 0;
+		} else {
+			ShapeEntry &entry = shapes[index];
+			entry.item_pose = record[5];
+			entry.item_material = record[6];
+			if (entry.motion_generation != motion_generation) {
+				entry.motion_generation = motion_generation;
+				moving_dirty = true;
+			}
+		}
+		next_ids[source_id].insert(surface, identity->get_instance_id());
+	}
+	reflection_item_ids = next_ids;
+	LocalVector<String> retired;
+	for (const KeyValue<String, Ref<ConcavePolygonShape3D>> &geometry : reflection_item_geometry) {
+		if (!live_geometry.has(geometry.key)) {
+			retired.push_back(geometry.key);
+		}
+	}
+	for (const String &key : retired) {
+		reflection_item_geometry.erase(key);
+	}
+	if (layout_changed) {
+		_layout_geometry();
+	}
+	reflection_item_materials = p_materials;
+	reflection_item_masks = p_masks.duplicate();
+	reflection_item_shader = p_shader_source;
+	reflection_item_hero = p_hero;
+	reflection_source_policy = uint64_t(p_source_policy);
+	if (reflection_items_driven && attached_world.is_valid()) {
+		_publish();
+	}
+}
+
 void PXTGI3D::_publish() {
 	if (!is_visible_in_tree()) {
 		PhysXGIEffect::remove_settings(get_instance_id());
@@ -2548,6 +2787,15 @@ void PXTGI3D::_publish() {
 	s.reflection_mode = reflection_mode;
 	s.reflection_cutoff = reflection_cutoff;
 
+	s.item_materials = reflection_item_materials;
+	s.item_masks = reflection_item_masks;
+	s.item_shader = reflection_item_shader;
+	s.item_hero = reflection_item_hero;
+	s.reflection_source_policy = reflection_source_policy;
+	s.reflection_items_configured = reflection_items_driven;
+	for (const KeyValue<ObjectID, HashMap<int, ObjectID>> &source : reflection_item_ids) {
+		s.item_count += source.value.size();
+	}
 	_update_primitives(s);
 	const Camera3D *camera = get_viewport() ? get_viewport()->get_camera_3d() : nullptr;
 	const Vector3 eye = camera ? camera->get_global_position() : get_global_position();
@@ -2741,7 +2989,9 @@ void PXTGI3D::_notification(int p_what) {
 			if (!attached_world.is_valid()) {
 				return;
 			}
-			_publish();
+			if (!reflection_items_driven) {
+				_publish();
+			}
 			PhysXGIEffect::install(get_world_3d().ptr(), get_viewport() ? get_viewport()->get_camera_3d() : nullptr);
 #ifdef TOOLS_ENABLED
 			// The editor draws only when something changes: keep it drawing until the GI has converged.
@@ -2765,10 +3015,13 @@ void PXTGI3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("prepare_geometry", "shape"), &PXTGI3D::prepare_geometry);
 	ClassDB::bind_method(D_METHOD("notify_body_changed", "body"), &PXTGI3D::notify_body_changed);
 	ClassDB::bind_method(D_METHOD("notify_bodies_changed", "bodies"), &PXTGI3D::notify_bodies_changed);
-	ClassDB::bind_method(D_METHOD("disable_bodies", "bodies"), &PXTGI3D::disable_bodies);
+	ClassDB::bind_method(D_METHOD("disable_bodies", "bodies", "check_membership"), &PXTGI3D::disable_bodies, DEFVAL(true));
 	ClassDB::bind_method(D_METHOD("notify_subtree_retired", "root"), &PXTGI3D::notify_subtree_retired);
+	ClassDB::bind_method(D_METHOD("set_reflection_items_driven", "enabled"), &PXTGI3D::set_reflection_items_driven);
+	ClassDB::bind_method(D_METHOD("set_reflection_items", "records", "materials", "masks", "shader_source", "hero", "source_policy"), &PXTGI3D::set_reflection_items);
 	ClassDB::bind_method(D_METHOD("set_body_look", "body", "albedo", "emission"), &PXTGI3D::set_body_look);
 	ClassDB::bind_method(D_METHOD("set_bodies_look", "bodies", "albedo", "emission"), &PXTGI3D::set_bodies_look);
+	ClassDB::bind_method(D_METHOD("set_body_group_looks", "groups", "keys", "albedo", "emissions"), &PXTGI3D::set_body_group_looks);
 	ClassDB::bind_method(D_METHOD("update_emitter_group", "bodies", "stations", "values", "time"), &PXTGI3D::update_emitter_group);
 	ClassDB::bind_method(D_METHOD("get_stats", "reset"), &PXTGI3D::get_stats, DEFVAL(true));
 	ClassDB::bind_method(D_METHOD("set_intensity", "intensity"), &PXTGI3D::set_intensity);

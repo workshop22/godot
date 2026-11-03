@@ -37,6 +37,7 @@
 #include "core/templates/hash_set.h"
 #include "core/templates/local_vector.h"
 #include "scene/resources/compositor.h"
+#include "scene/resources/texture.h"
 #include "servers/rendering/renderer_rd/storage_rd/render_buffer_custom_data_rd.h"
 #include "servers/rendering/rendering_device.h"
 
@@ -96,6 +97,8 @@ public:
 	LocalVector<RID> source_levels; // a view of each of its mips
 	Size2i source_size;
 	uint64_t source_frame = UINT64_MAX;
+	uint64_t source_policy = 0;
+	uint64_t requested_source_policy = 0;
 	Size2i reflect_size;
 	Size2i trace_size;
 	Size2i targets_for;
@@ -158,9 +161,19 @@ public:
 		Vector<float> planes;
 		Vector<float> nodes;
 		Vector<float> triangles;
+		Vector<float> attributes;
 	};
 
 	struct Snapshot {
+		PackedFloat32Array item_materials;
+		TypedArray<Texture2D> item_masks; // strong references survive skipped main-thread publications
+		String item_shader;
+		float item_hero = 1.0f;
+		int item_count = 0;
+		uint64_t reflection_source_policy = 0;
+		bool reflection_items_configured = false;
+		AABB opaque_world_bounds;
+		bool have_opaque_world_bounds = false;
 		RID compositor;
 		RID environment;
 		Vector<float> primitives;
@@ -263,8 +276,19 @@ private:
 	};
 	RID shaders[PASS_MAX];
 	RID pipelines[PASS_MAX];
+	struct ItemPipelines {
+		RID shader[2];
+		RID pipeline[2];
+		bool attempted[2] = {};
+	};
+	HashMap<String, ItemPipelines> item_pipelines;
+	ItemPipelines *active_item_pipelines = nullptr;
+	bool _ensure_item_pipeline(RenderingDevice *p_rd, const String &p_source, bool p_hardware);
+	RID item_material_buffer;
+	uint32_t item_material_capacity = 0;
 	RID linear_sampler;
 	RID mip_sampler;
+	RID item_mask_sampler;
 	RID blue_noise; // 64 x 64, R8
 	RID nearest_sampler;
 	RID data_buffer; // the frame's matrices
@@ -276,6 +300,7 @@ private:
 	RID geometry_buffer;
 	uint32_t geometry_capacity = 0; // floats
 	HashMap<uint64_t, int> geometry_offsets; // uploaded revision key -> float offset
+	LocalVector<Pair<uint64_t, int>> geometry_descriptors; // last successful publication's unique key/offset order
 	uint64_t geometry_uploaded = UINT64_MAX;
 	ObjectID snapshot_owner;
 	bool failed = false;
@@ -290,6 +315,7 @@ private:
 	uint64_t hw_blocks_version = UINT64_MAX;
 	RID hw_static_tlas;
 	RID hw_moving_tlas;
+	LocalVector<RD::AccelerationStructureInstance> hw_moving_instances;
 	uint32_t hw_moving_capacity = 0;
 	uint32_t hw_static_capacity = 0;
 	uint64_t hw_static_version = UINT64_MAX;
@@ -304,6 +330,10 @@ private:
 	uint64_t rt_last_us = 0;
 	uint64_t hw_static_us = 0;
 	uint64_t hw_moving_us = 0;
+	uint64_t hw_moving_instances_us = 0;
+	uint64_t hw_moving_create_us = 0;
+	uint64_t hw_moving_submit_us = 0;
+	int hw_moving_count = 0;
 	uint64_t hw_update_us = 0;
 	uint64_t motion_update_us = 0;
 	uint64_t geometry_update_us = 0;

@@ -133,6 +133,9 @@ layout(set = 0, binding = 9, std140) uniform Frame {
 	vec4 trace_settings; // x: reflection reach, y: filtered mirror rays, z: previous colour is valid, w: reflection softness
 	vec4 polish; // x: blue noise, y: GI history clamp, z: the source's mip levels for screen hits (0: level 0 only), w: frame pixels a reflection texel spans
 	vec4 jitter; // current and previous raster shifts, in UV
+	vec4 opaque_low; // w: the scene has opaque geometry
+	vec4 opaque_high;
+	vec4 item_trace; // material count, hero emission, valid reflection source, source mip count
 	vec4 hw; // hardware trace spike: x: the moving part's root node (-1: none)
 }
 f;
@@ -248,6 +251,54 @@ ivec2 frame_pixel(ivec2 px, ivec2 size) {
 
 // The collision shapes the rays fall back on (bindings 4 and 5), and the light leaving them; spliced in at @WORLD@ by
 // the shaders that trace (which bind the depth and colour at 0 and 2).
+const char *PROBE_REFLECTION = R"(
+// Traced + probes: the reflection a probe gives world point w along r at this roughness, as Godot's own probe
+// reflection would (the smallest box holding w, box projected if the probe is, the capture's level for the roughness),
+// and how much of it applies there (r_weight: 0 outside every box, fading to the edge over its blend distance).
+vec3 probe_reflection(vec3 w, vec3 r, float rough, out float r_weight) {
+	r_weight = 0.0;
+	int best = -1;
+	float best_volume = 1e30;
+	vec3 l = vec3(0.0);
+	for (int i = 0; i < f.srcs.x; i++) {
+		vec3 li = vec3(dot(f.src_x[i].xyz, w) + f.src_x[i].w, dot(f.src_y[i].xyz, w) + f.src_y[i].w, dot(f.src_z[i].xyz, w) + f.src_z[i].w);
+		if (f.src_usage[i].x <= 0.0) {
+			continue;
+		}
+		vec3 e = f.src_box[i].xyz;
+		float volume = e.x * e.y * e.z;
+		if (all(lessThanEqual(abs(li), e)) && volume < best_volume) {
+			best = i;
+			best_volume = volume;
+			l = li;
+		}
+	}
+	if (best < 0) {
+		return vec3(0.0);
+	}
+	vec3 e = f.src_box[best].xyz;
+	r_weight = 1.0;
+	float blend = f.src_capture[best].w;
+	if (blend > 0.0) {
+		vec3 axis = min(vec3(blend), e);
+		vec3 b = clamp(1.0 - (abs(l) - e + axis) / axis, 0.0, 1.0);
+		r_weight = pow(b.x * b.y * b.z, 2.0);
+	}
+	vec3 d = normalize(vec3(dot(f.src_x[best].xyz, r), dot(f.src_y[best].xyz, r), dot(f.src_z[best].xyz, r)));
+	if (mod(f.src_box[best].w, 2.0) > 0.5) {
+		vec3 to_max = (e - l) / d;
+		vec3 to_min = (-e - l) / d;
+		vec3 far_side = mix(to_min, to_max, greaterThan(d, vec3(0.0)));
+		d = l + d * min(min(far_side.x, far_side.y), far_side.z) - f.src_offset[best].xyz;
+	}
+	d /= abs(d.x) + abs(d.y) + abs(d.z);
+	vec2 uv = d.z >= 0.0 ? d.xy : (1.0 - abs(d.yx)) * vec2(d.x >= 0.0 ? 1.0 : -1.0, d.y >= 0.0 ? 1.0 : -1.0);
+	uv = (uv * 0.5 + 0.5) * f.src_border.y + f.src_border.x;
+	return textureLod(probe_atlas, vec3(uv, floor(f.src_box[best].w * 0.5)), sqrt(rough) * f.src_border.z).rgb * f.src_offset[best].w * f.src_usage[best].x;
+}
+
+)";
+
 const char *WORLD = R"(
 struct Primitive {
 	vec4 r0;
@@ -286,6 +337,9 @@ float mesh_box_entry(vec3 o, vec3 inv, int at, float best) {
 
 // The nearest triangle of a mesh along a local ray (either side), walking its own tree near child first (the far
 // one waits, and is skipped once a triangle nearer than its box has been found).
+int nearest_triangle = 0;
+vec2 nearest_bary = vec2(0.0);
+
 bool hit_mesh(int nodes, int tris, vec3 o, vec3 d, inout float t, out vec3 n) {
 	bool found = false;
 	vec3 inv = 1.0 / d;
@@ -345,6 +399,8 @@ bool hit_mesh(int nodes, int tris, vec3 o, vec3 d, inout float t, out vec3 n) {
 				if (th > 0.0 && th < t) {
 					t = th;
 					n = cross(e1, e2);
+					nearest_triangle = k;
+					nearest_bary = vec2(u, w);
 					found = true;
 				}
 			}
@@ -519,7 +575,7 @@ float box_entry(vec3 o, vec3 inv, vec3 lo, vec3 hi, float best) {
 // The nearest shape along the ray, walking the tree near child first (the far one waits on the stack, and is skipped
 // when a hit closer than its box has been found by then). With any_hit, the first shape in the way will do (shadow
 // rays): returns at once.
-int walk_tree(int start, vec3 o, vec3 d, inout float t, out vec3 normal, bool any_hit) {
+int walk_tree(int start, vec3 o, vec3 d, inout float t, out vec3 normal, bool any_hit, bool items) {
 	int hit = -1;
 	if (f.counts.y == 0 || start < 0) {
 		return hit;
@@ -557,6 +613,9 @@ int walk_tree(int start, vec3 o, vec3 d, inout float t, out vec3 normal, bool an
 		} else {
 			int first = floatBitsToInt(nd.lo.w);
 			for (int i = first; i < first + count; i++) {
+				if ((prims.p[i].albedo.w < 0.0) != items) {
+					continue;
+				}
 				vec3 n;
 				if (hit_primitive(prims.p[i], o, d, t, n)) {
 					hit = i;
@@ -612,17 +671,19 @@ vec3 hw_normal(int slot, int tri, vec3 p, vec3 d) {
 #define HW_QUERY(SCENE) \
 	{ \
 		rayQueryEXT q; \
-		rayQueryInitializeEXT(q, SCENE, flags, 0xFF, o, 0.0, d, t); \
+		rayQueryInitializeEXT(q, SCENE, flags, items ? 2u : 1u, o, 0.0, d, t); \
 		while (rayQueryProceedEXT(q)) { \
 		} \
 		if (rayQueryGetIntersectionTypeEXT(q, true) == gl_RayQueryCommittedIntersectionTriangleEXT) { \
 			t = rayQueryGetIntersectionTEXT(q, true); \
 			hit = rayQueryGetIntersectionInstanceCustomIndexEXT(q, true); \
 			tri = rayQueryGetIntersectionPrimitiveIndexEXT(q, true); \
+			nearest_triangle = tri; \
+			nearest_bary = rayQueryGetIntersectionBarycentricsEXT(q, true); \
 		} \
 	}
 
-int walk_world(vec3 o, vec3 d, inout float t, out vec3 normal, bool any_hit) {
+int walk_world(vec3 o, vec3 d, inout float t, out vec3 normal, bool any_hit, bool items) {
 	int hit = -1;
 	int tri = 0;
 	normal = vec3(0.0, 1.0, 0.0);
@@ -640,19 +701,19 @@ int walk_world(vec3 o, vec3 d, inout float t, out vec3 normal, bool any_hit) {
 	return hit;
 }
 #else
-int walk_world(vec3 o, vec3 d, inout float t, out vec3 normal, bool any_hit) {
-	return walk_tree(0, o, d, t, normal, any_hit);
+int walk_world(vec3 o, vec3 d, inout float t, out vec3 normal, bool any_hit, bool items) {
+	return walk_tree(0, o, d, t, normal, any_hit, items);
 }
 #endif
 
 int trace_world(vec3 o, vec3 d, inout float t, out vec3 normal) {
-	return walk_world(o, d, t, normal, false);
+	return walk_world(o, d, t, normal, false, false);
 }
 
 // Whether anything lies along the ray before reach (shadow rays).
 bool blocked(vec3 o, vec3 d, float reach) {
 	vec3 n;
-	return walk_world(o, d, reach, n, true) >= 0;
+	return walk_world(o, d, reach, n, true, false) >= 0;
 }
 
 // The radiance cache. A slot's key is a fingerprint of its cell (0: empty); its cell holds where it was first hit
@@ -788,12 +849,12 @@ vec3 background_light(vec3 d) {
 // Whether a ray that hit nothing within reach has left the scene (the box around every shape): only then does it see
 // the background. One that ran out of reach inside a large closed space (a long tunnel) doesn't.
 bool escapes(vec3 o, vec3 d, float reach) {
-	if (f.counts.y == 0) {
+	if (f.opaque_low.w < 0.5) {
 		return true;
 	}
 	vec3 inv = 1.0 / d;
-	vec3 t0 = (bvh.n[0].lo.xyz - o) * inv;
-	vec3 t1 = (bvh.n[0].hi.xyz - o) * inv;
+	vec3 t0 = (f.opaque_low.xyz - o) * inv;
+	vec3 t1 = (f.opaque_high.xyz - o) * inv;
 	vec3 far_t = max(t0, t1);
 	return min(min(far_t.x, far_t.y), far_t.z) <= reach;
 }
@@ -1368,6 +1429,9 @@ bool probe_source(vec3 x, vec3 n, int hit, out vec3 seen);
 bool probe_texture = false;
 
 @WORLD@
+@PROBE_REFLECTION@
+@ITEMS@
+
 
 // The light a reflection probe's capture shows at world point x (facing n) on shape hit: from the first probe whose
 // box holds x, when the shape doesn't move (the capture may be older than the frame), x faces the capture point and
@@ -1582,6 +1646,59 @@ void main() {
 			motion_valid = motions.p[hit].info.x > 0.5;
 		}
 	}
+#ifdef PXTGI_ITEMS
+	if (int(f.reflect.x) >= 2) {
+		vec3 wo = (f.view_to_world * vec4(origin, 1.0)).xyz;
+		vec3 wd = normalize(mat3(f.view_to_world) * dir);
+#ifdef PXTGI_LATTICE
+		prepare_item_differentials(p, dir, geometry_normal, fp, depth);
+#endif
+		float limit = found ? min(hit_t, f.trace_settings.x) : f.trace_settings.x;
+		// Screen hits may overlook an off-screen occluder; items only contribute
+		// in front of the nearest opaque shape on this same scene ray.
+		vec3 opaque_normal;
+		trace_world(wo, wd, limit, opaque_normal);
+		vec3 glow = vec3(0.0);
+		float transmission = 1.0;
+		float first_item = 0.0;
+		float cursor = 0.0;
+		for (int layer = 0; layer < 8 && cursor < limit; layer++) {
+			float distance = limit - cursor;
+			vec3 item_normal;
+			int hit = walk_world(wo + wd * cursor, wd, distance, item_normal, false, true);
+			if (hit < 0) {
+				break;
+			}
+			float along = cursor + distance;
+			vec4 contribution = item_crossing(hit, nearest_triangle, nearest_bary, wd, length(p) + along, along);
+			if ((any(greaterThan(contribution.rgb, vec3(0.0))) || contribution.a > 0.0) && !any(isnan(contribution)) && !any(isinf(contribution))) {
+				// Additive crossings have zero coverage. A lattice crossing carries
+				// premultiplied colour and attenuates every later layer/background.
+				glow += transmission * contribution.rgb;
+				transmission *= 1.0 - contribution.a;
+				if (first_item == 0.0) {
+					first_item = along;
+				}
+			}
+			cursor = along + 0.0002;
+		}
+		if (first_item > 0.0) {
+			if (!found) {
+				float weight;
+				vec3 probe = probe_reflection(wo, wd, rough, weight);
+				light = mix(item_background(wd, rough), probe, weight);
+				hit_t = first_item;
+				found = true;
+			}
+			light = glow * f.sun_color.w + transmission * light;
+			// Several translucent crossings plus a background have no single
+			// trustworthy velocity. Do not smear them with the opaque hit's motion.
+			motion_valid = false;
+			hit_moves = true;
+		}
+	}
+#endif
+
 	// A tangent-plane mirror maps hit motion through the same reflection as the ray.
 	// Store actual previous screen position for temporal reuse and the blur's separate layer.
 	vec3 virtual_point = p + normalize(p) * (found ? hit_t : 65000.0);
@@ -1818,50 +1935,7 @@ layout(set = 0, binding = 7) uniform sampler2D reflect_tex;
 layout(set = 0, binding = 8) uniform sampler2D reflect_depth_tex;
 layout(set = 0, binding = 12) uniform sampler2DArray probe_atlas;
 
-// Traced + probes: the reflection a probe gives world point w along r at this roughness, as Godot's own probe
-// reflection would (the smallest box holding w, box projected if the probe is, the capture's level for the roughness),
-// and how much of it applies there (r_weight: 0 outside every box, fading to the edge over its blend distance).
-vec3 probe_reflection(vec3 w, vec3 r, float rough, out float r_weight) {
-	r_weight = 0.0;
-	int best = -1;
-	float best_volume = 1e30;
-	vec3 l = vec3(0.0);
-	for (int i = 0; i < f.srcs.x; i++) {
-		vec3 li = vec3(dot(f.src_x[i].xyz, w) + f.src_x[i].w, dot(f.src_y[i].xyz, w) + f.src_y[i].w, dot(f.src_z[i].xyz, w) + f.src_z[i].w);
-		if (f.src_usage[i].x <= 0.0) {
-			continue;
-		}
-		vec3 e = f.src_box[i].xyz;
-		float volume = e.x * e.y * e.z;
-		if (all(lessThanEqual(abs(li), e)) && volume < best_volume) {
-			best = i;
-			best_volume = volume;
-			l = li;
-		}
-	}
-	if (best < 0) {
-		return vec3(0.0);
-	}
-	vec3 e = f.src_box[best].xyz;
-	r_weight = 1.0;
-	float blend = f.src_capture[best].w;
-	if (blend > 0.0) {
-		vec3 axis = min(vec3(blend), e);
-		vec3 b = clamp(1.0 - (abs(l) - e + axis) / axis, 0.0, 1.0);
-		r_weight = pow(b.x * b.y * b.z, 2.0);
-	}
-	vec3 d = normalize(vec3(dot(f.src_x[best].xyz, r), dot(f.src_y[best].xyz, r), dot(f.src_z[best].xyz, r)));
-	if (mod(f.src_box[best].w, 2.0) > 0.5) {
-		vec3 to_max = (e - l) / d;
-		vec3 to_min = (-e - l) / d;
-		vec3 far_side = mix(to_min, to_max, greaterThan(d, vec3(0.0)));
-		d = l + d * min(min(far_side.x, far_side.y), far_side.z) - f.src_offset[best].xyz;
-	}
-	d /= abs(d.x) + abs(d.y) + abs(d.z);
-	vec2 uv = d.z >= 0.0 ? d.xy : (1.0 - abs(d.yx)) * vec2(d.x >= 0.0 ? 1.0 : -1.0, d.y >= 0.0 ? 1.0 : -1.0);
-	uv = (uv * 0.5 + 0.5) * f.src_border.y + f.src_border.x;
-	return textureLod(probe_atlas, vec3(uv, floor(f.src_box[best].w * 0.5)), sqrt(rough) * f.src_border.z).rgb * f.src_offset[best].w * f.src_usage[best].x;
-}
+@PROBE_REFLECTION@
 
 void main() {
 	ivec2 px = ivec2(gl_GlobalInvocationID.xy);
@@ -2063,8 +2137,181 @@ struct FrameData {
 	float trace_settings[4];
 	float polish[4];
 	float jitter[4];
+	float opaque_low[4];
+	float opaque_high[4];
+	float item_trace[4];
 	float hw[4];
 };
+
+// Only bindings and intersection attributes live here. Material math is supplied
+// from the project's one shared source, never copied into the engine module.
+const char *ITEM_SHADING = R"(
+layout(std430, set = 0, binding = 19) restrict readonly buffer ItemMaterials {
+	vec4 v[];
+} item_materials;
+layout(set = 0, binding = 20) uniform sampler2D item_mask_0;
+layout(set = 0, binding = 21) uniform sampler2D item_mask_1;
+layout(set = 0, binding = 22) uniform sampler2D item_mask_2;
+layout(set = 0, binding = 23) uniform sampler2D item_mask_3;
+
+@ITEM_EMISSION@
+
+#ifdef PXTGI_LATTICE
+vec3 item_origin_dx;
+vec3 item_origin_dy;
+vec3 item_direction_dx;
+vec3 item_direction_dy;
+vec3 item_reflected_view_z;
+
+// The same reflected sample, displaced by one final-frame pixel in each axis.
+// Intersect adjacent camera rays with the receiver's tangent plane and keep the
+// current sample's reflection plane; neighbouring random GGX samples are not a
+// derivative. No extra scene rays or depth reads are needed.
+void prepare_item_differentials(vec3 receiver, vec3 direction, vec3 receiver_normal, ivec2 pixel, float depth) {
+	vec3 mirror_normal = normalize(receiver) - direction;
+	mirror_normal = dot(mirror_normal, mirror_normal) > 1e-12 ? normalize(mirror_normal) : receiver_normal;
+	vec3 px = view_from_pixel(vec2(pixel) + vec2(1.0, 0.0), depth, f.proj_info, f.clip.x, f.clip.y);
+	vec3 py = view_from_pixel(vec2(pixel) + vec2(0.0, 1.0), depth, f.proj_info, f.clip.x, f.clip.y);
+	vec3 dx = normalize(px);
+	vec3 dy = normalize(py);
+	float plane = dot(receiver_normal, receiver);
+	float nx = dot(receiver_normal, dx);
+	float ny = dot(receiver_normal, dy);
+	if (abs(nx) > 1e-6) px = dx * (plane / nx);
+	if (abs(ny) > 1e-6) py = dy * (plane / ny);
+	mat3 to_world = mat3(f.view_to_world);
+	item_origin_dx = to_world * (px - receiver);
+	item_origin_dy = to_world * (py - receiver);
+	item_direction_dx = to_world * (reflect(dx, mirror_normal) - direction);
+	item_direction_dy = to_world * (reflect(dy, mirror_normal) - direction);
+	item_reflected_view_z = to_world * reflect(vec3(0.0, 0.0, 1.0), mirror_normal);
+}
+
+vec2 item_uv_delta(vec3 direction, float distance, vec3 normal, vec3 origin_delta, vec3 direction_delta, vec3 gradient_u, vec3 gradient_v, vec2 uv_u, vec2 uv_v) {
+	vec3 adjacent = direction + direction_delta;
+	vec3 delta = origin_delta + distance * direction_delta;
+	float denominator = dot(normal, adjacent);
+	// A derivative grazing the plane has a large footprint, not a missing grid.
+	if (abs(denominator) < 1e-8) denominator = denominator < 0.0 ? -1e-8 : 1e-8;
+	delta -= adjacent * (dot(normal, delta) / denominator);
+	return uv_u * dot(gradient_u, delta) + uv_v * dot(gradient_v, delta);
+}
+
+vec2 item_uv_width(vec3 p0, vec3 p1, vec3 p2, vec2 uv0, vec2 uv1, vec2 uv2, vec3 direction, float distance) {
+	vec3 e1 = p1 - p0;
+	vec3 e2 = p2 - p0;
+	float d00 = dot(e1, e1);
+	float d01 = dot(e1, e2);
+	float d11 = dot(e2, e2);
+	float determinant = d00 * d11 - d01 * d01;
+	if (determinant <= 1e-20) return vec2(0.0);
+	vec3 normal = normalize(cross(e1, e2));
+	vec3 gradient_u = (d11 * e1 - d01 * e2) / determinant;
+	vec3 gradient_v = (d00 * e2 - d01 * e1) / determinant;
+	vec2 uv_u = uv1 - uv0;
+	vec2 uv_v = uv2 - uv0;
+	vec2 dx = item_uv_delta(direction, distance, normal, item_origin_dx, item_direction_dx, gradient_u, gradient_v, uv_u, uv_v);
+	vec2 dy = item_uv_delta(direction, distance, normal, item_origin_dy, item_direction_dy, gradient_u, gradient_v, uv_u, uv_v);
+	return abs(dx) + abs(dy);
+}
+#endif
+
+// RGB is premultiplied contribution; alpha is background coverage. Existing
+// additive materials retain zero coverage and their original emission function.
+vec4 item_crossing(int hit, int triangle, vec2 bary, vec3 direction, float path, float ray_distance) {
+	Primitive q = prims.p[hit];
+	int material = int(-q.albedo.w) - 1;
+	if (material < 0 || material >= int(f.item_trace.x)) {
+		return vec4(0.0);
+	}
+	vec4 header = item_materials.v[material * 4];
+	if ((int(header.z + 0.5) & 4) != 0) {
+		return vec4(0.0);
+	}
+	int attributes = floatBitsToInt(q.shape.w) + triangle * 2;
+	vec4 uv01 = geo.v[attributes];
+	vec4 uv2 = geo.v[attributes + 1];
+	vec3 w = vec3(1.0 - bary.x - bary.y, bary);
+	vec2 uv = uv01.xy * w.x + uv01.zw * w.y + uv2.xy * w.z;
+	int positions = floatBitsToInt(q.shape.z) + triangle * 3;
+	mat3 to_world = inverse(transpose(mat3(q.r0.xyz, q.r1.xyz, q.r2.xyz)));
+	vec3 p0 = to_world * geo.v[positions].xyz;
+	vec3 p1 = to_world * geo.v[positions + 1].xyz;
+	vec3 p2 = to_world * geo.v[positions + 2].xyz;
+	vec3 normal = cross(p1 - p0, p2 - p0);
+	float facing = dot(normal, normal) > 1e-14 ? abs(dot(normalize(normal), direction)) : 1.0;
+	if (int(header.y + 0.5) == 7) {
+#ifdef PXTGI_LATTICE
+		int auxiliary = int(header.w + 0.5);
+		if (auxiliary < 0 || auxiliary >= int(f.item_trace.x)) return vec4(0.0);
+		vec4 d = item_materials.v[auxiliary * 4];
+		vec4 e = item_materials.v[auxiliary * 4 + 1];
+		vec3 local_hit = geo.v[positions].xyz * w.x + geo.v[positions + 1].xyz * w.y + geo.v[positions + 2].xyz * w.z;
+		vec3 world_hit = to_world * (local_hit - vec3(q.r0.w, q.r1.w, q.r2.w));
+		float vertex_red = dot(vec3(geo.v[positions].w, geo.v[positions + 1].w, geo.v[positions + 2].w), w);
+		float along = dot(local_hit, d.xyz);
+		float nearer = dot(item_reflected_view_z, world_hit - e.xyz);
+		vec2 width = item_uv_width(p0, p1, p2, uv01.xy, uv01.zw, uv2.xy, direction, ray_distance);
+		vec4 lattice = lightriders_lattice(item_materials.v[material * 4 + 1], item_materials.v[material * 4 + 2], item_materials.v[material * 4 + 3], d, e, uv, width, along, vertex_red, facing, nearer);
+		float coverage = clamp(lattice.a, 0.0, 1.0);
+		// Lattice is unshaded blend_mix and does not read hero_emission.
+		return vec4(lattice.rgb * coverage, coverage);
+#else
+		return vec4(0.0);
+#endif
+	}
+	bool second = uv2.z > 0.5;
+	float across = second ? (-w.x + w.y + w.z) : (-w.x - w.y + w.z);
+	float half_width = 0.5 * (second ? distance(p0, p2) : distance(p1, p2));
+	float mask = 0.0;
+	if (int(header.y + 0.5) == 4 && header.w >= -0.5) {
+		int slot = int(header.w + 0.5);
+		if (slot == 0) mask = textureLod(item_mask_0, uv, 2.0).r;
+		if (slot == 1) mask = textureLod(item_mask_1, uv, 2.0).r;
+		if (slot == 2) mask = textureLod(item_mask_2, uv, 2.0).r;
+		if (slot == 3) mask = textureLod(item_mask_3, uv, 2.0).r;
+	}
+	float pixel_angle = abs(f.proj_info.y);
+	float cone = pixel_angle * f.polish.w * path;
+	float line_min_half = pixel_angle * float(f.sizes.y) / 1080.0 * 0.75 * path;
+	return vec4(lightriders_item_emission(header, item_materials.v[material * 4 + 1], item_materials.v[material * 4 + 2], item_materials.v[material * 4 + 3], uv, across, half_width, facing, cone, f.item_trace.y, line_min_half, mask), 0.0);
+}
+
+vec3 item_background(vec3 direction, float roughness) {
+	if (f.sky.w <= 0.0) {
+		return f.sky_flat.rgb;
+	}
+	vec3 sky_direction = vec3(dot(f.sky_x.xyz, direction), dot(f.sky_y.xyz, direction), dot(f.sky_z.xyz, direction));
+	float level = sqrt(roughness) * f.sky.x;
+#ifdef SKY_OCTMAP_ARRAY
+	float lower = floor(level);
+	vec2 uv = sky_oct(sky_direction);
+	vec3 a = textureLod(sky_tex, vec3(uv, lower), 0.0).rgb;
+	vec3 b = textureLod(sky_tex, vec3(uv, min(lower + 1.0, f.sky.x)), 0.0).rgb;
+	return mix(a, b, fract(level)) * f.sky.w;
+#else
+	return textureLod(sky_tex, sky_oct(sky_direction), level).rgb * f.sky.w;
+#endif
+}
+)";
+
+String pass_source(const char *p_shader, bool p_reflection, bool p_hardware, const String &p_items = String()) {
+	const String defines = RendererSceneRenderRD::get_singleton()->is_using_radiance_octmap_array() ? "#define SKY_OCTMAP_ARRAY\n" : "";
+	String source = String(p_shader).replace("@WORLD@", WORLD).replace("@COMMON@", defines + COMMON).replace("@PROBE_REFLECTION@", PROBE_REFLECTION).replace("@ITEMS@", p_items.is_empty() ? String() : String(ITEM_SHADING).replace("@ITEM_EMISSION@", p_items));
+	if (p_reflection) {
+		// GI continues to read the full raster scene; only reflection source validity
+		// and its mip count follow the matching filtered-source publication.
+		source = source.replace("f.trace_settings.z", "f.item_trace.z").replace("f.polish.z", "f.item_trace.w");
+	}
+	String version = p_hardware ? "#version 460\n#extension GL_EXT_ray_query : require\n#define PXTGI_HW\n" : "#version 450\n";
+	if (!p_items.is_empty()) {
+		version += "#define PXTGI_ITEMS\n";
+		if (p_items.contains("lightriders_lattice")) {
+			version += "#define PXTGI_LATTICE\n";
+		}
+	}
+	return source.replace("#version 450\n", version);
+}
 
 void projection_info(const Projection &p_projection, const Size2i &p_size, float *r_info) {
 	r_info[0] = -2.0f / (p_size.x * p_projection.columns[0][0]);
@@ -2080,6 +2327,7 @@ Ref<PhysXGISourceEffect> shared_source;
 } // namespace
 
 PhysXGISourceEffect::PhysXGISourceEffect() {
+	set_needs_separate_transparency(true);
 	set_effect_callback_type(EFFECT_CALLBACK_TYPE_POST_TRANSPARENT);
 	RenderingServer::get_singleton()->compositor_effect_set_callback(get_rid(), RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_POST_TRANSPARENT, callable_mp(this, &PhysXGISourceEffect::_render));
 }
@@ -2148,6 +2396,7 @@ void PhysXGISourceEffect::_render(int p_callback_type, const RenderData *p_rende
 		copy->make_mipmap(view->source_levels[m - 1], view->source_levels[m], level_size);
 	}
 	view->source_frame = RSG::rasterizer->get_frame_number();
+	view->source_policy = view->requested_source_policy;
 }
 
 void PhysXGIEffect::set_settings(const ObjectID &p_node, const Snapshot &p_snapshot) {
@@ -2215,7 +2464,16 @@ PhysXGIEffect::~PhysXGIEffect() {
 			}
 		}
 		_hw_free(rd);
-		for (RID r : { linear_sampler, mip_sampler, nearest_sampler, data_buffer, primitive_buffer, node_buffer, cache_keys, cache_cells, geometry_buffer, blue_noise }) {
+		for (const KeyValue<String, ItemPipelines> &source : item_pipelines) {
+			for (int mode = 0; mode < 2; mode++) {
+				for (RID rid : { source.value.pipeline[mode], source.value.shader[mode] }) {
+					if (rid.is_valid()) {
+						rd->free_rid(rid);
+					}
+				}
+			}
+		}
+		for (RID r : { item_mask_sampler, item_material_buffer, linear_sampler, mip_sampler, nearest_sampler, data_buffer, primitive_buffer, node_buffer, cache_keys, cache_cells, geometry_buffer, blue_noise }) {
 			if (r.is_valid()) {
 				rd->free_rid(r);
 			}
@@ -2272,6 +2530,7 @@ void PhysXGIEffect::_hw_free(RenderingDevice *p_rd) {
 	}
 	hw_static_tlas = RID();
 	hw_moving_tlas = RID();
+	hw_moving_instances.clear();
 	hw_box_blas = RID();
 	hw_box_vertices = RID();
 	hw_moving_capacity = 0;
@@ -2349,11 +2608,10 @@ void main() {
 
 // The passes that trace the world, compiled again with ray queries.
 bool PhysXGIEffect::_hw_compile(RenderingDevice *p_rd) {
-	const String defines = RendererSceneRenderRD::get_singleton()->is_using_radiance_octmap_array() ? "#define SKY_OCTMAP_ARRAY\n" : "";
 	for (int i : { PASS_TRACE, PASS_REFLECT, PASS_CACHE }) {
 		Ref<RDShaderFile> file;
 		file.instantiate();
-		const String source = String(SHADERS[i]).replace("@WORLD@", WORLD).replace("@COMMON@", defines + COMMON).replace("#version 450\n", "#version 460\n#extension GL_EXT_ray_query : require\n#define PXTGI_HW\n");
+		const String source = pass_source(SHADERS[i], i == PASS_REFLECT, true);
 		file->parse_versions_from_text(source);
 		Ref<RDShaderSPIRV> spirv = file->get_spirv();
 		const String err = spirv.is_valid() ? spirv->get_stage_compile_error(RD::SHADER_STAGE_COMPUTE) : file->get_base_error();
@@ -2388,7 +2646,7 @@ bool PhysXGIEffect::_hw_instance(const Snapshot &p_snapshot, int p_slot, const T
 	}
 	r_instance.transform = to_world;
 	r_instance.id = uint32_t(p_slot);
-	r_instance.mask = 0xFF;
+	r_instance.mask = r[19] < 0.0f ? 2 : 1;
 	// RenderingDevice wants a hit shader table range on every instance, though a ray query uses none: offset 0, count 1.
 	r_instance.hit_sbt_range = RD::HitShaderBindingTableRange(uint64_t(1) << 32);
 	r_instance.flags = RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT | RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT;
@@ -2563,7 +2821,9 @@ bool PhysXGIEffect::_hw_update(RenderingDevice *p_rd, const Snapshot &p_snapshot
 	// The moving shapes, every frame (bikes, riders' walls).
 	const uint64_t moving_since = OS::get_singleton()->get_ticks_usec();
 	const int moving = p_snapshot.primitive_count - p_snapshot.static_count;
-	LocalVector<RD::AccelerationStructureInstance> instances;
+	hw_moving_count = moving;
+	const bool timing = rt_timing();
+	LocalVector<RD::AccelerationStructureInstance> &instances = hw_moving_instances;
 	instances.resize(MAX(moving, 1));
 	for (int i = 0; i < moving; i++) {
 		if (!_hw_instance(p_snapshot, p_snapshot.static_count + i, p_worlds[p_snapshot.static_count + i], instances[i])) {
@@ -2572,10 +2832,13 @@ bool PhysXGIEffect::_hw_update(RenderingDevice *p_rd, const Snapshot &p_snapshot
 		}
 	}
 	if (moving == 0) {
+		instances[0] = RD::AccelerationStructureInstance();
 		instances[0].blas = hw_box_blas;
 		instances[0].mask = 0;
 		instances[0].hit_sbt_range = RD::HitShaderBindingTableRange(uint64_t(1) << 32);
 	}
+	const uint64_t instances_ready = timing ? OS::get_singleton()->get_ticks_usec() : 0;
+	hw_moving_instances_us = timing ? instances_ready - moving_since : 0;
 	if (instances.size() > hw_moving_capacity) {
 		if (hw_moving_tlas.is_valid()) {
 			p_rd->free_rid(hw_moving_tlas);
@@ -2586,9 +2849,37 @@ bool PhysXGIEffect::_hw_update(RenderingDevice *p_rd, const Snapshot &p_snapshot
 		hw_moving_tlas = p_rd->tlas_create(hw_moving_capacity, RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT);
 		ERR_FAIL_COND_V(!hw_moving_tlas.is_valid(), false);
 	}
+	const uint64_t submit_since = timing ? OS::get_singleton()->get_ticks_usec() : 0;
+	hw_moving_create_us = timing ? submit_since - instances_ready : 0;
 	ERR_FAIL_COND_V(p_rd->tlas_build(hw_moving_tlas, Span<RD::AccelerationStructureInstance>(instances.ptr(), instances.size())) != OK, false);
-	hw_moving_us = OS::get_singleton()->get_ticks_usec() - moving_since;
+	const uint64_t moving_done = OS::get_singleton()->get_ticks_usec();
+	hw_moving_us = moving_done - moving_since;
+	hw_moving_submit_us = timing ? moving_done - submit_since : 0;
 	hw_failed = false;
+	return true;
+}
+
+bool PhysXGIEffect::_ensure_item_pipeline(RenderingDevice *p_rd, const String &p_source, bool p_hardware) {
+	ItemPipelines &variants = item_pipelines[p_source];
+	const int mode = p_hardware ? 1 : 0;
+	if (!variants.attempted[mode]) {
+		variants.attempted[mode] = true;
+		Ref<RDShaderFile> file;
+		file.instantiate();
+		const String source = pass_source(SHADERS[PASS_REFLECT], true, p_hardware, p_source);
+		ERR_FAIL_COND_V_MSG(file->parse_versions_from_text(source) != OK, false, "PXTGI: item reflection shader failed to parse.");
+		Ref<RDShaderSPIRV> spirv = file->get_spirv();
+		ERR_FAIL_COND_V(spirv.is_null(), false);
+		const String error = spirv->get_stage_compile_error(RD::SHADER_STAGE_COMPUTE);
+		ERR_FAIL_COND_V_MSG(!error.is_empty(), false, vformat("PXTGI: item reflection shader: %s", error.get_slice("\n\nStage", 0)));
+		variants.shader[mode] = p_rd->shader_create_from_spirv(file->get_spirv_stages());
+		ERR_FAIL_COND_V(variants.shader[mode].is_null(), false);
+		variants.pipeline[mode] = p_rd->compute_pipeline_create(variants.shader[mode]);
+	}
+	if (variants.pipeline[mode].is_null()) {
+		return false;
+	}
+	active_item_pipelines = &variants;
 	return true;
 }
 
@@ -2605,8 +2896,7 @@ bool PhysXGIEffect::_ensure(RenderingDevice *p_rd) {
 		file.instantiate();
 		// The sky's radiance map is an array (a layer per roughness) or one texture (a mip per roughness), as the project
 		// sets it for Godot's own shaders.
-		const String defines = RendererSceneRenderRD::get_singleton()->is_using_radiance_octmap_array() ? "#define SKY_OCTMAP_ARRAY\n" : "";
-		const String source = String(SHADERS[i]).replace("@WORLD@", WORLD).replace("@COMMON@", defines + COMMON);
+		const String source = pass_source(SHADERS[i], i == PASS_REFLECT, false);
 		ERR_FAIL_COND_V_MSG(file->parse_versions_from_text(source) != OK, false, vformat("PhysXGI: %s shader failed to parse.", PASS_NAMES[i]));
 		Ref<RDShaderSPIRV> spirv = file->get_spirv();
 		ERR_FAIL_COND_V(spirv.is_null(), false);
@@ -2625,6 +2915,13 @@ bool PhysXGIEffect::_ensure(RenderingDevice *p_rd) {
 	linear_sampler = p_rd->sampler_create(state);
 	state.mip_filter = RD::SAMPLER_FILTER_LINEAR; // a probe's capture, between its roughness levels
 	mip_sampler = p_rd->sampler_create(state);
+	state.repeat_u = RD::SAMPLER_REPEAT_MODE_REPEAT;
+	state.repeat_v = RD::SAMPLER_REPEAT_MODE_REPEAT;
+	state.repeat_w = RD::SAMPLER_REPEAT_MODE_REPEAT;
+	item_mask_sampler = p_rd->sampler_create(state);
+	state.repeat_u = RD::SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE;
+	state.repeat_v = RD::SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE;
+	state.repeat_w = RD::SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE;
 	state.mip_filter = RD::SAMPLER_FILTER_NEAREST;
 	state.mag_filter = RD::SAMPLER_FILTER_NEAREST;
 	state.min_filter = RD::SAMPLER_FILTER_NEAREST;
@@ -2709,6 +3006,8 @@ void PhysXGIView::free_data() {
 	targets_for = Size2i();
 	source_size = Size2i();
 	source_frame = UINT64_MAX;
+	source_policy = 0;
+	requested_source_policy = 0;
 	have_history = false;
 }
 
@@ -2769,13 +3068,15 @@ void PhysXGIEffect::_dispatch(RenderingDevice *p_rd, int p_pass, const Vector<RD
 		uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_ACCELERATION_STRUCTURE, 15, hw_static_tlas));
 		uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_ACCELERATION_STRUCTURE, 16, hw_moving_tlas));
 	}
-	const RID shader = hw ? hw_shaders[p_pass] : shaders[p_pass];
+	const bool item_pass = p_pass == PASS_REFLECT && active_item_pipelines;
+	const RID shader = item_pass ? active_item_pipelines->shader[hw ? 1 : 0] : (hw ? hw_shaders[p_pass] : shaders[p_pass]);
+	const RID pipeline = item_pass ? active_item_pipelines->pipeline[hw ? 1 : 0] : (hw ? hw_pipelines[p_pass] : pipelines[p_pass]);
 	const RID set = UniformSetCacheRD::get_singleton()->get_cache_vec(shader, 0, uniforms);
 	ERR_FAIL_COND(!set.is_valid());
 	// GPU timestamps per pass (the visual profiler shows them).
 	p_rd->capture_timestamp(String("PXTGI ") + PASS_NAMES[p_pass]);
 	const RD::ComputeListID list = p_rd->compute_list_begin();
-	p_rd->compute_list_bind_compute_pipeline(list, hw ? hw_pipelines[p_pass] : pipelines[p_pass]);
+	p_rd->compute_list_bind_compute_pipeline(list, pipeline);
 	p_rd->compute_list_bind_uniform_set(list, set, 0);
 	if (p_push_size > 0) {
 		p_rd->compute_list_set_push_constant(list, p_push, p_push_size);
@@ -2791,6 +3092,10 @@ void PhysXGIEffect::_render(int p_callback_type, const RenderData *p_render_data
 	const uint64_t gap = rt_last_us > 0 ? since - rt_last_us : 0;
 	hw_static_us = 0;
 	hw_moving_us = 0;
+	hw_moving_instances_us = 0;
+	hw_moving_create_us = 0;
+	hw_moving_submit_us = 0;
+	hw_moving_count = 0;
 	hw_update_us = 0;
 	motion_update_us = 0;
 	geometry_update_us = 0;
@@ -2799,7 +3104,7 @@ void PhysXGIEffect::_render(int p_callback_type, const RenderData *p_render_data
 	const uint64_t now = OS::get_singleton()->get_ticks_usec();
 	rt_last_us = now;
 	if (rt_timing() && (now - since > 8000 || gap > 40000)) {
-		print_line(vformat("PXTGI_RT frame %d: since last frame %.1f ms, GI recording %.1f ms (hardware update %.1f: static %.1f, moving %.1f), motion %.1f ms, geometry %.1f ms (%d KiB)", int64_t(Engine::get_singleton()->get_frames_drawn()), gap / 1000.0, (now - since) / 1000.0, hw_update_us / 1000.0, hw_static_us / 1000.0, hw_moving_us / 1000.0, motion_update_us / 1000.0, geometry_update_us / 1000.0, int64_t(geometry_update_bytes / 1024)));
+		print_line(vformat("PXTGI_RT frame %d: since last frame %.1f ms, GI recording %.1f ms (hardware update %.1f: static %.1f, moving %.1f), motion %.1f ms, geometry %.1f ms (%d KiB); moving detail %d shapes: instances %.2f ms, TLAS create %.2f ms, submit %.2f ms", int64_t(Engine::get_singleton()->get_frames_drawn()), gap / 1000.0, (now - since) / 1000.0, hw_update_us / 1000.0, hw_static_us / 1000.0, hw_moving_us / 1000.0, motion_update_us / 1000.0, geometry_update_us / 1000.0, int64_t(geometry_update_bytes / 1024), hw_moving_count, hw_moving_instances_us / 1000.0, hw_moving_create_us / 1000.0, hw_moving_submit_us / 1000.0));
 	}
 }
 
@@ -2838,10 +3143,12 @@ void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_rende
 		primitives_uploaded = UINT64_MAX;
 		geometry_uploaded = UINT64_MAX;
 		geometry_offsets.clear();
+		geometry_descriptors.clear();
 		_hw_free(rd);
 		rd->buffer_clear(cache_keys, 0, CACHE_SLOTS * sizeof(uint32_t));
 		rd->buffer_clear(cache_cells, 0, CACHE_SLOTS * 5 * 4 * sizeof(float));
 	}
+	buffers->request_reflection_source(s.reflection_source_policy);
 	// Godot's GI step makes the buffers on its first run: nothing to write into until then.
 	static const StringName gi_scope = "rbgi", ambient_name = "ambient", reflection_name = "reflection";
 	static const StringName clustered_scope = "forward_clustered", normal_name = "normal_roughness";
@@ -2874,6 +3181,14 @@ void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_rende
 	// buffer itself (still last frame's image: the opaque pass hasn't run yet), which holds them.
 	const bool from_source = v.source.is_valid() && v.source_frame + 1 == RSG::rasterizer->get_frame_number();
 	const RID color = from_source ? v.source : buffers->get_internal_texture();
+	// The renderer keeps the previous filtered source until this frame's transparent
+	// replay. A zero visible-item count still requires matching source membership.
+	const uint64_t source_policy = s.reflection_source_policy;
+	const bool reflection_source_valid = !s.reflection_items_configured ||
+			(from_source && v.source_policy == source_policy && buffers->get_reflection_source_frame() == v.source_frame && buffers->get_reflection_source_policy() == source_policy);
+	const bool filtered_source = reflection_source_valid && from_source && buffers->has_filtered_reflection_source() && buffers->has_texture(clustered_scope, "reflection_source");
+	const RID reflection_color = filtered_source ? buffers->get_texture(clustered_scope, "reflection_source") : color;
+	v.requested_source_policy = source_policy;
 
 	const Transform3D cam_transform = scene->get_cam_transform();
 	// The depth/normal prepass is jittered by TAA/FSR2. Strip only the depth and raster-Y
@@ -2948,7 +3263,7 @@ void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_rende
 		const bool unchanged_pose = cached && cached->local == local;
 		const Transform3D world = unchanged_pose ? cached->world : local.affine_inverse();
 		worlds[i] = world;
-		const Transform3D *previous = v.have_history && cached && cached->generation == identity.second ? &cached->world : nullptr;
+		const Transform3D *previous = v.have_history && identity.second != UINT64_MAX && cached && cached->generation == identity.second ? &cached->world : nullptr;
 		// New shapes and teleports cannot supply trustworthy reflection history.
 		const bool valid = previous && previous->origin.distance_squared_to(world.origin) < 400.0f;
 		const Transform3D delta = valid && !unchanged_pose ? *previous * local : Transform3D();
@@ -2985,8 +3300,15 @@ void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_rende
 				i++;
 			}
 		}
-	} else {
-		for (uint64_t id : v.previous_moving_shapes) {
+	} else if (v.previous_moving_shapes.size() != current_moving_shapes.size() ||
+			(!current_moving_shapes.is_empty() && memcmp(v.previous_moving_shapes.ptr(), current_moving_shapes.ptr(), current_moving_shapes.size() * sizeof(uint64_t)) != 0)) {
+		// Identical IDs were all marked above; there cannot be a retired moving leaf.
+		for (uint32_t i = 0; i < v.previous_moving_shapes.size(); i++) {
+			const uint64_t id = v.previous_moving_shapes[i];
+			// Appended walls do not require looking up every unchanged predecessor.
+			if (i < current_moving_shapes.size() && id == current_moving_shapes[i]) {
+				continue;
+			}
 			const PhysXGIView::ShapeHistory *cached = v.get_shape_history(id);
 			if (cached && !cached->is_static && cached->seen_frame != motion_frame) {
 				v.erase_shape_history(id);
@@ -3124,7 +3446,7 @@ void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_rende
 				}
 				const RID probe = light_storage->reflection_probe_instance_get_probe(instance);
 				Transform3D xf;
-				if (!light_storage->reflection_probe_instance_get_captured_transform(instance, xf)) {
+				if ((s.reflection_items_configured && light_storage->reflection_probe_instance_get_captured_source_policy(instance) != s.reflection_source_policy) || !light_storage->reflection_probe_instance_get_captured_transform(instance, xf)) {
 					continue;
 				}
 				const Transform3D to_box = xf.affine_inverse();
@@ -3226,6 +3548,15 @@ void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_rende
 	data.trace_settings[1] = s.filtered_reflections ? 1.0f : 0.0f;
 	data.trace_settings[2] = v.have_history ? 1.0f : 0.0f;
 	data.trace_settings[3] = s.reflection_softness;
+	for (int axis = 0; axis < 3; axis++) {
+		data.opaque_low[axis] = s.opaque_world_bounds.position[axis];
+		data.opaque_high[axis] = s.opaque_world_bounds.position[axis] + s.opaque_world_bounds.size[axis];
+	}
+	data.opaque_low[3] = s.have_opaque_world_bounds ? 1.0f : 0.0f;
+	data.item_trace[0] = float(s.item_materials.size() / 16);
+	data.item_trace[1] = s.item_hero;
+	data.item_trace[2] = v.have_history && reflection_source_valid ? 1.0f : 0.0f;
+	data.item_trace[3] = s.filtered_hits && from_source ? float(filtered_source ? rd->texture_get_format(reflection_color).mipmaps : v.source_levels.size()) : 0.0f;
 	data.polish[0] = s.blue_noise ? 1.0f : 0.0f;
 	data.polish[1] = s.gi_history_clamp ? 1.0f : 0.0f;
 	data.polish[2] = s.filtered_hits && from_source ? float(v.source_levels.size()) : 0.0f;
@@ -3279,6 +3610,15 @@ void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_rende
 		data.omni_color[i][3] = s.omni_attenuation[i];
 		data.omni_indirect[i / 4][i % 4] = s.omni_indirect[i];
 	}
+	active_item_pipelines = nullptr;
+	if (!s.item_shader.is_empty()) {
+		// Loading can supply the shared shader before any item is visible. Keep
+		// each compiled source alive across worlds and inactive pool frames.
+		ERR_FAIL_COND(!_ensure_item_pipeline(rd, s.item_shader, hw_active));
+		if (s.item_count == 0) {
+			active_item_pipelines = nullptr;
+		}
+	}
 	rd->buffer_update(data_buffer, 0, sizeof(data), &data);
 
 	// The shapes, grown as needed (an empty buffer can't be bound: at least one); sent only when they changed.
@@ -3315,31 +3655,74 @@ void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_rende
 		// geometry beside it. Preserve the buffer and all unchanged block ranges.
 		const uint32_t required = MAX(s.geometry_floats, 4);
 		if (geometry_buffer.is_null() || required > geometry_capacity) {
+			geometry_uploaded = UINT64_MAX;
+			geometry_offsets.clear();
+			geometry_descriptors.clear();
 			if (geometry_buffer.is_valid()) {
 				rd->free_rid(geometry_buffer);
 			}
 			geometry_capacity = Math::next_power_of_2(required);
 			geometry_buffer = rd->storage_buffer_create(geometry_capacity * sizeof(float));
 			ERR_FAIL_COND(geometry_buffer.is_null());
-			geometry_offsets.clear();
 		}
-		HashMap<uint64_t, int> current_offsets;
-		for (const GeometryUpload &block : s.geometry) {
+		// PXTGI publishes each immutable revision key once. Unchanged positions
+		// need no hashing; old keys at changed/trimmed positions can survive only
+		// at another changed position in this complete snapshot.
+		thread_local HashSet<uint64_t> live_geometry_keys;
+		thread_local LocalVector<uint64_t> retired_geometry_keys;
+		thread_local LocalVector<Pair<uint64_t, int>> next_geometry_descriptors;
+		live_geometry_keys.clear();
+		retired_geometry_keys.clear();
+		const uint32_t count = s.geometry.size();
+		const uint32_t retained = geometry_descriptors.size();
+		next_geometry_descriptors.resize_uninitialized(count);
+		for (uint32_t i = 0; i < count; i++) {
+			const GeometryUpload &block = s.geometry[i];
+			next_geometry_descriptors[i] = { block.key, block.offset };
+			const bool same_key = i < retained && geometry_descriptors[i].first == block.key;
+			if (same_key && geometry_descriptors[i].second == block.offset) {
+				continue;
+			}
+			if (!same_key) {
+				live_geometry_keys.insert(block.key);
+				if (i < retained) {
+					retired_geometry_keys.push_back(geometry_descriptors[i].first);
+				}
+			}
 			const int *uploaded = geometry_offsets.getptr(block.key);
 			if (uploaded == nullptr || *uploaded != block.offset) {
 				uint32_t offset = block.offset * sizeof(float);
-				for (const Vector<float> *part : { &block.planes, &block.nodes, &block.triangles }) {
+				for (const Vector<float> *part : { &block.planes, &block.nodes, &block.triangles, &block.attributes }) {
 					const uint32_t bytes = part->size() * sizeof(float);
 					if (bytes > 0) {
-						ERR_FAIL_COND(rd->buffer_update(geometry_buffer, offset, bytes, part->ptr()) != OK);
+						const Error upload_error = rd->buffer_update(geometry_buffer, offset, bytes, part->ptr());
+						if (upload_error != OK) {
+							// Partial writes can overlap old ranges. Retry all blocks even if
+							// another snapshot replaces this failed publication before retry.
+							geometry_offsets.clear();
+							geometry_descriptors.clear();
+							geometry_uploaded = UINT64_MAX;
+						}
+						ERR_FAIL_COND(upload_error != OK);
 						geometry_update_bytes += bytes;
 						offset += bytes;
 					}
 				}
+				// Preserve unchanged entries and record only complete block uploads.
+				geometry_offsets.insert(block.key, block.offset);
 			}
-			current_offsets.insert(block.key, block.offset);
 		}
-		geometry_offsets = current_offsets;
+		for (uint32_t i = count; i < retained; i++) {
+			retired_geometry_keys.push_back(geometry_descriptors[i].first);
+		}
+		for (uint64_t key : retired_geometry_keys) {
+			if (!live_geometry_keys.has(key)) {
+				geometry_offsets.erase(key);
+			}
+		}
+		// A failed upload returned above with both caches invalidated. Commit the
+		// descriptor order only after every block and retirement succeeded.
+		SWAP(geometry_descriptors, next_geometry_descriptors);
 		geometry_uploaded = s.geometry_version;
 	}
 	geometry_update_us = OS::get_singleton()->get_ticks_usec() - geometry_since;
@@ -3370,8 +3753,33 @@ void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_rende
 
 	{
 		int32_t size[4] = { v.reflect_size.x, v.reflect_size.y, 0, 0 };
-		_dispatch(rd, PASS_REFLECT, { sampled(0, nearest_sampler, depth), sampled(1, nearest_sampler, normal), sampled(2, mip_sampler, color), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 3, v.reflect_trace), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 4, primitive_buffer), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 5, node_buffer), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 6, cache_keys), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 7, cache_cells), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 10, geometry_buffer), sampled(11, linear_sampler, sky_map), sampled(12, linear_sampler, probe_atlas), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 13, v.reflect_hit), sampled(14, nearest_sampler, blue_noise), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 17, v.primitive_motion), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 18, v.reflect_motion) }, v.reflect_size, size, sizeof(size));
-		size[2] = v.have_history ? 1 : 0;
+		Vector<RD::Uniform> reflection_uniforms = { sampled(0, nearest_sampler, depth), sampled(1, nearest_sampler, normal), sampled(2, mip_sampler, reflection_color), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 3, v.reflect_trace), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 4, primitive_buffer), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 5, node_buffer), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 6, cache_keys), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 7, cache_cells), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 10, geometry_buffer), sampled(11, linear_sampler, sky_map), sampled(12, linear_sampler, probe_atlas), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 13, v.reflect_hit), sampled(14, nearest_sampler, blue_noise), RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 17, v.primitive_motion), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 18, v.reflect_motion) };
+		if (active_item_pipelines) {
+			const uint32_t required = MAX(s.item_materials.size(), 16);
+			if (item_material_buffer.is_null() || item_material_capacity < required) {
+				if (item_material_buffer.is_valid()) {
+					rd->free_rid(item_material_buffer);
+				}
+				item_material_capacity = Math::next_power_of_2(required);
+				item_material_buffer = rd->storage_buffer_create(item_material_capacity * sizeof(float));
+				ERR_FAIL_COND(item_material_buffer.is_null());
+			}
+			if (!s.item_materials.is_empty()) {
+				ERR_FAIL_COND(rd->buffer_update(item_material_buffer, 0, s.item_materials.size() * sizeof(float), s.item_materials.ptr()) != OK);
+			}
+			reflection_uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 19, item_material_buffer));
+			RendererRD::TextureStorage *textures = RendererRD::TextureStorage::get_singleton();
+			for (int mask = 0; mask < 4; mask++) {
+				const Ref<Texture2D> texture = mask < s.item_masks.size() ? Ref<Texture2D>(s.item_masks[mask]) : Ref<Texture2D>();
+				RID texture_rd = texture.is_valid() ? textures->texture_get_rd_texture(texture->get_rid()) : RID();
+				if (texture_rd.is_null()) {
+					texture_rd = textures->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK);
+				}
+				reflection_uniforms.push_back(sampled(20 + mask, item_mask_sampler, texture_rd));
+			}
+		}
+		_dispatch(rd, PASS_REFLECT, reflection_uniforms, v.reflect_size, size, sizeof(size));
+		size[2] = v.have_history && reflection_source_valid ? 1 : 0;
 		_dispatch(rd, PASS_REFLECT_TEMPORAL, { sampled(0, nearest_sampler, v.reflect_trace), sampled(1, linear_sampler, v.reflect_accum[prev]), sampled(2, nearest_sampler, v.reflect_depth[prev]), sampled(3, nearest_sampler, depth), sampled(4, nearest_sampler, normal), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 5, v.reflect_accum[v.current]), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 6, v.reflect_depth[v.current]), sampled(7, nearest_sampler, v.reflect_hit), sampled(8, linear_sampler, v.reflect_info[prev]), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 10, v.reflect_info[v.current]), sampled(11, nearest_sampler, v.reflect_motion) }, v.reflect_size, size, sizeof(size));
 	}
 

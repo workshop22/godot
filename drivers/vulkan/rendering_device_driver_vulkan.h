@@ -131,6 +131,7 @@ class RenderingDeviceDriverVulkan : public RenderingDeviceDriver {
 		PFN_vkCreateAccelerationStructureKHR CreateAccelerationStructureKHR = nullptr;
 		PFN_vkDestroyAccelerationStructureKHR DestroyAccelerationStructureKHR = nullptr;
 		PFN_vkGetAccelerationStructureBuildSizesKHR GetAccelerationStructureBuildSizesKHR = nullptr;
+		PFN_vkGetAccelerationStructureDeviceAddressKHR GetAccelerationStructureDeviceAddressKHR = nullptr;
 		PFN_vkCmdBuildAccelerationStructuresKHR CmdBuildAccelerationStructuresKHR = nullptr;
 		PFN_vkCreateRayTracingPipelinesKHR CreateRaytracingPipelinesKHR = nullptr;
 		PFN_vkGetRayTracingShaderGroupHandlesKHR GetRayTracingShaderGroupHandlesKHR = nullptr;
@@ -708,6 +709,7 @@ public:
 
 	struct AccelerationStructureInfo {
 		VkAccelerationStructureKHR vk_acceleration_structure = VK_NULL_HANDLE;
+		VkDeviceAddress device_address = 0;
 		// Buffer used for the structure
 		RDD::BufferID buffer;
 
