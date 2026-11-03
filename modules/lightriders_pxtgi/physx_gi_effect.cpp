@@ -2531,6 +2531,7 @@ void PhysXGIEffect::_hw_free(RenderingDevice *p_rd) {
 	hw_static_tlas = RID();
 	hw_moving_tlas = RID();
 	hw_moving_instances.clear();
+	hw_previous_primitive_keys.clear();
 	hw_box_blas = RID();
 	hw_box_vertices = RID();
 	hw_moving_capacity = 0;
@@ -2660,6 +2661,10 @@ static bool rt_timing() {
 
 // Brings the structures up to date for this frame; false (and software from then on) when anything fails.
 bool PhysXGIEffect::_hw_update(RenderingDevice *p_rd, const Snapshot &p_snapshot, const Vector<Transform3D> &p_worlds) {
+	// Only a successful build restores reuse validity. Every early return leaves
+	// it empty, even if this attempt already retired meshes or wrote some instances.
+	Vector<uint64_t> previous_keys;
+	SWAP(previous_keys, hw_previous_primitive_keys);
 	if (hw_failed) {
 		return false;
 	}
@@ -2725,9 +2730,10 @@ bool PhysXGIEffect::_hw_update(RenderingDevice *p_rd, const Snapshot &p_snapshot
 		print_line(vformat("PXTGI: hardware tracing on (%s).", p_rd->get_device_name()));
 	}
 	// A structure for each mesh not seen before (its triangles as laid out in its geometry block: 16 bytes a corner).
-	if (p_snapshot.blocks_version != hw_blocks_version) {
+	const bool blocks_changed = p_snapshot.blocks_version != hw_blocks_version;
+	HashSet<uint64_t> live;
+	if (blocks_changed) {
 		hw_blocks_version = p_snapshot.blocks_version;
-		HashSet<uint64_t> live;
 		for (uint64_t key : p_snapshot.block_keys) {
 			live.insert(key);
 		}
@@ -2824,10 +2830,27 @@ bool PhysXGIEffect::_hw_update(RenderingDevice *p_rd, const Snapshot &p_snapshot
 	hw_moving_count = moving;
 	const bool timing = rt_timing();
 	LocalVector<RD::AccelerationStructureInstance> &instances = hw_moving_instances;
+	const uint32_t previous_instance_count = instances.size();
 	instances.resize(MAX(moving, 1));
 	for (int i = 0; i < moving; i++) {
-		if (!_hw_instance(p_snapshot, p_snapshot.static_count + i, p_worlds[p_snapshot.static_count + i], instances[i])) {
-			print_line(vformat("PXTGI: moving shape %d has no hardware structure; tracing stays in software.", p_snapshot.static_count + i));
+		const int slot = p_snapshot.static_count + i;
+		const float *record = p_snapshot.primitives.ptr() + slot * PRIMITIVE_FLOATS;
+		if (uint32_t(i) < previous_instance_count && int(record[12] + 0.5f) == 5 && slot < previous_keys.size() && slot < p_snapshot.primitive_keys.size()) {
+			const uint64_t key = p_snapshot.primitive_keys[slot];
+			const RD::AccelerationStructureInstance &cached = instances[i];
+			// This exact key survived from the previous successful instance. A live
+			// key is never freed/recreated by the mesh reconciliation above; checking
+			// it here also rejects a retired key in an inconsistent publication.
+			if (key != 0 && key == previous_keys[slot] && cached.id == uint32_t(slot) &&
+					cached.blas.is_valid() && cached.blas != hw_box_blas && cached.mask == (record[19] < 0.0f ? 2 : 1) &&
+					cached.hit_sbt_range == RD::HitShaderBindingTableRange(uint64_t(1) << 32) &&
+					uint64_t(cached.flags) == uint64_t(RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT | RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT) &&
+					cached.transform == p_worlds[slot] && (!blocks_changed || live.has(key))) {
+				continue;
+			}
+		}
+		if (!_hw_instance(p_snapshot, slot, p_worlds[slot], instances[i])) {
+			print_line(vformat("PXTGI: moving shape %d has no hardware structure; tracing stays in software.", slot));
 			return false;
 		}
 	}
@@ -2855,6 +2878,9 @@ bool PhysXGIEffect::_hw_update(RenderingDevice *p_rd, const Snapshot &p_snapshot
 	const uint64_t moving_done = OS::get_singleton()->get_ticks_usec();
 	hw_moving_us = moving_done - moving_since;
 	hw_moving_submit_us = timing ? moving_done - submit_since : 0;
+	if (moving > 0) {
+		hw_previous_primitive_keys = p_snapshot.primitive_keys;
+	}
 	hw_failed = false;
 	return true;
 }

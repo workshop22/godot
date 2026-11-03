@@ -963,6 +963,7 @@ _FORCE_INLINE_ static uint32_t _indices_to_primitives(RSE::PrimitiveType p_primi
 void RenderForwardClustered::_fill_render_list(RenderListType p_render_list, const RenderDataRD *p_render_data, PassMode p_pass_mode, bool p_using_sdfgi, bool p_using_opaque_gi, bool p_using_motion_pass, bool p_append) {
 	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
 	const bool source_probe = p_render_data->reflection_probe.is_valid() && RendererRD::LightStorage::get_singleton()->reflection_probe_instance_get_capture_source_policy(p_render_data->reflection_probe) != 0;
+	const bool sdfgi_has_energy = p_using_sdfgi && environment_get_sdfgi_energy(p_render_data->environment) > 0.0f;
 	uint64_t frame = RSG::rasterizer->get_frame_number();
 
 	if (p_render_list == RENDER_LIST_OPAQUE) {
@@ -1100,7 +1101,11 @@ void RenderForwardClustered::_fill_render_list(RenderListType p_render_list, con
 					uses_gi = true;
 				} else {
 					if (p_using_sdfgi && inst->can_sdfgi) {
-						flags |= INSTANCE_DATA_FLAG_USE_SDFGI;
+						if (sdfgi_has_energy) {
+							flags |= INSTANCE_DATA_FLAG_USE_SDFGI;
+						}
+						// Alpha must stay on its forward path even when a zero-energy helper
+						// contributes no SDFGI; it must not read the opaque GI buffers instead.
 						uses_gi = true;
 					}
 					inst->gi_offset_cache = 0xFFFFFFFF;
@@ -2510,6 +2515,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			render_list_params.exclude_reflection_sources = true;
 			RID source_framebuffer = rb_data->get_color_pass_fb(transparent_color_pass_flags);
 			_render_list_with_draw_list(&render_list_params, source_framebuffer, RD::DRAW_CLEAR_COLOR_0 | RD::DRAW_CLEAR_COLOR_1, Vector<Color>({ Color(0, 0, 0, 0), Color(1, 1, 1, 1) }), 0.0f, 0u, p_render_data->render_region);
+			RENDER_TIMESTAMP("Reflection Source Resolve");
 			render_list_params.exclude_reflection_sources = false;
 			if (use_msaa) {
 				for (uint32_t v = 0; v < rb->get_view_count(); v++) {
@@ -2532,7 +2538,9 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			}
 			for (uint32_t v = 0; v < rb->get_view_count(); v++) {
 				const RID specular = rb->has_separate_reflections() ? rb_data->get_specular(v) : RID();
+				RENDER_TIMESTAMP("Reflection Source Composite");
 				copy_effects->copy_scene_layers(rb->get_internal_texture(v), specular, rb->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSPARENCY, v, 0), rb->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSMISSION, v, 0), rb->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, source_name, v, 0), source_size);
+				RENDER_TIMESTAMP("Reflection Source Mipmaps");
 				Size2i level_size = source_size;
 				for (uint32_t m = 1; m < mipmaps; m++) {
 					level_size = Size2i(MAX(1, level_size.x >> 1), MAX(1, level_size.y >> 1));
@@ -2542,6 +2550,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		}
 		// This call copies opaque depth again, removing every depth write from the
 		// filtered pass. Visible color/transmission and the full GI source are normal.
+		RENDER_TIMESTAMP("Render 3D Alpha Replay");
 		RID alpha_framebuffer = rb_data.is_valid() ? rb_data->get_color_pass_fb(transparent_color_pass_flags) : color_only_framebuffer;
 		_render_list_with_draw_list(&render_list_params, alpha_framebuffer, separate_transparency ? RD::DRAW_CLEAR_COLOR_0 | RD::DRAW_CLEAR_COLOR_1 : RD::DRAW_DEFAULT_ALL, separate_transparency ? Vector<Color>({Color(0, 0, 0, 0), Color(1, 1, 1, 1)}) : Vector<Color>(), 0.0f, 0u, p_render_data->render_region);
 		rb->set_reflection_source_complete(RSG::rasterizer->get_frame_number(), source_policy, filtered_source);

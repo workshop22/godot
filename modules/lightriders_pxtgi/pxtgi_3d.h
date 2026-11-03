@@ -185,7 +185,7 @@ class PXTGI3D : public Node3D {
 	int frames_since_rescan = 0;
 	// Each tracked shape's and mesh's look (albedo, emission), with a bounded slice checked
 	// each frame for unnotified authoring edits. Explicit notifications apply at the next publication.
-	HashMap<ObjectID, Pair<Color, Color>> looks;
+	HashMap<ObjectID, Pair<Color, Color>> looks; // observation fallback; admitted nodes use ShapeEntry appearance
 	LocalVector<ObjectID> look_order;
 	HashMap<ObjectID, int> look_slots;
 	uint32_t look_cursor = 0;

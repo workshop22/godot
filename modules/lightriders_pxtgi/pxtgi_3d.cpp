@@ -311,8 +311,8 @@ void PXTGI3D::_activate() {
 	active = true;
 	_attach();
 	if (users++ == 0) {
-		RenderingServer::get_singleton()->environment_set_sdfgi_ray_count(RSE::ENV_SDFGI_RAY_COUNT_4);
-		RenderingServer::get_singleton()->environment_set_sdfgi_frames_to_update_light(RSE::ENV_SDFGI_UPDATE_LIGHT_IN_16_FRAMES);
+		// Native fog and transparent surfaces still use SDFGI probes. Their sampling
+		// quality belongs to the project and live video settings, not this opaque GI hook.
 		RenderingServer::get_singleton()->call_on_render_thread(callable_mp_static(&PXTGI3D::_install));
 	}
 	// What's tracked is found by one walk on the first update, then kept up to date from the tree's signals.
@@ -344,10 +344,6 @@ void PXTGI3D::_deactivate() {
 	_detach();
 	if (--users == 0) {
 		RenderingServer::get_singleton()->call_on_render_thread(callable_mp_static(&PXTGI3D::_uninstall));
-		// SDFGI's probe ray count and light update rate are global: the project's own back (as Godot reads them at
-		// start), or a scene using SDFGI after PXTGI would keep the cheapest ones set above.
-		RenderingServer::get_singleton()->environment_set_sdfgi_ray_count(RSE::EnvironmentSDFGIRayCount(CLAMP(int(GLOBAL_GET("rendering/global_illumination/sdfgi/probe_ray_count")), 0, int(RSE::ENV_SDFGI_RAY_COUNT_MAX) - 1)));
-		RenderingServer::get_singleton()->environment_set_sdfgi_frames_to_update_light(RSE::EnvironmentSDFGIFramesToUpdateLight(CLAMP(int(GLOBAL_GET("rendering/global_illumination/sdfgi/frames_to_update_lights")), 0, int(RSE::ENV_SDFGI_UPDATE_LIGHT_MAX) - 1)));
 	}
 }
 
@@ -1151,18 +1147,27 @@ void PXTGI3D::_restyle_slice(LocalVector<int> &r_changed) {
 			continue;
 		}
 		Pair<Color, Color> look = _look_of(node);
-		Pair<Color, Color> *known = looks.getptr(id);
-		if (index && shapes[*index].driven) {
-			look.second = shapes[*index].emission;
-		}
-		if (index == nullptr && look.second.get_luminance() > 0.0f) {
-			const MeshInstance3D *mesh = Object::cast_to<MeshInstance3D>(node);
-			if (mesh && mesh->get_mesh().is_valid() && mesh->get_gi_mode() != GeometryInstance3D::GI_MODE_DISABLED) {
-				pending_membership.insert(id);
+		if (index) {
+			// Live appearance already resides on the admitted entry. Glow updates
+			// need not duplicate every change in the observation fallback map.
+			const ShapeEntry &entry = shapes[*index];
+			if (entry.driven) {
+				look.second = entry.emission;
 			}
-		}
-		if (known && look.first == known->first && look.second == known->second) {
-			continue;
+			if (look.first == entry.albedo && look.second == entry.emission) {
+				continue;
+			}
+		} else {
+			if (look.second.get_luminance() > 0.0f) {
+				const MeshInstance3D *mesh = Object::cast_to<MeshInstance3D>(node);
+				if (mesh && mesh->get_mesh().is_valid() && mesh->get_gi_mode() != GeometryInstance3D::GI_MODE_DISABLED) {
+					pending_membership.insert(id);
+				}
+			}
+			const Pair<Color, Color> *known = looks.getptr(id);
+			if (known && look.first == known->first && look.second == known->second) {
+				continue;
+			}
 		}
 		if (index) {
 			ShapeEntry &entry = shapes[*index];
@@ -1258,6 +1263,11 @@ void PXTGI3D::_unregister_entry(const ShapeEntry &p_entry) {
 void PXTGI3D::_remove_entry(int p_index) {
 	constexpr int PF = PhysXGIEffect::PRIMITIVE_FLOATS;
 	const ShapeEntry removed = shapes[p_index];
+	if (look_slots.has(removed.shape_node)) {
+		// Still-observed nodes resume comparison through the fallback map after
+		// admission ends. _unobserve already erased retired nodes; do not revive them.
+		looks.insert(removed.shape_node, Pair<Color, Color>(removed.albedo, removed.emission));
+	}
 	_unregister_entry(removed);
 	entry_of.erase(removed.shape_node);
 	(removed.moving ? moving_dirty : static_dirty) = true;
@@ -1350,6 +1360,10 @@ bool PXTGI3D::_sync_member(ObjectID p_id) {
 		if (mesh->get_mesh().is_null() || mesh->get_gi_mode() == GeometryInstance3D::GI_MODE_DISABLED || (index < 0 && look.second.get_luminance() <= 0.0f)) {
 			if (index >= 0) {
 				_remove_entry(index);
+				if (look_slots.has(p_id)) {
+					// This observation is newer than the removed entry's cached look.
+					looks.insert(p_id, look);
+				}
 			}
 			return false;
 		}
@@ -1420,6 +1434,9 @@ bool PXTGI3D::_sync_member(ObjectID p_id) {
 	if (index >= 0) {
 		geometry_changed |= shapes[index].geometry_type != 0;
 		_remove_entry(index);
+		if (look_slots.has(p_id)) {
+			looks.insert(p_id, look);
+		}
 	}
 	const uint64_t register_since = OS::get_singleton()->get_ticks_usec();
 	index = shapes.size();
@@ -1522,13 +1539,20 @@ void PXTGI3D::_layout_geometry(const LocalVector<ObjectID> *p_changed) {
 		return std::lower_bound(geometry_ranges.ptr(), geometry_ranges.ptr() + geometry_ranges.size(), p_offset, [](const Pair<int, int> &p_range, int p_value) { return p_range.first < p_value; }) - geometry_ranges.ptr();
 	};
 	if (p_changed) {
-		// Geometry-only edits retain membership. Release just the changed spans;
-		// unchanged wall/city ranges are already sorted from the previous layout.
+		// Reconcile only affected resources against their final ownership. A shared
+		// block removed and reattached in one batch keeps its existing range.
 		allocate.reserve(p_changed->size());
 		for (const ObjectID &id : *p_changed) {
-			GeometryBlock &block = geometry_blocks[id];
-			const int words = (block.planes.size() + block.nodes.size() + block.triangles.size() + block.attributes.size()) / 4;
-			if (block.words == words && block.offset >= 0) {
+			GeometryBlock *known = geometry_blocks.getptr(id);
+			if (known == nullptr) {
+				_layout_geometry(); // Reconstruct if a retired block lost its cached range.
+				return;
+			}
+			GeometryBlock &block = *known;
+			const LocalVector<int> *owners = geometry_entries.getptr(id);
+			const bool live = block.type && owners && !owners->is_empty();
+			const int words = live ? (block.planes.size() + block.nodes.size() + block.triangles.size() + block.attributes.size()) / 4 : 0;
+			if (live && block.words == words && block.offset >= 0) {
 				continue;
 			}
 			if (block.offset >= 0 && block.words > 0) {
@@ -1976,11 +2000,6 @@ void PXTGI3D::_set_glow(int p_index, const Color &p_glow) {
 		return;
 	}
 	entry.emission = p_glow;
-	if (Pair<Color, Color> *look = looks.getptr(entry.shape_node)) {
-		look->second = p_glow;
-	} else {
-		looks.insert(entry.shape_node, Pair<Color, Color>(entry.albedo, p_glow));
-	}
 	if (uint32_t(p_index) < entry_valid.size()) {
 		float *record = &entry_floats[p_index * PF];
 		record[20] = p_glow.r;
@@ -2451,11 +2470,6 @@ void PXTGI3D::_set_body_look(Node3D *p_body, const Color &p_albedo, const Color 
 			radiance_dirty = true;
 		}
 		_set_glow(i, glow);
-		// _set_glow already updates the cached emission. Fading walls keep the
-		// same albedo, so avoid a second appearance-map write for every body.
-		if (albedo_changed) {
-			looks.insert(entry.shape_node, Pair<Color, Color>(albedo, glow));
-		}
 	}
 }
 
@@ -2646,11 +2660,13 @@ void PXTGI3D::set_reflection_items(const Array &p_records, const PackedFloat32Ar
 		_rescan();
 	}
 	bool layout_changed = false;
+	HashSet<ObjectID> affected_geometry;
 	for (const KeyValue<ObjectID, HashMap<int, ObjectID>> &source : reflection_item_ids) {
 		const HashSet<int> *surfaces = admitted.getptr(source.key);
 		for (const KeyValue<int, ObjectID> &surface : source.value) {
 			if (!surfaces || !surfaces->has(surface.key)) {
 				if (const int *index = entry_of.getptr(surface.value)) {
+					affected_geometry.insert(shapes[*index].shape_resource);
 					_remove_entry(*index);
 					layout_changed = true;
 				}
@@ -2690,6 +2706,7 @@ void PXTGI3D::set_reflection_items(const Array &p_records, const PackedFloat32Ar
 		}
 		const bool geometry_changed = index >= 0 && shapes[index].item_geometry != geometry;
 		if (geometry_changed) {
+			affected_geometry.insert(shapes[index].shape_resource);
 			_remove_entry(index);
 			index = -1;
 			layout_changed = true;
@@ -2729,6 +2746,7 @@ void PXTGI3D::set_reflection_items(const Array &p_records, const PackedFloat32Ar
 			entry_slot.push_back(-1);
 			entry_valid[index] = _refresh_entry(index, &entry_floats[index * PF], entry_bounds[index]);
 			moving_dirty = true;
+			affected_geometry.insert(entry.shape_resource);
 			layout_changed |= block->offset < 0;
 		} else {
 			ShapeEntry &entry = shapes[index];
@@ -2752,7 +2770,12 @@ void PXTGI3D::set_reflection_items(const Array &p_records, const PackedFloat32Ar
 		reflection_item_geometry.erase(key);
 	}
 	if (layout_changed) {
-		_layout_geometry();
+		LocalVector<ObjectID> changed;
+		changed.reserve(affected_geometry.size());
+		for (const ObjectID &id : affected_geometry) {
+			changed.push_back(id);
+		}
+		_layout_geometry(&changed);
 	}
 	reflection_item_materials = p_materials;
 	reflection_item_masks = p_masks.duplicate();
@@ -2902,8 +2925,8 @@ void PXTGI3D::_publish() {
 	s.light_changed = fresh_frames > 0;
 	const Ref<Compositor> compositor = camera && camera->get_compositor().is_valid() ? camera->get_compositor() : get_world_3d()->get_compositor();
 	s.compositor = compositor.is_valid() ? compositor->get_rid() : RID();
-	// SDFGI is only the switch that makes surfaces read the GI buffer: on, at its cheapest (one cascade of 8 m cells,
-	// so a moving camera rarely makes it re-voxelize).
+	// Keep authored SDFGI for native fog and forward transparent lighting. The hook
+	// replaces only opaque GI buffers, so these consumers still need the native probes.
 	Ref<Environment> env = camera && camera->get_environment().is_valid() ? camera->get_environment() : get_world_3d()->get_environment();
 	if (environment.is_valid() && environment != env) {
 		environment->set_sdfgi_enabled(environment->is_sdfgi_enabled());
@@ -2911,8 +2934,11 @@ void PXTGI3D::_publish() {
 	environment = env;
 	s.environment = env.is_valid() ? env->get_rid() : RID();
 	PhysXGIEffect::set_settings(get_instance_id(), s);
-	if (env.is_valid()) {
-		RenderingServer::get_singleton()->environment_set_sdfgi(env->get_rid(), true, 1, 8.0f, RSE::ENV_SDFGI_Y_SCALE_100_PERCENT, false, 0.0f, false, 1.0f, 1.1f, 1.1f);
+	if (env.is_valid() && !env->is_sdfgi_enabled()) {
+		// With authored SDFGI off, retain the minimal helper that enables opaque GI-buffer
+		// reads, with no native fog/transparent contribution. The Environment resource stays
+		// unchanged and restores its state on detach.
+		RenderingServer::get_singleton()->environment_set_sdfgi(env->get_rid(), true, 1, 8.0f, RSE::ENV_SDFGI_Y_SCALE_100_PERCENT, false, 0.0f, false, 0.0f, 1.1f, 1.1f);
 	}
 
 	// Anything that changes the light (shapes moved, lights, settings) means converging again.

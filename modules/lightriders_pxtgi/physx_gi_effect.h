@@ -316,6 +316,7 @@ private:
 	RID hw_static_tlas;
 	RID hw_moving_tlas;
 	LocalVector<RD::AccelerationStructureInstance> hw_moving_instances;
+	Vector<uint64_t> hw_previous_primitive_keys; // COW keys from the last successful moving build
 	uint32_t hw_moving_capacity = 0;
 	uint32_t hw_static_capacity = 0;
 	uint64_t hw_static_version = UINT64_MAX;
