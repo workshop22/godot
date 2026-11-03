@@ -795,6 +795,11 @@ uint32_t RenderForwardClustered::_setup_environment(const RenderDataRD *p_render
 			ss_flags |= environment_get_ssr_enabled(p_render_data->environment) ? (1 << 2) : 0;
 
 			if (rd.is_valid()) {
+				// PXTGI has already resolved visibility for its reflection contribution.
+				// A current-frame producer tag excludes cleared/fallback and stale buffers.
+				if (rd->get_reflection_motion_frame() == RSG::rasterizer->get_frame_number() && rd->has_texture(SNAME("pxtgi"), SNAME("reflection_motion"))) {
+					ss_flags |= (1 << 4);
+				}
 				Ref<RenderBufferDataForwardClustered> rb_data;
 				if (rd->has_custom_data(RB_SCOPE_FORWARD_CLUSTERED)) {
 					rb_data = rd->get_custom_data(RB_SCOPE_FORWARD_CLUSTERED);

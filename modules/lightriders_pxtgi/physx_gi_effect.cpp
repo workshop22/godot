@@ -83,14 +83,17 @@ layout(set = 0, binding = 9, std140) uniform Frame {
 	vec4 misc; // frame index, max ray distance, intensity, debug mode
 	vec4 sun_direction; // toward the sun, world space
 	vec4 sun_color; // w: the camera's exposure, which the shapes' glow is scaled by
+	vec4 gi_sun_direction; // independently selected sun which participates in bounce lighting
+	vec4 gi_sun_color;
 	vec4 ambient; // w: how far a GI ray goes against the collision shapes
 	ivec4 counts; // x: primitives, y: tree nodes, z: omni lights, w: spot lights
 	vec4 omni_position[8]; // w: 1 / range
 	vec4 omni_color[8]; // w: attenuation exponent
+	vec4 omni_indirect[2]; // packed per-light bounce energy; zero excludes analytic GI
 	vec4 spot_position[8]; // w: 1 / range
 	vec4 spot_direction[8]; // w: cosine of the cone's half angle
 	vec4 spot_color[8]; // w: attenuation exponent
-	vec4 spot_cone[8]; // x: the cone edge's falloff exponent
+	vec4 spot_cone[8]; // x: cone edge falloff exponent, y: bounce energy
 	vec4 reflect; // x: mode (0 Godot's own, 1 screen space, 2 and the shapes, 3 and the probes), y: roughness cutoff, z: emissives, w: the light sources just changed
 	vec4 emit_center[16];
 	vec4 emit_x[16]; // half axes
@@ -797,16 +800,21 @@ bool escapes(vec3 o, vec3 d, float reach) {
 
 // The light a surface patch receives straight from the sun and the omni lights (shadowed by the shapes), and the
 // ambient light: what it shows times its albedo, before any bounce light.
-vec3 direct_light(vec3 x, vec3 n) {
+vec3 direct_light(vec3 x, vec3 n, bool indirect) {
 	vec3 light = f.ambient.rgb;
-	float lit = dot(n, f.sun_direction.xyz);
-	if (lit > 0.0 && f.sun_direction.w > 0.5) {
-		if (!blocked(x + n * 0.02, f.sun_direction.xyz, 1e6)) {
-			light += f.sun_color.rgb * lit;
+	vec4 sun = indirect ? f.gi_sun_direction : f.sun_direction;
+	float lit = dot(n, sun.xyz);
+	if (lit > 0.0 && sun.w > 0.5) {
+		if (!blocked(x + n * 0.02, sun.xyz, 1e6)) {
+			light += (indirect ? f.gi_sun_color.rgb : f.sun_color.rgb) * lit;
 		}
 	}
 	// Omni lights, falling off as Godot's do, shadowed by the shapes.
 	for (int i = 0; i < f.counts.z; i++) {
+		float energy = indirect ? f.omni_indirect[i / 4][i % 4] : 1.0;
+		if (energy == 0.0) {
+			continue;
+		}
 		vec3 to = f.omni_position[i].xyz - x;
 		float dist = length(to);
 		vec3 l = to / max(dist, 1e-4);
@@ -825,10 +833,14 @@ vec3 direct_light(vec3 x, vec3 n) {
 		if (blocked(x + n * 0.02, l, dist - 0.05)) {
 			continue;
 		}
-		light += f.omni_color[i].rgb * nl * falloff;
+		light += f.omni_color[i].rgb * nl * falloff * energy;
 	}
 	// Spot lights: the omni falloff inside a cone, its edge softened as Godot's are.
 	for (int i = 0; i < f.counts.w; i++) {
+		float energy = indirect ? f.spot_cone[i].y : 1.0;
+		if (energy == 0.0) {
+			continue;
+		}
 		vec3 to = f.spot_position[i].xyz - x;
 		float dist = length(to);
 		vec3 l = to / max(dist, 1e-4);
@@ -851,7 +863,7 @@ vec3 direct_light(vec3 x, vec3 n) {
 		if (blocked(x + n * 0.02, l, dist - 0.05)) {
 			continue;
 		}
-		light += f.spot_color[i].rgb * nl * falloff;
+		light += f.spot_color[i].rgb * nl * falloff * energy;
 	}
 	return light;
 }
@@ -878,6 +890,9 @@ vec3 world_light(vec3 x, vec3 n, int hit, sampler2D depth_tex, sampler2D color_t
 		}
 	}
 	vec3 v = (f.world_to_view * vec4(x, 1.0)).xyz;
+	// A source pixel already contains combined raster lighting: bake participation
+	// and indirect energy below apply to analytic reconstruction, not this image.
+	// The trace also has no receiver layers with which to reproduce light cull masks.
 	if (f.trace_settings.z > 0.5 && v.z < -f.clip.x) {
 		vec2 sp = pixel_from_view(v, f.proj_info);
 		if (on_screen(sp)) {
@@ -924,12 +939,12 @@ vec3 world_light(vec3 x, vec3 n, int hit, sampler2D depth_tex, sampler2D color_t
 					cells.c[slot].pos.w = uintBitsToFloat(f.cache.x);
 				}
 				if (cells.c[slot].normal.w > 0.5) {
-					return glow + (sharp ? albedo * (direct_light(x, n) + smooth_incoming(x, n)) : cells.c[slot].outgoing.rgb);
+					return glow + (sharp ? albedo * (direct_light(x, n, false) + smooth_incoming(x, n)) : cells.c[slot].outgoing.rgb);
 				}
 			}
 		}
 	}
-	return glow + albedo * direct_light(x, n);
+	return glow + albedo * direct_light(x, n, !sharp);
 }
 )";
 
@@ -1392,6 +1407,39 @@ float noise1(vec2 p) {
 	return f.polish.x > 0.5 ? texelFetch(blue_noise, ivec2(p) & 63, 0).r : ign(p);
 }
 
+float reflection_depth(ivec2 px) {
+	return any(lessThan(px, ivec2(0))) || any(greaterThanEqual(px, f.sizes.xy)) ? 0.0 : texelFetch(depth_tex, px, 0).r;
+}
+
+// As in Godot's screen-space reflection pass, choose the depth derivatives whose
+// extrapolation best matches this pixel, rather than crossing a silhouette edge.
+vec3 reflection_geometry_normal(ivec2 px, float depth, vec3 p, vec3 fallback) {
+	vec4 hd = vec4(reflection_depth(px + ivec2(-1, 0)), reflection_depth(px + ivec2(-2, 0)),
+			reflection_depth(px + ivec2(1, 0)), reflection_depth(px + ivec2(2, 0)));
+	vec4 vd = vec4(reflection_depth(px + ivec2(0, -1)), reflection_depth(px + ivec2(0, -2)),
+			reflection_depth(px + ivec2(0, 1)), reflection_depth(px + ivec2(0, 2)));
+	vec2 he = abs(2.0 * hd.xz - hd.yw - depth);
+	vec2 ve = abs(2.0 * vd.xz - vd.yw - depth);
+	for (int i = 0; i < 2; i++) {
+		he[i] = hd[i * 2] <= 0.0 ? 1e30 : (hd[i * 2 + 1] <= 0.0 ? 1e20 : he[i]);
+		ve[i] = vd[i * 2] <= 0.0 ? 1e30 : (vd[i * 2 + 1] <= 0.0 ? 1e20 : ve[i]);
+	}
+	if (min(he.x, he.y) >= 1e30 || min(ve.x, ve.y) >= 1e30) {
+		return fallback;
+	}
+	int hs = he.x < he.y ? -1 : 1;
+	int vs = ve.x < ve.y ? -1 : 1;
+	vec3 hp = view_from_pixel(vec2(px + ivec2(hs, 0)), hd[1 + hs], f.proj_info, f.clip.x, f.clip.y);
+	vec3 vp = view_from_pixel(vec2(px + ivec2(0, vs)), vd[1 + vs], f.proj_info, f.clip.x, f.clip.y);
+	vec3 normal = cross(float(vs) * (vp - p), float(hs) * (hp - p));
+	float length_squared = dot(normal, normal);
+	if (length_squared <= 1e-12 || any(isnan(normal)) || any(isinf(normal))) {
+		return fallback;
+	}
+	normal *= inversesqrt(length_squared);
+	return dot(normal, p) > 0.0 ? -normal : normal;
+}
+
 void main() {
 	ivec2 px = ivec2(gl_GlobalInvocationID.xy);
 	if (any(greaterThanEqual(px, pc.size.xy))) {
@@ -1436,7 +1484,20 @@ void main() {
 		dir = reflect(v, n);
 	}
 
-	vec3 origin = p + n * (0.02 + 0.002 * -p.z);
+	// A normal map can turn a grazing reflection back into its own receiver. Keep
+	// the authored shading normal, but use the geometric surface for the origin
+	// bias and Godot SSR's below-surface bounce correction.
+	vec3 geometry_normal = reflection_geometry_normal(fp, depth, p, n);
+	vec3 motion_normal = n;
+	if (dot(dir, geometry_normal) < 0.0) {
+		dir = normalize(reflect(dir, geometry_normal));
+		// History must use the corrected reflection plane as well as the ray.
+		vec3 bisector = v - dir;
+		if (dot(bisector, bisector) > 1e-12) {
+			motion_normal = normalize(bisector);
+		}
+	}
+	vec3 origin = p + geometry_normal * (0.02 + 0.002 * -p.z);
 	const int STEPS = 32;
 	float reach = 3.0 * f.misc.y;
 	float jitter = fract(noise1(vec2(px) + vec2(13.0, 101.0)) + f.misc.x * 0.6180339887);
@@ -1524,7 +1585,7 @@ void main() {
 	// A tangent-plane mirror maps hit motion through the same reflection as the ray.
 	// Store actual previous screen position for temporal reuse and the blur's separate layer.
 	vec3 virtual_point = p + normalize(p) * (found ? hit_t : 65000.0);
-	vec3 mirrored_delta = reflect(mat3(f.world_to_view) * hit_delta, n);
+	vec3 mirrored_delta = reflect(mat3(f.world_to_view) * hit_delta, motion_normal);
 	float previous_depth;
 	vec2 previous = prev_pixel(virtual_point + mirrored_delta, previous_depth);
 	vec2 velocity = (previous - vec2(fp)) / vec2(f.sizes.xy);
@@ -1691,7 +1752,7 @@ void main() {
 	}
 	cells.c[slot].incoming = vec4(incoming, 0.0);
 	cells.c[slot].normal.w = samples;
-	cells.c[slot].outgoing = vec4(cell.albedo.rgb * (direct_light(cell.pos.xyz, n) + incoming), 0.0);
+	cells.c[slot].outgoing = vec4(cell.albedo.rgb * (direct_light(cell.pos.xyz, n, true) + incoming), 0.0);
 }
 )",
 	// PASS_REFLECT_BLUR: a separable reflection-only blur, kept out of temporal history.
@@ -1962,10 +2023,13 @@ struct FrameData {
 	float misc[4];
 	float sun_direction[4];
 	float sun_color[4];
+	float gi_sun_direction[4];
+	float gi_sun_color[4];
 	float ambient[4];
 	int32_t counts[4];
 	float omni_position[8][4];
 	float omni_color[8][4];
+	float omni_indirect[2][4];
 	float spot_position[8][4];
 	float spot_direction[8][4];
 	float spot_color[8][4];
@@ -2306,10 +2370,9 @@ bool PhysXGIEffect::_hw_compile(RenderingDevice *p_rd) {
 // One leaf as an instance: its record's local-to-world (a box scaled to its half extents over the unit box), its slot as
 // the custom index. False for a shape the hardware path doesn't have (spheres, capsules, cylinders, hulls) or a mesh
 // whose structure is missing.
-bool PhysXGIEffect::_hw_instance(const Snapshot &p_snapshot, int p_slot, RD::AccelerationStructureInstance &r_instance) const {
+bool PhysXGIEffect::_hw_instance(const Snapshot &p_snapshot, int p_slot, const Transform3D &p_world, RD::AccelerationStructureInstance &r_instance) const {
 	const float *r = p_snapshot.primitives.ptr() + p_slot * PRIMITIVE_FLOATS;
-	const Transform3D to_local(Basis(r[0], r[1], r[2], r[4], r[5], r[6], r[8], r[9], r[10]), Vector3(r[3], r[7], r[11]));
-	Transform3D to_world = to_local.affine_inverse();
+	Transform3D to_world = p_world;
 	const int type = int(r[12] + 0.5f);
 	if (type == 0) {
 		to_world.basis = to_world.basis * Basis::from_scale(Vector3(MAX(r[13], 1e-5f), MAX(r[14], 1e-5f), MAX(r[15], 1e-5f)));
@@ -2332,8 +2395,13 @@ bool PhysXGIEffect::_hw_instance(const Snapshot &p_snapshot, int p_slot, RD::Acc
 	return true;
 }
 
+static bool rt_timing() {
+	static const bool on = OS::get_singleton()->has_environment("PXTGI_RT_TIMING");
+	return on;
+}
+
 // Brings the structures up to date for this frame; false (and software from then on) when anything fails.
-bool PhysXGIEffect::_hw_update(RenderingDevice *p_rd, const Snapshot &p_snapshot) {
+bool PhysXGIEffect::_hw_update(RenderingDevice *p_rd, const Snapshot &p_snapshot, const Vector<Transform3D> &p_worlds) {
 	if (hw_failed) {
 		return false;
 	}
@@ -2442,7 +2510,7 @@ bool PhysXGIEffect::_hw_update(RenderingDevice *p_rd, const Snapshot &p_snapshot
 			built++;
 			triangles += tris.size() / 12;
 		}
-		if (built > 0) {
+		if (built > 0 && rt_timing()) {
 			print_line(vformat("PXTGI: %d mesh structures (%d triangles) in %.1f ms; %d meshes in all.", built, triangles, (OS::get_singleton()->get_ticks_usec() - since) / 1000.0, hw_meshes.size()));
 		}
 	}
@@ -2466,7 +2534,7 @@ bool PhysXGIEffect::_hw_update(RenderingDevice *p_rd, const Snapshot &p_snapshot
 			LocalVector<RD::AccelerationStructureInstance> instances;
 			instances.resize(MAX(count, 1));
 			for (int i = 0; i < count; i++) {
-				if (!_hw_instance(p_snapshot, i, instances[i])) {
+				if (!_hw_instance(p_snapshot, i, p_worlds[i], instances[i])) {
 					print_line(vformat("PXTGI: static shape %d has no hardware structure (type %d); tracing stays in software.", i, int(p_snapshot.primitives[i * PRIMITIVE_FLOATS + 12] + 0.5f)));
 					return false;
 				}
@@ -2486,7 +2554,9 @@ bool PhysXGIEffect::_hw_update(RenderingDevice *p_rd, const Snapshot &p_snapshot
 				ERR_FAIL_COND_V(!hw_static_tlas.is_valid(), false);
 			}
 			ERR_FAIL_COND_V(p_rd->tlas_build(hw_static_tlas, Span<RD::AccelerationStructureInstance>(instances.ptr(), instances.size())) != OK, false);
-			print_line(vformat("PXTGI: static structure, %d shapes in %.2f ms (frame %d).", count, (OS::get_singleton()->get_ticks_usec() - since) / 1000.0, int64_t(Engine::get_singleton()->get_frames_drawn())));
+			if (rt_timing()) {
+				print_line(vformat("PXTGI: static structure, %d shapes in %.2f ms (frame %d).", count, (OS::get_singleton()->get_ticks_usec() - since) / 1000.0, int64_t(Engine::get_singleton()->get_frames_drawn())));
+			}
 		}
 	}
 	hw_static_us = OS::get_singleton()->get_ticks_usec() - static_since;
@@ -2496,7 +2566,7 @@ bool PhysXGIEffect::_hw_update(RenderingDevice *p_rd, const Snapshot &p_snapshot
 	LocalVector<RD::AccelerationStructureInstance> instances;
 	instances.resize(MAX(moving, 1));
 	for (int i = 0; i < moving; i++) {
-		if (!_hw_instance(p_snapshot, p_snapshot.static_count + i, instances[i])) {
+		if (!_hw_instance(p_snapshot, p_snapshot.static_count + i, p_worlds[p_snapshot.static_count + i], instances[i])) {
 			print_line(vformat("PXTGI: moving shape %d has no hardware structure; tracing stays in software.", p_snapshot.static_count + i));
 			return false;
 		}
@@ -2582,6 +2652,31 @@ bool PhysXGIEffect::_ensure(RenderingDevice *p_rd) {
 	return true;
 }
 
+PhysXGIView::ShapeHistory *PhysXGIView::get_shape_history(uint64_t p_id) {
+	const uint32_t *slot = previous_shape_slots.getptr(p_id);
+	return slot ? &previous_shapes[*slot] : nullptr;
+}
+
+PhysXGIView::ShapeHistory *PhysXGIView::add_shape_history(uint64_t p_id, uint64_t p_generation, const Transform3D &p_world, const Transform3D &p_local) {
+	const uint32_t slot = previous_shapes.size();
+	previous_shapes.push_back({ p_id, p_generation, p_world, p_local });
+	previous_shape_slots.insert(p_id, slot);
+	return &previous_shapes[slot];
+}
+
+void PhysXGIView::erase_shape_history(uint64_t p_id) {
+	const uint32_t *found = previous_shape_slots.getptr(p_id);
+	if (found == nullptr) {
+		return;
+	}
+	const uint32_t slot = *found;
+	previous_shape_slots.erase(p_id);
+	previous_shapes.remove_at_unordered(slot);
+	if (slot < previous_shapes.size()) {
+		previous_shape_slots[previous_shapes[slot].id] = slot;
+	}
+}
+
 void PhysXGIView::free_data() {
 	RenderingDevice *rd = RenderingDevice::get_singleton();
 	if (rd == nullptr) {
@@ -2600,10 +2695,16 @@ void PhysXGIView::free_data() {
 		}
 	}
 	previous_shapes.clear();
-	previous_static_shapes.clear();
+	previous_shape_slots.clear();
+	primitive_history_slots.clear();
 	previous_moving_shapes.clear();
+	current_moving_shapes.clear();
 	primitive_motion_data.clear();
+	primitive_worlds.clear();
 	primitive_motion_static_version = UINT64_MAX;
+	primitive_motion_frame = 0;
+	primitive_motion_static_identity = false;
+	primitive_motion_static_history = false;
 	primitive_motion_capacity = 0;
 	targets_for = Size2i();
 	source_size = Size2i();
@@ -2681,11 +2782,6 @@ void PhysXGIEffect::_dispatch(RenderingDevice *p_rd, int p_pass, const Vector<RD
 	}
 	p_rd->compute_list_dispatch(list, (p_size.x + 7) / 8, (p_size.y + 7) / 8, 1);
 	p_rd->compute_list_end();
-}
-
-static bool rt_timing() {
-	static const bool on = OS::get_singleton()->has_environment("PXTGI_RT_TIMING");
-	return on;
 }
 
 // The frame's recording, timed: with PXTGI_RT_TIMING set, a slow one (or a long gap since the last frame, which is the
@@ -2804,24 +2900,36 @@ void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_rende
 	// rendering may skip publications, and a BVH rebuild may reorder every primitive slot.
 	const uint64_t motion_since = OS::get_singleton()->get_ticks_usec();
 	const bool static_changed = v.primitive_motion_static_version != s.static_version;
-	HashSet<uint64_t> current_static_shapes;
-	if (static_changed) {
-		current_static_shapes.reserve(s.static_count);
+	const uint64_t motion_frame = ++v.primitive_motion_frame;
+	if (static_changed && s.primitive_count > int(v.previous_shapes.size())) {
+		v.previous_shapes.reserve(s.primitive_count);
+		v.previous_shape_slots.reserve(s.primitive_count);
 	}
-	HashSet<uint64_t> current_moving_shapes;
+	LocalVector<uint64_t> &current_moving_shapes = v.current_moving_shapes;
+	current_moving_shapes.clear();
 	current_moving_shapes.reserve(s.primitive_count - s.static_count);
 	Vector<float> &motion = v.primitive_motion_data;
 	motion.resize(MAX(s.primitive_count, 1) * 16);
-	motion.fill(0.0f);
 	float *motion_data = motion.ptrw();
-	if (!static_changed) {
-		// These exact static leaves occupied these slots in the preceding rendered
-		// frame. Their world points stay fixed; no pose inversions or history-map
-		// allocation are needed for the tens of thousands of city instances.
+	v.primitive_worlds.resize(s.primitive_count);
+	Transform3D *worlds = v.primitive_worlds.ptrw();
+	const uint32_t previous_slot_count = v.primitive_history_slots.size();
+	v.primitive_history_slots.resize(s.primitive_count);
+	uint32_t *history_slots = v.primitive_history_slots.ptr();
+	for (uint32_t i = previous_slot_count; i < v.primitive_history_slots.size(); i++) {
+		history_slots[i] = UINT32_MAX;
+	}
+	if (s.primitive_count == 0) {
+		memset(motion_data, 0, 16 * sizeof(float));
+	}
+	bool upload_static = static_changed || !v.primitive_motion_static_identity || v.primitive_motion_static_history != v.have_history;
+	if (!static_changed && upload_static) {
+		// The first frame after a rebuild may contain new or formerly moving leaves.
+		// Thereafter these same static slots have identity motion until a membership
+		// change or camera-history reset. Keep that prefix resident on the GPU.
+		const float identity[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, v.have_history ? 1.0f : 0.0f, 0, 0, 0 };
 		for (int i = 0; i < s.static_count; i++) {
-			float *out = motion_data + i * 16;
-			out[0] = out[5] = out[10] = 1.0f;
-			out[12] = v.have_history ? 1.0f : 0.0f;
+			memcpy(motion_data + i * 16, identity, sizeof(identity));
 		}
 	}
 	for (int i = static_changed ? 0 : s.static_count; i < s.primitive_count; i++) {
@@ -2832,9 +2940,14 @@ void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_rende
 			local.origin[r] = record[r * 4 + 3];
 		}
 		const Pair<uint64_t, uint64_t> &identity = s.primitive_ids[i];
-		const PhysXGIView::ShapeHistory *cached = v.previous_shapes.getptr(identity.first);
+		// Most leaves keep their slot across streamed membership changes. Reuse
+		// their dense history index only while it still names this exact shape;
+		// reordering, pruning and slot reuse otherwise fall back to the ID map.
+		const uint32_t history_slot = history_slots[i];
+		PhysXGIView::ShapeHistory *cached = history_slot < v.previous_shapes.size() && v.previous_shapes[history_slot].id == identity.first ? &v.previous_shapes[history_slot] : v.get_shape_history(identity.first);
 		const bool unchanged_pose = cached && cached->local == local;
 		const Transform3D world = unchanged_pose ? cached->world : local.affine_inverse();
+		worlds[i] = world;
 		const Transform3D *previous = v.have_history && cached && cached->generation == identity.second ? &cached->world : nullptr;
 		// New shapes and teleports cannot supply trustworthy reflection history.
 		const bool valid = previous && previous->origin.distance_squared_to(world.origin) < 400.0f;
@@ -2847,32 +2960,43 @@ void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_rende
 			out[r * 4 + 3] = delta.origin[r];
 		}
 		out[12] = valid ? 1.0f : 0.0f;
-		if (!unchanged_pose || cached->generation != identity.second) {
-			v.previous_shapes.insert(identity.first, { identity.second, world, local });
+		out[13] = out[14] = out[15] = 0.0f;
+		if (!cached) {
+			cached = v.add_shape_history(identity.first, identity.second, world, local);
+		} else if (!unchanged_pose || cached->generation != identity.second) {
+			cached->generation = identity.second;
+			cached->world = world;
+			cached->local = local;
 		}
-		if (i < s.static_count) {
-			current_static_shapes.insert(identity.first);
-		} else {
-			current_moving_shapes.insert(identity.first);
+		history_slots[i] = uint32_t(cached - v.previous_shapes.ptr());
+		cached->seen_frame = motion_frame;
+		cached->is_static = i < s.static_count;
+		if (!cached->is_static) {
+			current_moving_shapes.push_back(identity.first);
 		}
 	}
 	if (static_changed) {
-		// Streaming changes membership, not the poses of retained city objects.
-		// Keep their history entries and retire only identities absent this frame.
-		for (uint64_t id : v.previous_static_shapes) {
-			if (!current_static_shapes.has(id) && !current_moving_shapes.has(id)) {
-				v.previous_shapes.erase(id);
+		// Every current leaf was marked above, even if reordered. Prune contiguous
+		// records in place; removal swaps the last record into the slot being checked.
+		for (uint32_t i = 0; i < v.previous_shapes.size();) {
+			if (v.previous_shapes[i].seen_frame != motion_frame) {
+				v.erase_shape_history(v.previous_shapes[i].id);
+			} else {
+				i++;
 			}
 		}
-		v.previous_static_shapes = std::move(current_static_shapes);
-	}
-	for (uint64_t id : v.previous_moving_shapes) {
-		if (!current_moving_shapes.has(id) && !v.previous_static_shapes.has(id)) {
-			v.previous_shapes.erase(id);
+	} else {
+		for (uint64_t id : v.previous_moving_shapes) {
+			const PhysXGIView::ShapeHistory *cached = v.get_shape_history(id);
+			if (cached && !cached->is_static && cached->seen_frame != motion_frame) {
+				v.erase_shape_history(id);
+			}
 		}
 	}
-	v.previous_moving_shapes = std::move(current_moving_shapes);
+	SWAP(v.previous_moving_shapes, v.current_moving_shapes);
 	v.primitive_motion_static_version = s.static_version;
+	v.primitive_motion_static_identity = !static_changed;
+	v.primitive_motion_static_history = v.have_history;
 	const uint32_t motion_bytes = motion.size() * sizeof(float);
 	if (v.primitive_motion_capacity < motion_bytes) {
 		if (v.primitive_motion.is_valid()) {
@@ -2880,8 +3004,12 @@ void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_rende
 		}
 		v.primitive_motion_capacity = Math::next_power_of_2(motion_bytes);
 		v.primitive_motion = rd->storage_buffer_create(v.primitive_motion_capacity);
+		upload_static = true;
 	}
-	rd->buffer_update(v.primitive_motion, 0, motion_bytes, motion.ptr());
+	const uint32_t motion_offset = upload_static ? 0 : s.static_count * 16 * sizeof(float);
+	if (motion_bytes > motion_offset) {
+		rd->buffer_update(v.primitive_motion, motion_offset, motion_bytes - motion_offset, reinterpret_cast<const uint8_t *>(motion.ptr()) + motion_offset);
+	}
 	motion_update_us = OS::get_singleton()->get_ticks_usec() - motion_since;
 	FrameData data = {};
 	RendererRD::MaterialStorage::store_transform(cam_transform, data.view_to_world);
@@ -2919,6 +3047,13 @@ void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_rende
 	data.sun_color[1] = s.sun_color.g * exposure;
 	data.sun_color[2] = s.sun_color.b * exposure;
 	data.sun_color[3] = exposure;
+	data.gi_sun_direction[0] = s.gi_sun_direction.x;
+	data.gi_sun_direction[1] = s.gi_sun_direction.y;
+	data.gi_sun_direction[2] = s.gi_sun_direction.z;
+	data.gi_sun_direction[3] = s.gi_sun_color.get_luminance() > 0.0f ? 1.0f : 0.0f;
+	data.gi_sun_color[0] = s.gi_sun_color.r * exposure;
+	data.gi_sun_color[1] = s.gi_sun_color.g * exposure;
+	data.gi_sun_color[2] = s.gi_sun_color.b * exposure;
 	// The ambient light every surface patch gets (the environment's ambient colour, when that's its source), and what a
 	// ray that leaves the scene sees: the sky, or the background colour (as Godot draws them, exposure included).
 	RID sky_map;
@@ -3039,8 +3174,35 @@ void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_rende
 	// Hardware tracing for this frame's world rays (trace, reflect, cache) when it is asked for and everything is up
 	// to date; the software walk otherwise.
 	const uint64_t hw_since = OS::get_singleton()->get_ticks_usec();
-	hw_active = (s.trace_mode == 2 || s.trace_mode == 3) && _hw_update(rd, s);
+	const bool hw_requested = s.trace_mode == 2 || s.trace_mode == 3;
+	hw_active = hw_requested && _hw_update(rd, s, v.primitive_worlds);
+	if (hw_requested && !hw_active) {
+		// _hw_update temporarily sets hw_failed while building. Publish only its
+		// terminal result: the main thread restores SAH for subsequent software frames.
+		hw_terminal_fallback.store(true);
+	}
 	hw_update_us = OS::get_singleton()->get_ticks_usec() - hw_since;
+	if (!hw_active && s.hardware_layout) {
+		// A non-spatial tree is complete but can make a large software dispatch
+		// prohibitively expensive. Wait for the main thread's SAH publication instead
+		// of tracing it, including any hardware-only snapshots already in flight.
+		RendererRD::CopyEffects *copy = RendererRD::CopyEffects::get_singleton();
+		for (uint32_t layer = 0; layer < out_format.array_layers; layer++) {
+			for (const StringName &name : { ambient_name, reflection_name }) {
+				copy->set_color(buffers->get_texture_slice(gi_scope, name, layer, 0), Color(0, 0, 0, 0), Rect2i(Point2i(), out_size));
+			}
+			copy->set_color(buffers->get_texture_slice(view_scope, "reflection_motion", layer, 0), Color(0, 0, 0, 0), Rect2i(Point2i(), out_size));
+		}
+		// Zero alpha keeps the normal environment lighting; never reuse an old
+		// camera's reflections or report motion for this untraced frame.
+		buffers->set_reflection_motion_frame(UINT64_MAX);
+		v.have_history = false;
+		v.primitive_motion_static_version = UINT64_MAX;
+		v.primitive_motion_static_identity = false;
+		v.primitive_motion_static_history = false;
+		unsettle();
+		return;
+	}
 	data.counts[2] = s.omni_count;
 	data.counts[3] = s.spot_count;
 	for (int i = 0; i < s.spot_count; i++) {
@@ -3057,6 +3219,7 @@ void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_rende
 		data.spot_color[i][2] = s.spot_color[i].b * exposure;
 		data.spot_color[i][3] = s.spot_attenuation[i];
 		data.spot_cone[i][0] = s.spot_cone_attenuation[i];
+		data.spot_cone[i][1] = s.spot_indirect[i];
 	}
 	data.reflect[0] = (float)s.reflection_mode;
 	data.trace_settings[0] = s.reflection_distance;
@@ -3114,6 +3277,7 @@ void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_rende
 		data.omni_color[i][1] = s.omni_color[i].g * exposure;
 		data.omni_color[i][2] = s.omni_color[i].b * exposure;
 		data.omni_color[i][3] = s.omni_attenuation[i];
+		data.omni_indirect[i / 4][i % 4] = s.omni_indirect[i];
 	}
 	rd->buffer_update(data_buffer, 0, sizeof(data), &data);
 
@@ -3124,7 +3288,7 @@ void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_rende
 		if (primitive_buffer.is_valid()) {
 			rd->free_rid(primitive_buffer);
 		}
-		primitive_capacity = MAX(s.primitive_count, 64);
+		primitive_capacity = Math::next_power_of_2(uint32_t(MAX(s.primitive_count, 64)));
 		primitive_buffer = rd->storage_buffer_create(primitive_capacity * PRIMITIVE_FLOATS * sizeof(float));
 		primitives_uploaded = UINT64_MAX;
 	}
@@ -3135,7 +3299,7 @@ void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_rende
 		if (node_buffer.is_valid()) {
 			rd->free_rid(node_buffer);
 		}
-		node_capacity = MAX(s.node_count, 128);
+		node_capacity = Math::next_power_of_2(uint32_t(MAX(s.node_count, 128)));
 		node_buffer = rd->storage_buffer_create(node_capacity * NODE_FLOATS * sizeof(float));
 		primitives_uploaded = UINT64_MAX;
 	}

@@ -1681,6 +1681,7 @@ void fragment_shader(in SceneData scene_data) {
 
 	vec3 direct_specular_light = vec3(0.0, 0.0, 0.0);
 	vec3 indirect_specular_light = vec3(0.0, 0.0, 0.0);
+	vec3 traced_indirect_specular = vec3(0.0);
 	vec3 diffuse_light = vec3(0.0, 0.0, 0.0);
 	vec3 ambient_light = vec3(0.0, 0.0, 0.0);
 #ifndef MODE_UNSHADED
@@ -2028,6 +2029,9 @@ void fragment_shader(in SceneData scene_data) {
 
 		ambient_light = mix(ambient_light, buffer_ambient.rgb, buffer_ambient.a);
 		indirect_specular_light = mix(indirect_specular_light, buffer_reflection.rgb, buffer_reflection.a);
+		if (bool(implementation_data.ss_effects_flags & SCREEN_SPACE_EFFECTS_FLAGS_TRACED_REFLECTIONS)) {
+			traced_indirect_specular = buffer_reflection.rgb * buffer_reflection.a;
+		}
 	}
 #endif // !USE_LIGHTMAP
 
@@ -2127,6 +2131,8 @@ void fragment_shader(in SceneData scene_data) {
 
 		if (reflection_accum.a > 0.0) {
 			indirect_specular_light = reflection_accum.rgb;
+			// Preserve the probes' existing blend/override of the traced contribution.
+			traced_indirect_specular *= max(1.0 - reflection_accum.a, 0.0);
 		}
 
 #ifdef LIGHT_CLEARCOAT_USED
@@ -2186,6 +2192,10 @@ void fragment_shader(in SceneData scene_data) {
 		// Low enough for occlusion, high enough for reaction to lights and shadows.
 		specular_occlusion = max(min(reflective_f * specular_occlusion * 10.0, 1.0), specular_occlusion);
 		indirect_specular_light *= specular_occlusion;
+		// Diffuse ambient brightness estimates visibility for environment lighting.
+		// Applying it again to a traced reflection erases visible lights in dark rooms.
+		// Keep only that contribution, after probe blending; the BRDF still follows.
+		indirect_specular_light += traced_indirect_specular * (1.0 - specular_occlusion);
 #endif // BENT_NORMAL_MAP_USED
 #endif // SPECULAR_OCCLUSION_DISABLED
 		ambient_light *= albedo.rgb;

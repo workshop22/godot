@@ -130,14 +130,17 @@ class PXTGI3D : public Node3D {
 	HashMap<ObjectID, GeometryBlock> geometry_blocks;
 	HashSet<ObjectID> geometry_dirty;
 	HashMap<ObjectID, LocalVector<int>> geometry_entries;
+	LocalVector<Pair<int, int>> geometry_ranges; // live GPU spans, sorted by offset, in vec4s
 	int geometry_floats = 0; // logical size; the immutable blocks are packed only on the GPU
 	Vector<PhysXGIEffect::GeometryUpload> published_geometry;
+	Vector<PhysXGIEffect::GeometryUpload> geometry_spares[2];
+	uint32_t geometry_spare = 0;
 	uint64_t published_geometry_version = UINT64_MAX;
 	uint64_t geometry_version = 0;
 
 	const GeometryBlock *_geometry_for(const Ref<Shape3D> &p_shape);
 	void _geometry_changed(ObjectID p_shape);
-	void _layout_geometry();
+	void _layout_geometry(const LocalVector<ObjectID> *p_changed = nullptr);
 	void _refresh_geometry();
 	LocalVector<ShapeEntry> shapes;
 	LocalVector<ObjectID> suns; // every DirectionalLight3D: the brightest one drawn on surfaces is the sun, chosen each frame
@@ -204,6 +207,7 @@ class PXTGI3D : public Node3D {
 	uint64_t static_version = 0; // the static part's layout: bumped whenever it is rebuilt (hardware trace spike)
 	int moving_root_node = -1; // the moving part's root node, -1 with no moving part
 	int trace_mode = 0; // 0 software, 1 world rays find nothing (their share of the cost), 2 hardware, 3 hardware where it is safe (NVIDIA, no earlier session lost with it)
+	bool hardware_layout = false; // hardware requested and the shared effect has not permanently fallen back
 	bool static_dirty = true;
 	bool moving_dirty = true;
 	bool radiance_dirty = false; // only glow changed: the records in place, not the tree
@@ -213,8 +217,18 @@ class PXTGI3D : public Node3D {
 	int published_count = 0;
 	// Hardware tracing: each leaf's mesh (its Shape3D's id; 0 for a box), and every mesh's triangles by that id.
 	Vector<uint64_t> published_keys;
+	// The current publication and two rotating spares retain at most three buffers
+	// per field. A renderer still holding a spare is protected by Vector's COW.
+	Vector<float> primitive_spares[2];
+	Vector<Pair<uint64_t, uint64_t>> id_spares[2];
+	Vector<float> node_spares[2];
+	Vector<uint64_t> key_spares[2];
+	uint32_t publication_spare = 0;
 	Vector<uint64_t> published_block_keys;
 	Vector<Vector<float>> published_block_triangles;
+	Vector<uint64_t> block_key_spares[2];
+	Vector<Vector<float>> block_triangle_spares[2];
+	uint32_t block_spare = 0;
 	uint64_t published_blocks_version = UINT64_MAX;
 	uint64_t primitives_version = 0;
 
@@ -231,9 +245,11 @@ class PXTGI3D : public Node3D {
 	bool _refresh_entry(int p_index, float *r_out, AABB &r_bounds);
 	void _record_frame(int p_index, Transform3D &r_to_world, AABB &r_local) const;
 	void _set_glow(int p_index, const Color &p_glow);
+	void _set_body_look(Node3D *p_body, const Color &p_albedo, const Color &p_emission, const Pair<Color, Color> &p_linear);
 	void _append_mesh(MeshInstance3D *p_mesh, const Pair<Color, Color> &p_look);
 	void _build_tree();
 	void _update_primitives(PhysXGIEffect::Snapshot &r_snapshot);
+	void _publish_geometry(PhysXGIEffect::Snapshot &r_snapshot);
 
 	static void _install();
 	static void _uninstall();
@@ -262,6 +278,8 @@ class PXTGI3D : public Node3D {
 		STAGE_GEOMETRY_FIRST,
 		STAGE_GEOMETRY_RETIRED,
 		STAGE_GEOMETRY_EDITED,
+		STAGE_HARDWARE_PUBLISH,
+		STAGE_GEOMETRY_PUBLISH,
 		STAGE_MAX,
 	};
 	struct StageTime {
@@ -281,6 +299,11 @@ public:
 	static void free_shared();
 	void prepare_geometry(const Ref<Shape3D> &p_shape);
 	void notify_body_changed(Node3D *p_body);
+	void notify_bodies_changed(const Array &p_bodies);
+	void disable_bodies(const Array &p_bodies);
+	void notify_subtree_retired(Node *p_root);
+	void set_body_look(Node3D *p_body, const Color &p_albedo, const Color &p_emission);
+	void set_bodies_look(const Array &p_bodies, const Color &p_albedo, const Color &p_emission);
 	void update_emitter_group(const PackedInt64Array &p_bodies, const PackedFloat32Array &p_stations, const Dictionary &p_values, double p_time);
 	Dictionary get_stats(bool p_reset = true);
 

@@ -66,15 +66,27 @@ public:
 	RID primitive_motion; // current world point -> its previous rendered world point, by primitive slot
 	uint32_t primitive_motion_capacity = 0;
 	Vector<float> primitive_motion_data;
+	Vector<Transform3D> primitive_worlds; // current slot poses, shared by motion and hardware instances
 	uint64_t primitive_motion_static_version = UINT64_MAX;
+	uint64_t primitive_motion_frame = 0;
+	bool primitive_motion_static_identity = false;
+	bool primitive_motion_static_history = false;
 	struct ShapeHistory {
+		uint64_t id = 0;
 		uint64_t generation = 0;
 		Transform3D world;
 		Transform3D local;
+		uint64_t seen_frame = 0;
+		bool is_static = false;
 	};
-	HashMap<uint64_t, ShapeHistory> previous_shapes;
-	HashSet<uint64_t> previous_static_shapes;
-	HashSet<uint64_t> previous_moving_shapes;
+	LocalVector<ShapeHistory> previous_shapes;
+	HashMap<uint64_t, uint32_t> previous_shape_slots;
+	LocalVector<uint32_t> primitive_history_slots; // checked hint: dense indices can move after pruning
+	ShapeHistory *get_shape_history(uint64_t p_id);
+	ShapeHistory *add_shape_history(uint64_t p_id, uint64_t p_generation, const Transform3D &p_world, const Transform3D &p_local);
+	void erase_shape_history(uint64_t p_id);
+	LocalVector<uint64_t> previous_moving_shapes;
+	LocalVector<uint64_t> current_moving_shapes;
 	RID reflect_accum[2]; // reflection size: accumulated, ping-ponged
 	RID reflect_info[2]; // reflection size: frames of history, hit distance, motion in the reflection
 	RID reflect_depth[2];
@@ -156,6 +168,7 @@ public:
 		int primitive_count = 0;
 		uint64_t primitives_version = 0; // primitives and nodes: uploaded only when this changes
 		int trace_mode = 0; // PXTGI3D.trace_mode: 0 software, 1 world misses, 2 hardware, 3 hardware where safe
+		bool hardware_layout = false; // defer software tracing until a spatial SAH snapshot replaces this one
 		int static_count = 0; // the static primitives, first in leaf order
 		uint64_t static_version = 0;
 		int moving_root = -1; // the software walk's moving part (unused by hardware tracing)
@@ -173,6 +186,10 @@ public:
 		uint64_t geometry_version = 0;
 		Vector3 sun_direction; // toward the sun, world space
 		Color sun_color; // linear, times energy; black for none
+		// Analytic bounce lighting selects its own eligible sun. A brighter direct-only
+		// light must not displace a weaker sun which participates in GI.
+		Vector3 gi_sun_direction;
+		Color gi_sun_color;
 		// Omni lights: position and 1 / range; linear colour times energy, and the attenuation exponent.
 		static constexpr int MAX_OMNIS = 8;
 		int omni_count = 0;
@@ -180,6 +197,7 @@ public:
 		float omni_inv_range[MAX_OMNIS] = {};
 		Color omni_color[MAX_OMNIS];
 		float omni_attenuation[MAX_OMNIS] = {};
+		float omni_indirect[MAX_OMNIS] = {};
 		// Spot lights: as the omni lights, plus the direction they point, the cosine of their cone's half angle and the
 		// cone's edge falloff (1 / spot attenuation, as Godot's shader takes it).
 		static constexpr int MAX_SPOTS = 8;
@@ -191,6 +209,7 @@ public:
 		Color spot_color[MAX_SPOTS];
 		float spot_attenuation[MAX_SPOTS] = {};
 		float spot_cone_attenuation[MAX_SPOTS] = {};
+		float spot_indirect[MAX_SPOTS] = {};
 		float intensity = 1.0f;
 		float max_distance = 8.0f;
 		float world_distance = 30.0f; // how far a GI ray goes against the collision shapes
@@ -276,6 +295,7 @@ private:
 	uint64_t hw_static_version = UINT64_MAX;
 	uint32_t hw_static_hash = 0;
 	bool hw_failed = false;
+	std::atomic<bool> hw_terminal_fallback{ false }; // published only after a hardware update fails
 	bool hw_active = false; // the hardware variants run this frame
 	bool hw_guarded = false; // this session wrote the crash guard
 	bool _hw_compile(RenderingDevice *p_rd);
@@ -289,8 +309,8 @@ private:
 	uint64_t geometry_update_us = 0;
 	uint64_t geometry_update_bytes = 0;
 	void _render_frame(int p_callback_type, const RenderData *p_render_data);
-	bool _hw_update(RenderingDevice *p_rd, const Snapshot &p_snapshot);
-	bool _hw_instance(const Snapshot &p_snapshot, int p_slot, RD::AccelerationStructureInstance &r_instance) const;
+	bool _hw_update(RenderingDevice *p_rd, const Snapshot &p_snapshot, const Vector<Transform3D> &p_worlds);
+	bool _hw_instance(const Snapshot &p_snapshot, int p_slot, const Transform3D &p_world, RD::AccelerationStructureInstance &r_instance) const;
 	void _hw_free(RenderingDevice *p_rd);
 
 	// The radiance cache: surface patches the off-screen rays hit, hashed by position (cells growing with distance from
@@ -323,6 +343,7 @@ public:
 
 	static Ref<PhysXGIEffect> get_shared();
 	static void free_shared();
+	bool has_hardware_fallback() const { return hw_terminal_fallback.load(); }
 
 	PhysXGIEffect();
 	~PhysXGIEffect();
