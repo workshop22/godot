@@ -69,6 +69,10 @@
 			}
 			[/codeblock]
 		</member>
+		<member name="needs_separate_transparency" type="bool" setter="set_needs_separate_transparency" getter="get_needs_separate_transparency" default="false">
+			If [code]true[/code], Forward+ renders alpha-blended geometry into separate color and transmission textures. Opaque color, depth and velocity remain available to temporal anti-aliasing and compositor effects. The renderer composites the transparent layer after [constant EFFECT_CALLBACK_TYPE_POST_UPSCALE], before glow and tonemapping, including frames where the effect skips its own processing.
+			Transparent materials are selected by the renderer's normal alpha-pass classification, without per-object flags. Their existing blend modes and depth tests are preserved. This layer is spatially resampled when the opaque view uses temporal upscaling; it does not inherit the background's motion blur or temporal history.
+		</member>
 		<member name="needs_separate_specular" type="bool" setter="set_needs_separate_specular" getter="get_needs_separate_specular">
 			If [code]true[/code] this triggers specular data being rendered to a separate buffer and combined after effects have been applied, only applicable for the Forward+ renderer.
 		</member>
@@ -92,7 +96,10 @@
 		<constant name="EFFECT_CALLBACK_TYPE_POST_UPSCALE" value="5" enum="EffectCallbackType">
 			The callback is called after TAA or a temporal upscaler has resolved the frame, before depth of field, glow and tonemapping. The frame is [method RenderSceneBuffersRD.get_output_texture], at [method RenderSceneBuffersRD.get_output_size]; depth and motion vectors stay at the internal size.
 		</constant>
-		<constant name="EFFECT_CALLBACK_TYPE_MAX" value="6" enum="EffectCallbackType">
+		<constant name="EFFECT_CALLBACK_TYPE_POST_TRANSPARENCY_COMPOSITE" value="6" enum="EffectCallbackType">
+			Called after post-upscale effects and optional transparent-layer composition, before glow and tonemapping. Use [method RenderSceneBuffersRD.get_output_texture] and [method RenderSceneBuffersRD.get_output_size] for full-frame effects; depth and normals remain at internal resolution. This callback also runs when separate transparency is disabled.
+		</constant>
+		<constant name="EFFECT_CALLBACK_TYPE_MAX" value="7" enum="EffectCallbackType">
 			Represents the size of the [enum EffectCallbackType] enum.
 		</constant>
 	</constants>

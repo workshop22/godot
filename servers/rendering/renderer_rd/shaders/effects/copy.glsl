@@ -52,11 +52,17 @@ layout(set = 0, binding = 0) uniform sampler2D source_color;
 layout(set = 0, binding = 0) uniform sampler2D source_color;
 #endif
 
+#ifdef MODE_MERGE_TRANSPARENCY
+layout(set = 1, binding = 0) uniform sampler2D source_transmission;
+#endif
+
 #ifdef GLOW_USE_AUTO_EXPOSURE
 layout(set = 1, binding = 0) uniform sampler2D source_auto_exposure;
 #endif
 
-#if defined(MODE_LINEARIZE_DEPTH_COPY) || defined(MODE_SIMPLE_COPY_DEPTH)
+#if defined(MODE_MERGE_TRANSPARENCY)
+layout(rgba16f, set = 3, binding = 0) uniform image2D dest_buffer;
+#elif defined(MODE_LINEARIZE_DEPTH_COPY) || defined(MODE_SIMPLE_COPY_DEPTH)
 layout(r32f, set = 3, binding = 0) uniform restrict writeonly image2D dest_buffer;
 #elif defined(DST_IMAGE_8BIT)
 layout(rgba8, set = 3, binding = 0) uniform restrict writeonly image2D dest_buffer;
@@ -72,6 +78,18 @@ shared vec4 temp_cache[128];
 void main() {
 	// Pixel being shaded
 	ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+#ifdef MODE_MERGE_TRANSPARENCY
+	if (any(greaterThanEqual(pos, params.section.zw))) {
+		return;
+	}
+	// The layer was rasterized with this frame's jitter; temporal AA/upscalers have
+	// removed that jitter from the opaque image. Sample both layer terms together.
+	vec2 uv = (vec2(pos) + 0.5) / vec2(params.section.zw) + params.set_color.xy;
+	vec4 emission = textureLod(source_color, uv, 0.0);
+	vec4 transmission = textureLod(source_transmission, uv, 0.0);
+	imageStore(dest_buffer, pos, emission + transmission * imageLoad(dest_buffer, pos));
+	return;
+#endif
 
 #ifndef MODE_GAUSSIAN_BLUR // Gaussian blur needs the extra threads
 	if (any(greaterThanEqual(pos, params.section.zw))) { //too large, do nothing

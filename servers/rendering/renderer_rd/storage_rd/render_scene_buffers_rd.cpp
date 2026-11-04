@@ -838,7 +838,7 @@ uint32_t RenderSceneBuffersRD::get_depth_usage_bits(bool p_resolve, bool p_msaa,
 			usage_bits |= RD::TEXTURE_USAGE_DEPTH_RESOLVE_ATTACHMENT_BIT;
 		}
 	} else {
-		usage_bits |= RD::TEXTURE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+		usage_bits |= RD::TEXTURE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT;
 	}
 
 	return usage_bits;

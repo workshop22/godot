@@ -47,6 +47,7 @@ public:
 		EFFECT_CALLBACK_TYPE_PRE_TRANSPARENT,
 		EFFECT_CALLBACK_TYPE_POST_TRANSPARENT,
 		EFFECT_CALLBACK_TYPE_POST_UPSCALE,
+		EFFECT_CALLBACK_TYPE_POST_TRANSPARENCY_COMPOSITE,
 		EFFECT_CALLBACK_TYPE_MAX
 	};
 
@@ -58,6 +59,7 @@ private:
 	bool access_resolved_color = false;
 	bool access_resolved_depth = false;
 	bool needs_motion_vectors = false;
+	bool needs_separate_transparency = false;
 	bool needs_normal_roughness = false;
 	bool needs_separate_specular = false;
 
@@ -83,6 +85,9 @@ public:
 
 	void set_access_resolved_depth(bool p_enabled);
 	bool get_access_resolved_depth() const;
+
+	void set_needs_separate_transparency(bool p_enabled);
+	bool get_needs_separate_transparency() const;
 
 	void set_needs_motion_vectors(bool p_enabled);
 	bool get_needs_motion_vectors() const;

@@ -43,7 +43,7 @@ void CompositorEffect::_bind_methods() {
 
 	ClassDB::bind_method(D_METHOD("set_effect_callback_type", "effect_callback_type"), &CompositorEffect::set_effect_callback_type);
 	ClassDB::bind_method(D_METHOD("get_effect_callback_type"), &CompositorEffect::get_effect_callback_type);
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "effect_callback_type", PROPERTY_HINT_ENUM, "Pre Opaque,Post Opaque,Post Sky,Pre Transparent,Post Transparent,Post Upscale"), "set_effect_callback_type", "get_effect_callback_type");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "effect_callback_type", PROPERTY_HINT_ENUM, "Pre Opaque,Post Opaque,Post Sky,Pre Transparent,Post Transparent,Post Upscale,Post Transparency Composite"), "set_effect_callback_type", "get_effect_callback_type");
 
 	ClassDB::bind_method(D_METHOD("set_access_resolved_color", "enable"), &CompositorEffect::set_access_resolved_color);
 	ClassDB::bind_method(D_METHOD("get_access_resolved_color"), &CompositorEffect::get_access_resolved_color);
@@ -52,6 +52,10 @@ void CompositorEffect::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_access_resolved_depth", "enable"), &CompositorEffect::set_access_resolved_depth);
 	ClassDB::bind_method(D_METHOD("get_access_resolved_depth"), &CompositorEffect::get_access_resolved_depth);
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "access_resolved_depth"), "set_access_resolved_depth", "get_access_resolved_depth");
+
+	ClassDB::bind_method(D_METHOD("set_needs_separate_transparency", "enable"), &CompositorEffect::set_needs_separate_transparency);
+	ClassDB::bind_method(D_METHOD("get_needs_separate_transparency"), &CompositorEffect::get_needs_separate_transparency);
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "needs_separate_transparency"), "set_needs_separate_transparency", "get_needs_separate_transparency");
 
 	ClassDB::bind_method(D_METHOD("set_needs_motion_vectors", "enable"), &CompositorEffect::set_needs_motion_vectors);
 	ClassDB::bind_method(D_METHOD("get_needs_motion_vectors"), &CompositorEffect::get_needs_motion_vectors);
@@ -71,6 +75,7 @@ void CompositorEffect::_bind_methods() {
 	BIND_ENUM_CONSTANT(EFFECT_CALLBACK_TYPE_PRE_TRANSPARENT)
 	BIND_ENUM_CONSTANT(EFFECT_CALLBACK_TYPE_POST_TRANSPARENT)
 	BIND_ENUM_CONSTANT(EFFECT_CALLBACK_TYPE_POST_UPSCALE)
+	BIND_ENUM_CONSTANT(EFFECT_CALLBACK_TYPE_POST_TRANSPARENCY_COMPOSITE)
 	BIND_ENUM_CONSTANT(EFFECT_CALLBACK_TYPE_MAX)
 
 	GDVIRTUAL_BIND(_render_callback, "effect_callback_type", "render_data");
@@ -148,6 +153,19 @@ void CompositorEffect::set_access_resolved_depth(bool p_enabled) {
 
 bool CompositorEffect::get_access_resolved_depth() const {
 	return access_resolved_depth;
+}
+
+void CompositorEffect::set_needs_separate_transparency(bool p_enabled) {
+	needs_separate_transparency = p_enabled;
+	if (rid.is_valid()) {
+		RenderingServer *rs = RenderingServer::get_singleton();
+		ERR_FAIL_NULL(rs);
+		rs->compositor_effect_set_flag(rid, RSE::COMPOSITOR_EFFECT_FLAG_NEEDS_SEPARATE_TRANSPARENCY, p_enabled);
+	}
+}
+
+bool CompositorEffect::get_needs_separate_transparency() const {
+	return needs_separate_transparency;
 }
 
 void CompositorEffect::set_needs_motion_vectors(bool p_enabled) {

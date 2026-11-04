@@ -1066,6 +1066,9 @@ layout(location = 1) out vec4 specular_buffer; //specular and SSS (subsurface sc
 #else
 
 layout(location = 0) out vec4 frag_color;
+#ifdef MODE_SEPARATE_TRANSPARENCY
+layout(location = 1) out vec4 transparency_source;
+#endif
 #endif // MODE_SEPARATE_SPECULAR
 
 #endif // RENDER DEPTH
@@ -3101,6 +3104,10 @@ void fragment_shader(in SceneData scene_data) {
 #if defined(PREMUL_ALPHA_USED) && !defined(MODE_RENDER_DEPTH)
 	frag_color.rgb *= premul_alpha;
 #endif //PREMUL_ALPHA_USED
+
+#ifdef MODE_SEPARATE_TRANSPARENCY
+	transparency_source = frag_color;
+#endif
 
 #endif //MODE_SEPARATE_SPECULAR
 
