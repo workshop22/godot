@@ -1046,14 +1046,15 @@ void Object::set_meta(const StringName &p_name, const Variant &p_value) {
 }
 
 Variant Object::get_meta(const StringName &p_name, const Variant &p_default) const {
-	if (!metadata.has(p_name)) {
+	const Variant *value = metadata.getptr(p_name);
+	if (value == nullptr) {
 		if (p_default != Variant()) {
 			return p_default;
 		} else {
 			ERR_FAIL_V_MSG(Variant(), vformat("The object does not have any 'meta' values with the key '%s'.", p_name));
 		}
 	}
-	return metadata[p_name];
+	return *value;
 }
 
 void Object::remove_meta(const StringName &p_name) {
