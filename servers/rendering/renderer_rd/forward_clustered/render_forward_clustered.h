@@ -583,13 +583,14 @@ private:
 		bool using_softshadows = false;
 
 		//used during setup
-		uint64_t prev_transform_change_frame = 0xFFFFFFFF;
+		uint64_t rendered_transform_frame = uint64_t(-1);
 		enum TransformStatus {
 			NONE,
 			MOVED,
 			TELEPORTED,
 		} transform_status = TransformStatus::MOVED;
 		Transform3D prev_transform;
+		Transform3D rendered_transform;
 		RID voxel_gi_instances[MAX_VOXEL_GI_INSTANCESS_PER_INSTANCE];
 		GeometryInstanceSurfaceDataCache *surface_caches = nullptr;
 		SelfList<GeometryInstanceForwardClustered> dirty_list_element;

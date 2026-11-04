@@ -1126,10 +1126,17 @@ void RenderForwardClustered::_fill_render_list(RenderListType p_render_list, con
 			lod_distance = surface_distance.length();
 		}
 
-		if (unlikely(inst->transform_status != GeometryInstanceForwardClustered::TransformStatus::NONE && frame > inst->prev_transform_change_frame && inst->prev_transform_change_frame)) {
-			inst->prev_transform = inst->transform;
+		// A dirty-instance flush (for example, freeing an unrelated instance) can publish
+		// transforms before the rasterizer advances its frame. Keep the pose actually
+		// submitted last frame instead of dating history by that early publication.
+		// All views and passes in this frame share the same previous pose.
+		if (inst->rendered_transform_frame != frame) {
+			const bool consecutive = inst->rendered_transform_frame != uint64_t(-1) && inst->rendered_transform_frame + 1 == frame;
+			inst->prev_transform = consecutive && inst->transform_status != GeometryInstanceForwardClustered::TransformStatus::TELEPORTED ? inst->rendered_transform : inst->transform;
+			inst->rendered_transform_frame = frame;
 			inst->transform_status = GeometryInstanceForwardClustered::TransformStatus::NONE;
 		}
+		inst->rendered_transform = inst->transform;
 
 		while (surf) {
 			surf->sort.uses_forward_gi = 0;
@@ -4986,13 +4993,9 @@ RenderGeometryInstance *RenderForwardClustered::geometry_instance_create(RID p_b
 }
 
 void RenderForwardClustered::GeometryInstanceForwardClustered::set_transform(const Transform3D &p_transform, const AABB &p_aabb, const AABB &p_transformed_aabb) {
-	uint64_t frame = RSG::rasterizer->get_frame_number();
-	if (frame != prev_transform_change_frame) {
-		prev_transform = transform;
-		prev_transform_change_frame = frame;
-		transform_status = TransformStatus::MOVED;
-	} else if (unlikely(transform_status == TransformStatus::TELEPORTED)) {
-		prev_transform = transform;
+	if (unlikely(transform_status == TransformStatus::TELEPORTED)) {
+		prev_transform = p_transform;
+		rendered_transform = p_transform;
 	}
 
 	RenderGeometryInstanceBase::set_transform(p_transform, p_aabb, p_transformed_aabb);
@@ -5000,6 +5003,7 @@ void RenderForwardClustered::GeometryInstanceForwardClustered::set_transform(con
 
 void RenderForwardClustered::GeometryInstanceForwardClustered::reset_motion_vectors() {
 	prev_transform = transform;
+	rendered_transform = transform;
 	transform_status = TransformStatus::TELEPORTED;
 }
 
