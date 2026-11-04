@@ -1097,7 +1097,13 @@ void RenderForwardClustered::_fill_render_list(RenderListType p_render_list, con
 				}
 			}
 			if (p_pass_mode == PASS_MODE_DEPTH_NORMAL_ROUGHNESS || p_pass_mode == PASS_MODE_DEPTH_NORMAL_ROUGHNESS_VOXEL_GI || p_pass_mode == PASS_MODE_COLOR) {
-				bool transform_changed = inst->transform_status == GeometryInstanceForwardClustered::TransformStatus::MOVED;
+				// Temporal upscaling's separate motion pass needs the same history as the
+				// velocity transform, including later views and depth/color passes.
+				const bool history_valid = inst->rendered_transform_frame != uint64_t(-1) &&
+						(inst->rendered_transform_frame == frame || inst->rendered_transform_frame + 1 == frame) &&
+						inst->transform_status != GeometryInstanceForwardClustered::TransformStatus::TELEPORTED;
+				const Transform3D &previous_pose = inst->rendered_transform_frame == frame ? inst->prev_transform : inst->rendered_transform;
+				bool transform_changed = history_valid && previous_pose != inst->transform;
 				bool has_mesh_instance = inst->mesh_instance.is_valid();
 				bool uses_particles = inst->base_flags & INSTANCE_DATA_FLAG_PARTICLES;
 				bool is_multimesh_with_motion = !uses_particles && (inst->base_flags & INSTANCE_DATA_FLAG_MULTIMESH) && mesh_storage->_multimesh_uses_motion_vectors_offsets(inst->data->base);
