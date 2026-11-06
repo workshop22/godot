@@ -33,6 +33,7 @@
  @brief ENet Godot specific functions
 */
 
+#include "core/config/project_settings.h"
 #include "core/io/dtls_server.h"
 #include "core/io/ip.h"
 #include "core/io/net_socket.h"
@@ -51,6 +52,7 @@ public:
 	virtual Error sendto(const uint8_t *p_buffer, int p_len, int &r_sent, IPAddress p_ip, uint16_t p_port) = 0;
 	virtual Error recvfrom(uint8_t *p_buffer, int p_len, int &r_read, IPAddress &r_ip, uint16_t &r_port) = 0;
 	virtual int set_option(ENetSocketOption p_option, int p_value) = 0;
+	virtual int get_option(ENetSocketOption p_option, int *r_value) { return -1; }
 	virtual void close() = 0;
 	virtual void set_refuse_new_connections(bool p_enable) {} /* Only used by dtls server */
 	virtual bool can_upgrade() { return false; } /* Only true in ENetUDP */
@@ -61,6 +63,16 @@ public:
 
 class ENetDTLSClient;
 class ENetDTLSServer;
+
+// Socket buffer request in bytes: the project setting when registered, else ENet's own.
+static int _buffer_request(bool p_receive, int p_enet_default) {
+	const StringName setting = p_receive ? StringName("network/enet/receive_buffer_size") : StringName("network/enet/send_buffer_size");
+	ProjectSettings *settings = ProjectSettings::get_singleton();
+	if (settings == nullptr || !settings->has_setting(setting)) {
+		return p_enet_default;
+	}
+	return settings->get_setting_with_override(setting);
+}
 
 /// NetSocket interface
 class ENetUDP : public ENetGodotSocket {
@@ -134,12 +146,15 @@ public:
 				return 0;
 			} break;
 
-			case ENET_SOCKOPT_RCVBUF: {
-				return -1;
-			} break;
-
+			case ENET_SOCKOPT_RCVBUF:
 			case ENET_SOCKOPT_SNDBUF: {
-				return -1;
+				// The project setting replaces ENet's built-in request; 0 keeps the OS default.
+				const bool receive = p_option == ENET_SOCKOPT_RCVBUF;
+				const int bytes = _buffer_request(receive, p_value);
+				if (bytes <= 0) {
+					return 0;
+				}
+				return sock->set_buffer_size(receive ? NetSocket::BUFFER_RECEIVE : NetSocket::BUFFER_SEND, bytes) == OK ? 0 : -1;
 			} break;
 
 			case ENET_SOCKOPT_RCVTIMEO: {
@@ -157,6 +172,18 @@ public:
 		}
 
 		return -1;
+	}
+
+	int get_option(ENetSocketOption p_option, int *r_value) override {
+		if (p_option != ENET_SOCKOPT_RCVBUF && p_option != ENET_SOCKOPT_SNDBUF) {
+			return -1;
+		}
+		const int value = sock->get_buffer_size(p_option == ENET_SOCKOPT_RCVBUF ? NetSocket::BUFFER_RECEIVE : NetSocket::BUFFER_SEND);
+		if (value < 0) {
+			return -1;
+		}
+		*r_value = value;
+		return 0;
 	}
 
 	void close() {
@@ -681,7 +708,8 @@ int enet_socket_set_option(ENetSocket socket, ENetSocketOption option, int value
 }
 
 int enet_socket_get_option(ENetSocket socket, ENetSocketOption option, int *value) {
-	return -1;
+	ENetGodotSocket *sock = (ENetGodotSocket *)socket;
+	return sock->get_option(option, value);
 }
 
 int enet_socket_connect(ENetSocket socket, const ENetAddress *address) {

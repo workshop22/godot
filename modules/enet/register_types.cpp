@@ -34,6 +34,7 @@
 #include "enet_multiplayer_peer.h"
 #include "enet_packet_peer.h"
 
+#include "core/config/project_settings.h"
 #include "core/error/error_macros.h"
 #include "core/object/class_db.h"
 
@@ -49,6 +50,11 @@ void initialize_enet_module(ModuleInitializationLevel p_level) {
 	} else {
 		enet_ok = true;
 	}
+
+	// OS socket buffers for every ENet host (bytes, 0 = OS default). A client that stalls longer
+	// than its receive buffer holds loses datagrams; Windows' UDP default is 64 KiB.
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "network/enet/receive_buffer_size", PROPERTY_HINT_RANGE, "0,67108864,1,suffix:B"), 4 * 1024 * 1024);
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "network/enet/send_buffer_size", PROPERTY_HINT_RANGE, "0,67108864,1,suffix:B"), 1024 * 1024);
 
 	GDREGISTER_CLASS(ENetMultiplayerPeer);
 	GDREGISTER_ABSTRACT_CLASS(ENetPacketPeer);

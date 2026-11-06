@@ -2470,6 +2470,12 @@
 		<member name="navigation/world/region_use_async_iterations" type="bool" setter="" getter="" default="true">
 			If enabled, navigation region synchronization uses an async process that runs on a background thread. This avoids stalling the main thread but adds an additional delay to any navigation region change.
 		</member>
+		<member name="network/enet/receive_buffer_size" type="int" setter="" getter="" default="4194304">
+			OS receive buffer, in bytes, requested for every [ENetConnection] socket ([code]0[/code] keeps the OS default). Datagrams that arrive while the host is not serviced wait here; a stall longer than the buffer holds drops them. The OS may grant less (Linux caps it at [code]net.core.rmem_max[/code]); the granted size is printed when the host is created.
+		</member>
+		<member name="network/enet/send_buffer_size" type="int" setter="" getter="" default="1048576">
+			OS send buffer, in bytes, requested for every [ENetConnection] socket ([code]0[/code] keeps the OS default). The OS may grant less (Linux caps it at [code]net.core.wmem_max[/code]).
+		</member>
 		<member name="network/limits/debugger/max_chars_per_second" type="int" setter="" getter="" default="32768">
 			Maximum number of characters allowed to send as output from the debugger. Over this value, content is dropped. This helps not to stall the debugger connection.
 		</member>
