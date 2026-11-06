@@ -30,6 +30,8 @@
 
 #pragma once
 
+#include "core/os/mutex.h"
+#include "core/templates/hash_set.h"
 #include "core/templates/paged_allocator.h"
 #include "servers/rendering/multi_uma_buffer.h"
 #include "servers/rendering/renderer_rd/cluster_builder_rd.h"
@@ -666,6 +668,23 @@ private:
 	GlobalPipelineData global_pipeline_data_compiled = {};
 	GlobalPipelineData global_pipeline_data_required = {};
 
+	// Pass layouts (pipeline version, color pass flags, framebuffer format) the renderer has drawn. Surface pipeline
+	// prediction only knows the project MSAA and the stock passes; viewports with their own MSAA and compositor passes
+	// (separate transparency) otherwise compile their ubershader at the first draw, stalling that frame.
+	// Every surface also compiles its ubershaders for these, in the background, when it is created or a new layout appears.
+	struct DrawnPass {
+		uint32_t version = 0;
+		uint32_t color_pass_flags = 0;
+		RD::FramebufferFormatID framebuffer_format_id = 0;
+	};
+	Mutex drawn_passes_mutex;
+	HashSet<uint64_t> drawn_pass_keys;
+	LocalVector<DrawnPass> drawn_passes;
+	uint32_t drawn_passes_compiled = 0;
+	void _note_drawn_pass(uint64_t p_key);
+	void _drawn_passes_copy(LocalVector<DrawnPass> &r_passes);
+	void _mesh_compile_drawn_passes_for_surface(const SurfacePipelineData &p_surface, const GlobalPipelineData &p_global, const LocalVector<DrawnPass> &p_passes, uint32_t p_from, RSE::PipelineSource p_source, Vector<ShaderPipelinePair> *r_pipeline_pairs);
+
 	typedef Pair<SceneShaderForwardClustered::ShaderData *, SceneShaderForwardClustered::ShaderData::PipelineKey> ShaderPipelinePair;
 
 	void _update_global_pipeline_data_requirements_from_project();
@@ -676,6 +695,8 @@ private:
 	void _geometry_instance_update(RenderGeometryInstance *p_geometry_instance);
 	void _mesh_compile_pipeline_for_surface(SceneShaderForwardClustered::ShaderData *p_shader, void *p_mesh_surface, bool p_ubershader, bool p_instanced_surface, RSE::PipelineSource p_source, SceneShaderForwardClustered::ShaderData::PipelineKey &r_pipeline_key, Vector<ShaderPipelinePair> *r_pipeline_pairs = nullptr);
 	void _mesh_compile_pipelines_for_surface(const SurfacePipelineData &p_surface, const GlobalPipelineData &p_global, RSE::PipelineSource p_source, Vector<ShaderPipelinePair> *r_pipeline_pairs = nullptr);
+	void _mesh_compile_stock_pipelines_for_surface(const SurfacePipelineData &p_surface, const GlobalPipelineData &p_global, RSE::PipelineSource p_source, Vector<ShaderPipelinePair> *r_pipeline_pairs);
+	void _surface_pipeline_data_from_cache(GeometryInstanceSurfaceDataCache *p_surface_cache, SurfacePipelineData &r_surface);
 	void _mesh_generate_all_pipelines_for_surface_cache(GeometryInstanceSurfaceDataCache *p_surface_cache, const GlobalPipelineData &p_global);
 	void _update_dirty_geometry_instances();
 	void _update_dirty_geometry_pipelines();

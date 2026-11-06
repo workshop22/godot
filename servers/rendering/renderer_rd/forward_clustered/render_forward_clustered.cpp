@@ -514,6 +514,15 @@ void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p
 			} break;
 		}
 
+		if constexpr (p_pass_mode != PASS_MODE_DEPTH_MATERIAL && p_pass_mode != PASS_MODE_SDF) {
+			const uint64_t drawn_key = (uint64_t(pipeline_key.version) << 56) | (uint64_t(pipeline_key.color_pass_flags & ~uint32_t(SceneShaderForwardClustered::PIPELINE_COLOR_PASS_FLAG_LIGHTMAP)) << 48) | (uint64_t(framebuffer_format) & 0xFFFFFFFFFFFFull);
+			thread_local uint64_t last_drawn_key = UINT64_MAX;
+			if (unlikely(drawn_key != last_drawn_key)) {
+				last_drawn_key = drawn_key;
+				_note_drawn_pass(drawn_key);
+			}
+		}
+
 		pipeline_key.framebuffer_format_id = framebuffer_format;
 		pipeline_key.wireframe = p_params->force_wireframe;
 		pipeline_key.ubershader = 0;
@@ -4757,7 +4766,87 @@ void RenderForwardClustered::_mesh_compile_pipeline_for_surface(SceneShaderForwa
 	}
 }
 
+void RenderForwardClustered::_note_drawn_pass(uint64_t p_key) {
+	MutexLock lock(drawn_passes_mutex);
+	if (drawn_pass_keys.has(p_key)) {
+		return;
+	}
+	drawn_pass_keys.insert(p_key);
+	DrawnPass pass;
+	pass.version = uint32_t(p_key >> 56);
+	pass.color_pass_flags = uint32_t((p_key >> 48) & 0xFF);
+	pass.framebuffer_format_id = RD::FramebufferFormatID(p_key & 0xFFFFFFFFFFFFull);
+	drawn_passes.push_back(pass);
+}
+
+void RenderForwardClustered::_drawn_passes_copy(LocalVector<DrawnPass> &r_passes) {
+	MutexLock lock(drawn_passes_mutex);
+	r_passes = drawn_passes;
+}
+
+void RenderForwardClustered::_mesh_compile_drawn_passes_for_surface(const SurfacePipelineData &p_surface, const GlobalPipelineData &p_global, const LocalVector<DrawnPass> &p_passes, uint32_t p_from, RSE::PipelineSource p_source, Vector<ShaderPipelinePair> *r_pipeline_pairs) {
+	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
+
+	const bool multiview_enabled = scene_shader.is_multiview_shader_group_enabled();
+	SceneShaderForwardClustered::ShaderData::PipelineKey pipeline_key;
+	pipeline_key.cull_mode = RD::POLYGON_CULL_DISABLED;
+	pipeline_key.primitive_type = mesh_storage->mesh_surface_get_primitive(p_surface.mesh_surface);
+	pipeline_key.wireframe = false;
+	pipeline_key.ubershader = true;
+	// Low priority: these are ahead-of-time guesses; the stock prediction and draw-time requests keep the high-priority slots.
+	auto compile = [&](SceneShaderForwardClustered::ShaderData *p_shader, void *p_mesh_surface) {
+		const uint64_t input_mask = p_shader->get_vertex_input_mask(pipeline_key.version, pipeline_key.color_pass_flags, true);
+		const bool motion_vectors = pipeline_key.color_pass_flags & SceneShaderForwardClustered::PIPELINE_COLOR_PASS_FLAG_MOTION_VECTORS;
+		const bool emulate_point_size = p_shader->uses_point_size && scene_shader.emulate_point_size;
+		pipeline_key.vertex_format_id = mesh_storage->mesh_surface_get_vertex_format(p_mesh_surface, input_mask, p_surface.instanced, motion_vectors, emulate_point_size);
+		p_shader->pipeline_hash_map.compile_pipeline(pipeline_key, pipeline_key.hash(), p_source, false);
+		if (r_pipeline_pairs != nullptr) {
+			r_pipeline_pairs->push_back({ p_shader, pipeline_key });
+		}
+	};
+	for (uint32_t i = p_from; i < p_passes.size(); i++) {
+		const DrawnPass &pass = p_passes[i];
+		const bool multiview = (pass.color_pass_flags & SceneShaderForwardClustered::PIPELINE_COLOR_PASS_FLAG_MULTIVIEW) || pass.version == SceneShaderForwardClustered::PIPELINE_VERSION_DEPTH_PASS_MULTIVIEW ||
+				pass.version == SceneShaderForwardClustered::PIPELINE_VERSION_DEPTH_PASS_WITH_NORMAL_AND_ROUGHNESS_MULTIVIEW || pass.version == SceneShaderForwardClustered::PIPELINE_VERSION_DEPTH_PASS_WITH_NORMAL_AND_ROUGHNESS_AND_VOXEL_GI_MULTIVIEW;
+		if (multiview && !multiview_enabled) {
+			continue;
+		}
+		pipeline_key.version = SceneShaderForwardClustered::PipelineVersion(pass.version);
+		pipeline_key.framebuffer_format_id = pass.framebuffer_format_id;
+		pipeline_key.color_pass_flags = pass.color_pass_flags;
+		if (pass.version == SceneShaderForwardClustered::PIPELINE_VERSION_COLOR_PASS) {
+			const bool transparent = pass.color_pass_flags & SceneShaderForwardClustered::PIPELINE_COLOR_PASS_FLAG_TRANSPARENT;
+			if (transparent ? !p_surface.uses_transparent : !p_surface.uses_opaque) {
+				continue;
+			}
+			compile(p_surface.shader, p_surface.mesh_surface);
+			if (p_global.use_lightmaps && p_surface.can_use_lightmap) {
+				pipeline_key.color_pass_flags = pass.color_pass_flags | SceneShaderForwardClustered::PIPELINE_COLOR_PASS_FLAG_LIGHTMAP;
+				compile(p_surface.shader, p_surface.mesh_surface);
+			}
+		} else {
+			if (!p_surface.uses_depth) {
+				continue;
+			}
+			// Plain depth and shadow passes draw the shadow shader (render list: shadow_pass || PASS_MODE_DEPTH).
+			const bool shadow_shader = pass.version == SceneShaderForwardClustered::PIPELINE_VERSION_DEPTH_PASS || pass.version == SceneShaderForwardClustered::PIPELINE_VERSION_DEPTH_PASS_DP || pass.version == SceneShaderForwardClustered::PIPELINE_VERSION_DEPTH_PASS_MULTIVIEW;
+			if (shadow_shader) {
+				compile(p_surface.shader_shadow, p_surface.mesh_surface_shadow);
+			} else {
+				compile(p_surface.shader, p_surface.mesh_surface);
+			}
+		}
+	}
+}
+
 void RenderForwardClustered::_mesh_compile_pipelines_for_surface(const SurfacePipelineData &p_surface, const GlobalPipelineData &p_global, RSE::PipelineSource p_source, Vector<ShaderPipelinePair> *r_pipeline_pairs) {
+	_mesh_compile_stock_pipelines_for_surface(p_surface, p_global, p_source, r_pipeline_pairs);
+	thread_local LocalVector<DrawnPass> passes;
+	_drawn_passes_copy(passes);
+	_mesh_compile_drawn_passes_for_surface(p_surface, p_global, passes, 0, p_source, r_pipeline_pairs);
+}
+
+void RenderForwardClustered::_mesh_compile_stock_pipelines_for_surface(const SurfacePipelineData &p_surface, const GlobalPipelineData &p_global, RSE::PipelineSource p_source, Vector<ShaderPipelinePair> *r_pipeline_pairs) {
 	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
 	bool octmap_use_storage = !copy_effects->get_raster_effects().has_flag(RendererRD::CopyEffects::RASTER_EFFECT_OCTMAP);
 
@@ -4904,20 +4993,24 @@ void RenderForwardClustered::_mesh_compile_pipelines_for_surface(const SurfacePi
 	}
 }
 
-void RenderForwardClustered::_mesh_generate_all_pipelines_for_surface_cache(GeometryInstanceSurfaceDataCache *p_surface_cache, const GlobalPipelineData &p_global) {
+void RenderForwardClustered::_surface_pipeline_data_from_cache(GeometryInstanceSurfaceDataCache *p_surface_cache, SurfacePipelineData &r_surface) {
 	bool uses_alpha_pass = (p_surface_cache->flags & GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA) != 0;
 	float multiplied_fade_alpha = p_surface_cache->owner->force_alpha * p_surface_cache->owner->parent_fade_alpha;
 	bool uses_fade = (multiplied_fade_alpha < FADE_ALPHA_PASS_THRESHOLD) || p_surface_cache->owner->fade_near || p_surface_cache->owner->fade_far;
+	r_surface.mesh_surface = p_surface_cache->surface;
+	r_surface.mesh_surface_shadow = p_surface_cache->surface_shadow;
+	r_surface.shader = p_surface_cache->shader;
+	r_surface.shader_shadow = p_surface_cache->shader_shadow;
+	r_surface.instanced = p_surface_cache->owner->mesh_instance.is_valid();
+	r_surface.uses_opaque = !uses_alpha_pass;
+	r_surface.uses_transparent = uses_alpha_pass || uses_fade;
+	r_surface.uses_depth = (p_surface_cache->flags & (GeometryInstanceSurfaceDataCache::FLAG_PASS_DEPTH | GeometryInstanceSurfaceDataCache::FLAG_PASS_OPAQUE | GeometryInstanceSurfaceDataCache::FLAG_PASS_SHADOW)) != 0;
+	r_surface.can_use_lightmap = p_surface_cache->owner->lightmap_instance.is_valid() || p_surface_cache->owner->lightmap_sh;
+}
+
+void RenderForwardClustered::_mesh_generate_all_pipelines_for_surface_cache(GeometryInstanceSurfaceDataCache *p_surface_cache, const GlobalPipelineData &p_global) {
 	SurfacePipelineData surface;
-	surface.mesh_surface = p_surface_cache->surface;
-	surface.mesh_surface_shadow = p_surface_cache->surface_shadow;
-	surface.shader = p_surface_cache->shader;
-	surface.shader_shadow = p_surface_cache->shader_shadow;
-	surface.instanced = p_surface_cache->owner->mesh_instance.is_valid();
-	surface.uses_opaque = !uses_alpha_pass;
-	surface.uses_transparent = uses_alpha_pass || uses_fade;
-	surface.uses_depth = (p_surface_cache->flags & (GeometryInstanceSurfaceDataCache::FLAG_PASS_DEPTH | GeometryInstanceSurfaceDataCache::FLAG_PASS_OPAQUE | GeometryInstanceSurfaceDataCache::FLAG_PASS_SHADOW)) != 0;
-	surface.can_use_lightmap = p_surface_cache->owner->lightmap_instance.is_valid() || p_surface_cache->owner->lightmap_sh;
+	_surface_pipeline_data_from_cache(p_surface_cache, surface);
 	_mesh_compile_pipelines_for_surface(surface, p_global, RSE::PIPELINE_SOURCE_SURFACE);
 }
 
@@ -4931,6 +5024,23 @@ void RenderForwardClustered::_update_dirty_geometry_instances() {
 }
 
 void RenderForwardClustered::_update_dirty_geometry_pipelines() {
+	thread_local LocalVector<DrawnPass> passes;
+	_drawn_passes_copy(passes);
+	if (global_pipeline_data_required.key == global_pipeline_data_compiled.key && drawn_passes_compiled < passes.size()) {
+		GodotProfileZone("fc.drawn_pass_pipelines");
+		// A pass layout drew for the first time: give every existing surface its ubershader for it, in the background.
+		SelfList<GeometryInstanceSurfaceDataCache> *list = geometry_surface_compilation_all_list.first();
+		while (list != nullptr) {
+			GeometryInstanceSurfaceDataCache *surface_cache = list->self();
+			if (!surface_cache->compilation_dirty_element.in_list()) {
+				SurfacePipelineData surface;
+				_surface_pipeline_data_from_cache(surface_cache, surface);
+				_mesh_compile_drawn_passes_for_surface(surface, global_pipeline_data_compiled, passes, drawn_passes_compiled, RSE::PIPELINE_SOURCE_SURFACE, nullptr);
+			}
+			list = list->next();
+		}
+		drawn_passes_compiled = passes.size();
+	}
 	if (global_pipeline_data_required.key != global_pipeline_data_compiled.key) {
 		// Go through the entire list of surfaces and compile pipelines for everything again.
 		SelfList<GeometryInstanceSurfaceDataCache> *list = geometry_surface_compilation_all_list.first();
@@ -4947,6 +5057,7 @@ void RenderForwardClustered::_update_dirty_geometry_pipelines() {
 		}
 
 		global_pipeline_data_compiled.key = global_pipeline_data_required.key;
+		drawn_passes_compiled = passes.size();
 	} else {
 		// Compile pipelines only for the dirty list.
 		if (!geometry_surface_compilation_dirty_list.first()) {
