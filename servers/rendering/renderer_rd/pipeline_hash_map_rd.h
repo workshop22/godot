@@ -40,6 +40,7 @@
 #include "core/templates/vector.h"
 #include "servers/rendering/rendering_device.h"
 #include "servers/rendering/rendering_server_enums.h"
+#include "core/profiling/profiling.h"
 
 #define PRINT_PIPELINE_COMPILATION_KEYS 0
 
@@ -124,6 +125,12 @@ public:
 			compilations[p_source]++;
 		}
 
+#ifdef LIGHTCYCLE_SLOWZONE
+		if (slowzone::pipelog_enabled()) {
+			static const char *source_names[] = { "canvas", "mesh", "surface", "draw", "specialization" };
+			slowzone::pipelog("PIPEREQ obj=%p hash=%08x src=%s prio=%d", (void *)creation_object, p_key_hash, p_source < 5 ? source_names[p_source] : "?", int(p_high_priority));
+		}
+#endif
 #if PRINT_PIPELINE_COMPILATION_KEYS
 		String source_name = "UNKNOWN";
 		switch (p_source) {
@@ -191,7 +198,15 @@ public:
 			compile_pipeline(p_key, p_key_hash, p_source, p_wait_for_compilation);
 
 			if (p_wait_for_compilation) {
+#ifdef LIGHTCYCLE_SLOWZONE
+				const int64_t wait_start = slowzone::now_us();
 				wait_for_pipeline(p_key_hash);
+				if (slowzone::pipelog_enabled()) {
+					slowzone::pipelog("PIPEWAIT obj=%p hash=%08x src=%d %.2fms", (void *)creation_object, p_key_hash, int(p_source), (slowzone::now_us() - wait_start) / 1000.0);
+				}
+#else
+				wait_for_pipeline(p_key_hash);
+#endif
 				_add_new_pipelines_to_map();
 
 				e = hash_map.find(p_key_hash);

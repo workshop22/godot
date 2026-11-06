@@ -37,6 +37,7 @@
 #include "core/os/os.h"
 #include "core/string/string_builder.h"
 #include "core/version.h"
+#include "core/profiling/profiling.h"
 #include "servers/rendering/shader_include_db.h"
 
 #define ENABLE_SHADER_CACHE 1
@@ -411,12 +412,20 @@ void ShaderRD::_compile_variant(uint32_t p_variant, CompileData p_data) {
 		return; // Variant is disabled, return.
 	}
 
+#ifdef LIGHTCYCLE_SLOWZONE
+	const int64_t variant_start = slowzone::now_us();
+#endif
 	Vector<String> variant_stage_sources = _build_variant_stage_sources(variant, p_data);
 	Vector<RD::ShaderStageSPIRVData> variant_stages = compile_stages(variant_stage_sources, dynamic_buffers);
 	ERR_FAIL_COND(variant_stages.is_empty());
 
 	Vector<uint8_t> shader_data = RD::get_singleton()->shader_compile_binary_from_spirv(variant_stages, name + ":" + itos(variant));
 	ERR_FAIL_COND(shader_data.is_empty());
+#ifdef LIGHTCYCLE_SLOWZONE
+	if (slowzone::pipelog_enabled()) {
+		slowzone::pipelog("SHADERVARIANT name=%s variant=%d group=%d %.2fms", name.utf8().get_data(), variant, p_data.group, (slowzone::now_us() - variant_start) / 1000.0);
+	}
+#endif
 
 	{
 		p_data.version->variants.write[variant] = RD::get_singleton()->shader_create_from_bytecode_with_samplers(shader_data, p_data.version->variants[variant], immutable_samplers);
@@ -731,9 +740,20 @@ void ShaderRD::_compile_version_start(Version *p_version, int p_group) {
 
 #if ENABLE_SHADER_CACHE
 	if (shader_cache_user_dir_valid || shader_cache_res_dir_valid) {
+#ifdef LIGHTCYCLE_SLOWZONE
+		const int64_t load_start = slowzone::now_us();
+		const bool loaded = _load_from_cache(p_version, p_group);
+		if (slowzone::pipelog_enabled()) {
+			slowzone::pipelog("SHADERRD start name=%s group=%d cache=%s %.2fms", name.utf8().get_data(), p_group, loaded ? "hit" : "miss", (slowzone::now_us() - load_start) / 1000.0);
+		}
+		if (loaded) {
+			return;
+		}
+#else
 		if (_load_from_cache(p_version, p_group)) {
 			return;
 		}
+#endif
 	}
 #endif
 
@@ -750,7 +770,15 @@ void ShaderRD::_compile_version_end(Version *p_version, int p_group) {
 		return;
 	}
 	WorkerThreadPool::GroupID group_task = p_version->group_compilation_tasks[p_group];
+#ifdef LIGHTCYCLE_SLOWZONE
+	const int64_t wait_start = slowzone::now_us();
 	WorkerThreadPool::get_singleton()->wait_for_group_task_completion(group_task);
+	if (slowzone::pipelog_enabled()) {
+		slowzone::pipelog("SHADERRD end name=%s group=%d wait %.2fms", name.utf8().get_data(), p_group, (slowzone::now_us() - wait_start) / 1000.0);
+	}
+#else
+	WorkerThreadPool::get_singleton()->wait_for_group_task_completion(group_task);
+#endif
 	p_version->group_compilation_tasks.write[p_group] = 0;
 
 	bool all_valid = true;

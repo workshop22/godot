@@ -29,6 +29,7 @@
 /**************************************************************************/
 
 #include "scene_shader_forward_clustered.h"
+#include "core/profiling/profiling.h"
 
 #include "core/config/project_settings.h"
 #include "core/math/math_defs.h"
@@ -42,6 +43,21 @@ void SceneShaderForwardClustered::ShaderData::set_code(const String &p_code) {
 	//compile
 
 	code = p_code;
+#ifdef LIGHTCYCLE_SLOWZONE
+	if (slowzone::pipelog_enabled() && !p_code.is_empty()) {
+		// Identify generated (StandardMaterial3D) shaders by their render modes and uniform names.
+		String head;
+		for (const String &line : p_code.split("\n")) {
+			const String l = line.strip_edges();
+			if (l.begins_with("render_mode") || l.begins_with("shader_type")) {
+				head += l + " ";
+			} else if (l.begins_with("uniform ") || l.begins_with("instance uniform")) {
+				head += l.get_slicec(' ', l.begins_with("instance") ? 3 : 2).get_slicec(':', 0).get_slicec(';', 0) + ",";
+			}
+		}
+		slowzone::pipelog("PIPESHADER %s obj=%p code=%08x path=\"%s\" %s", "scene", (void *)this, p_code.hash(), path.utf8().get_data(), head.left(900).utf8().get_data());
+	}
+#endif
 	ubo_size = 0;
 	uniforms.clear();
 	_clear_vertex_input_mask_cache();
@@ -530,7 +546,19 @@ void SceneShaderForwardClustered::ShaderData::_create_pipeline(PipelineKey p_pip
 	RID shader_rid = get_shader_variant(p_pipeline_key.version, p_pipeline_key.color_pass_flags, p_pipeline_key.ubershader);
 	ERR_FAIL_COND(shader_rid.is_null());
 
+#ifdef LIGHTCYCLE_SLOWZONE
+	const int64_t create_start = slowzone::now_us();
+#endif
 	RID pipeline = RD::get_singleton()->render_pipeline_create(shader_rid, p_pipeline_key.framebuffer_format_id, p_pipeline_key.vertex_format_id, primitive_rd, raster_state, multisample_state, depth_stencil_state, blend_state, 0, 0, specialization_constants);
+#ifdef LIGHTCYCLE_SLOWZONE
+	if (slowzone::pipelog_enabled()) {
+		slowzone::pipelog("PIPEMAKE scene obj=%p code=%08x path=\"%s\" hash=%08x ver=%d flags=%d uber=%d cull=%d prim=%d vf=%lld fb=%lld spec=%08x/%08x/%08x blend=%d %.2fms",
+				(void *)this, code.hash(), path.utf8().get_data(), p_pipeline_key.hash(), int(p_pipeline_key.version), int(p_pipeline_key.color_pass_flags), int(p_pipeline_key.ubershader),
+				int(p_pipeline_key.cull_mode), int(p_pipeline_key.primitive_type), (long long)p_pipeline_key.vertex_format_id, (long long)p_pipeline_key.framebuffer_format_id,
+				p_pipeline_key.shader_specialization.packed_0, p_pipeline_key.shader_specialization.packed_1, p_pipeline_key.shader_specialization.packed_2, blend_mode,
+				(slowzone::now_us() - create_start) / 1000.0);
+	}
+#endif
 	ERR_FAIL_COND(pipeline.is_null());
 
 	pipeline_hash_map.add_compiled_pipeline(p_pipeline_key.hash(), pipeline);

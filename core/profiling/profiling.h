@@ -252,6 +252,9 @@ int64_t threshold_us();
 void report(const char *p_name, int64_t p_start_us, int64_t p_dur_us, int p_depth);
 void frame_mark();
 void report_command(const char *p_name, uint64_t p_method, int64_t p_start_us, int64_t p_dur_us);
+// PRIVATE pipeline/shader compile log (GODOT_PIPELOG=1): one line per event, prefixed with thread, process frame and time.
+bool pipelog_enabled();
+void pipelog(const char *p_format, ...);
 extern thread_local int depth;
 // One queue flush: per-method command counts and time; a flush over the threshold prints its top methods.
 struct FlushStats {

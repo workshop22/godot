@@ -29,6 +29,7 @@
 /**************************************************************************/
 
 #include "renderer_canvas_render_rd.h"
+#include "core/profiling/profiling.h"
 
 #include "core/config/engine.h"
 #include "core/config/project_settings.h"
@@ -1533,7 +1534,18 @@ void RendererCanvasRenderRD::CanvasShaderData::_create_pipeline(PipelineKey p_pi
 	RID shader_rid = get_shader(p_pipeline_key.variant, p_pipeline_key.ubershader);
 	ERR_FAIL_COND(shader_rid.is_null());
 
+#ifdef LIGHTCYCLE_SLOWZONE
+	const int64_t create_start = slowzone::now_us();
+#endif
 	RID pipeline = RD::get_singleton()->render_pipeline_create(shader_rid, p_pipeline_key.framebuffer_format_id, p_pipeline_key.vertex_format_id, p_pipeline_key.render_primitive, RD::PipelineRasterizationState(), multisample_state, RD::PipelineDepthStencilState(), blend_state, dynamic_state_flags, 0, specialization_constants);
+#ifdef LIGHTCYCLE_SLOWZONE
+	if (slowzone::pipelog_enabled()) {
+		slowzone::pipelog("PIPEMAKE canvas obj=%p code=%08x path=\"%s\" hash=%08x variant=%d uber=%d prim=%d vf=%lld fb=%lld spec=%08x blend=%d %.2fms",
+				(void *)this, code.hash(), path.utf8().get_data(), p_pipeline_key.hash(), int(p_pipeline_key.variant), int(p_pipeline_key.ubershader), int(p_pipeline_key.render_primitive),
+				(long long)p_pipeline_key.vertex_format_id, (long long)p_pipeline_key.framebuffer_format_id, p_pipeline_key.shader_specialization.packed_0, blend_mode,
+				(slowzone::now_us() - create_start) / 1000.0);
+	}
+#endif
 	ERR_FAIL_COND(pipeline.is_null());
 
 	pipeline_hash_map.add_compiled_pipeline(p_pipeline_key.hash(), pipeline);
@@ -1543,6 +1555,21 @@ void RendererCanvasRenderRD::CanvasShaderData::set_code(const String &p_code) {
 	//compile
 
 	code = p_code;
+#ifdef LIGHTCYCLE_SLOWZONE
+	if (slowzone::pipelog_enabled() && !p_code.is_empty()) {
+		// Identify generated (StandardMaterial3D) shaders by their render modes and uniform names.
+		String head;
+		for (const String &line : p_code.split("\n")) {
+			const String l = line.strip_edges();
+			if (l.begins_with("render_mode") || l.begins_with("shader_type")) {
+				head += l + " ";
+			} else if (l.begins_with("uniform ") || l.begins_with("instance uniform")) {
+				head += l.get_slicec(' ', l.begins_with("instance") ? 3 : 2).get_slicec(':', 0).get_slicec(';', 0) + ",";
+			}
+		}
+		slowzone::pipelog("PIPESHADER %s obj=%p code=%08x path=\"%s\" %s", "canvas", (void *)this, p_code.hash(), path.utf8().get_data(), head.left(900).utf8().get_data());
+	}
+#endif
 	ubo_size = 0;
 	uniforms.clear();
 	uses_screen_texture = false;

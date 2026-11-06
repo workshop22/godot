@@ -247,8 +247,10 @@ void godot_cleanup_profiler() {
 #endif
 
 #if defined(LIGHTCYCLE_SLOWZONE) && !defined(GODOT_USE_TRACY) && !defined(GODOT_USE_PERFETTO) && !defined(GODOT_USE_INSTRUMENTS)
+#include "core/config/engine.h"
 #include "core/os/thread.h"
 #include <atomic>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 namespace slowzone {
@@ -290,6 +292,20 @@ void FlushStats::finish() {
 void report_command(const char *p_name, uint64_t p_method, int64_t p_start_us, int64_t p_dur_us) {
 	fprintf(stderr, "SLOWZONE t=%llu frame=%llu d=-1 %.2fms at=%.3fs command method=%llx %s\n", (unsigned long long)Thread::get_caller_id(),
 			(unsigned long long)frames.load(std::memory_order_relaxed), p_dur_us / 1000.0, (p_start_us - origin) / 1e6, (unsigned long long)p_method, p_name);
+	fflush(stderr);
+}
+bool pipelog_enabled() {
+	static bool on = [] { const char *e = getenv("GODOT_PIPELOG"); return e && e[0] == '1'; }();
+	return on;
+}
+void pipelog(const char *p_format, ...) {
+	char buffer[2048];
+	va_list args;
+	va_start(args, p_format);
+	vsnprintf(buffer, sizeof(buffer), p_format, args);
+	va_end(args);
+	fprintf(stderr, "PIPELOG t=%llu pf=%llu at=%.3fs %s\n", (unsigned long long)Thread::get_caller_id(),
+			(unsigned long long)Engine::get_singleton()->get_process_frames(), (now_us() - origin) / 1e6, buffer);
 	fflush(stderr);
 }
 } //namespace slowzone
