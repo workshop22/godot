@@ -30,6 +30,8 @@
 
 #pragma once
 
+#define LIGHTCYCLE_SLOWZONE 1 // PRIVATE diagnostic build
+
 #include "core/profiling/profiling.gen.h" // IWYU pragma: keep.
 
 // This header provides profiling primitives (implemented as macros) for various backends.
@@ -237,6 +239,89 @@ private:
 
 void godot_init_profiler();
 void godot_cleanup_profiler();
+
+#elif defined(LIGHTCYCLE_SLOWZONE)
+// PRIVATE diagnostic (perf-claude-1106c): every zone that runs longer than GODOT_SLOWZONE_US
+// (default 8000) prints one SLOWZONE line to stderr with its thread, frame, depth and duration.
+#include <chrono>
+#include <cstdint>
+
+namespace slowzone {
+inline int64_t now_us() { return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+int64_t threshold_us();
+void report(const char *p_name, int64_t p_start_us, int64_t p_dur_us, int p_depth);
+void frame_mark();
+void report_command(const char *p_name, uint64_t p_method, int64_t p_start_us, int64_t p_dur_us);
+extern thread_local int depth;
+// One queue flush: per-method command counts and time; a flush over the threshold prints its top methods.
+struct FlushStats {
+	static constexpr int SLOTS = 48;
+	uint64_t method[SLOTS] = {};
+	const char *name[SLOTS] = {};
+	int64_t us[SLOTS] = {};
+	uint32_t count[SLOTS] = {};
+	int used = 0;
+	uint32_t total = 0;
+	int64_t start = 0;
+	int64_t busy = 0;
+	void add(uint64_t p_method, const char *p_name, int64_t p_us) {
+		total++;
+		busy += p_us;
+		for (int i = 0; i < used; i++) {
+			if (method[i] == p_method && name[i] == p_name) {
+				us[i] += p_us;
+				count[i]++;
+				return;
+			}
+		}
+		if (used < SLOTS) {
+			method[used] = p_method;
+			name[used] = p_name;
+			us[used] = p_us;
+			count[used] = 1;
+			used++;
+		}
+	}
+	void finish();
+};
+struct Zone {
+	const char *name = nullptr;
+	int64_t start = 0;
+	Zone() {}
+	explicit Zone(const char *p_name) { begin(p_name); }
+	void begin(const char *p_name) {
+		name = p_name;
+		start = now_us();
+		depth++;
+	}
+	void end() {
+		if (name) {
+			depth--;
+			int64_t d = now_us() - start;
+			if (d >= threshold_us()) {
+				report(name, start, d, depth);
+			}
+			name = nullptr;
+		}
+	}
+	~Zone() { end(); }
+};
+} //namespace slowzone
+
+void godot_init_profiler();
+void godot_cleanup_profiler();
+
+#define GodotProfileFrameMark slowzone::frame_mark();
+#define GodotProfileZone(m_zone_name) slowzone::Zone GD_UNIQUE_NAME(__slowzone_)(m_zone_name);
+#define GodotProfileZoneGroupedFirst(m_group_name, m_zone_name) slowzone::Zone __slowzone_##m_group_name(m_zone_name);
+#define GodotProfileZoneGroupedEndEarly(m_group_name, m_zone_name) __slowzone_##m_group_name.end();
+#define GodotProfileZoneGrouped(m_group_name, m_zone_name) \
+	__slowzone_##m_group_name.end();                         \
+	__slowzone_##m_group_name.begin(m_zone_name);
+#define GodotProfileAlloc(m_ptr, m_size)
+#define GodotProfileFree(m_ptr)
+#define GodotProfileZoneScript(m_ptr, m_file, m_function, m_name, m_line)
+#define GodotProfileZoneScriptSystemCall(m_ptr, m_file, m_function, m_name, m_line)
 
 #else
 // No profiling; all macros are stubs.

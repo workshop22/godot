@@ -37,6 +37,9 @@
 #include "core/templates/simple_type.h"
 #include "core/templates/tuple.h"
 #include "core/typedefs.h"
+#include "core/profiling/profiling.h" // PRIVATE slow-command diagnostic
+
+#include <cstring>
 
 class CommandQueueMT {
 	static const size_t MAX_COMMAND_SIZE = 1024;
@@ -44,6 +47,8 @@ class CommandQueueMT {
 	struct CommandBase {
 		bool sync = false;
 		virtual void call() = 0;
+		virtual const char *name() const { return "?"; }
+		virtual uint64_t method_bits() const { return 0; }
 		virtual ~CommandBase() = default;
 
 		CommandBase(bool p_sync) :
@@ -62,6 +67,12 @@ class CommandQueueMT {
 
 		void call() override {
 			call_impl(BuildIndexSequence<sizeof...(Args)>{});
+		}
+		const char *name() const override { return __PRETTY_FUNCTION__; }
+		uint64_t method_bits() const override {
+			uint64_t bits = 0;
+			memcpy(&bits, &method, sizeof(bits) < sizeof(method) ? sizeof(bits) : sizeof(method));
+			return bits;
 		}
 
 	private:
@@ -89,6 +100,12 @@ class CommandQueueMT {
 
 		void call() override {
 			*ret = call_impl(BuildIndexSequence<sizeof...(Args)>{});
+		}
+		const char *name() const override { return __PRETTY_FUNCTION__; }
+		uint64_t method_bits() const override {
+			uint64_t bits = 0;
+			memcpy(&bits, &method, sizeof(bits) < sizeof(method) ? sizeof(bits) : sizeof(method));
+			return bits;
 		}
 
 	private:
@@ -176,6 +193,10 @@ class CommandQueueMT {
 		}
 
 		alignas(uint64_t) char cmd_local_mem[MAX_COMMAND_SIZE];
+#ifdef LIGHTCYCLE_SLOWZONE
+		slowzone::FlushStats flush_stats;
+		flush_stats.start = slowzone::now_us();
+#endif
 
 		while (flush_read_ptr < command_mem.size()) {
 			uint64_t size = *(uint64_t *)&command_mem[flush_read_ptr];
@@ -189,7 +210,17 @@ class CommandQueueMT {
 			memcpy(cmd_local_mem, (char *)cmd_original, size);
 
 			lock.temp_unlock();
+#ifdef LIGHTCYCLE_SLOWZONE
+			int64_t slow_start = slowzone::now_us();
 			cmd_local->call();
+			int64_t slow_dur = slowzone::now_us() - slow_start;
+			if (slow_dur >= slowzone::threshold_us()) {
+				slowzone::report_command(cmd_local->name(), cmd_local->method_bits(), slow_start, slow_dur);
+			}
+			flush_stats.add(cmd_local->method_bits(), cmd_local->name(), slow_dur);
+#else
+			cmd_local->call();
+#endif
 			lock.temp_relock();
 
 			if (unlikely(cmd_local->sync)) {
@@ -207,6 +238,9 @@ class CommandQueueMT {
 		command_mem.clear();
 		pending.store(false);
 		flush_read_ptr = 0;
+#ifdef LIGHTCYCLE_SLOWZONE
+		flush_stats.finish();
+#endif
 
 		_prevent_sync_wraparound();
 

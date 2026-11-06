@@ -1165,6 +1165,7 @@ Error RenderingDevice::_buffer_update(Buffer *p_buffer, RID p_buffer_id, uint32_
 }
 
 Error RenderingDevice::buffer_update(RID p_buffer, uint32_t p_offset, uint32_t p_size, const void *p_data, bool p_skip_check) {
+	GodotProfileZone("rd.buffer_update");
 	ERR_RENDER_THREAD_GUARD_V(ERR_UNAVAILABLE);
 
 	ERR_FAIL_COND_V_MSG(draw_list.active && !p_skip_check, ERR_INVALID_PARAMETER,
@@ -1547,6 +1548,7 @@ RID RenderingDevice::texture_buffer_create(uint32_t p_size_elements, DataFormat 
 /*****************/
 
 RID RenderingDevice::texture_create(const TextureFormat &p_format, const TextureView &p_view, const Vector<Vector<uint8_t>> &p_data) {
+	GodotProfileZone("rd.texture_create");
 	// Some adjustments will happen.
 	TextureFormat format = p_format;
 
@@ -2253,6 +2255,7 @@ Error RenderingDevice::_texture_initialize(RID p_texture, uint32_t p_layer, cons
 }
 
 Error RenderingDevice::texture_update(RID p_texture, uint32_t p_layer, const Vector<uint8_t> &p_data) {
+	GodotProfileZone("rd.texture_update");
 	ERR_RENDER_THREAD_GUARD_V(ERR_UNAVAILABLE);
 
 	ERR_FAIL_COND_V_MSG(draw_list.active, ERR_INVALID_PARAMETER, "Updating textures is forbidden during creation of a draw list.");
@@ -4171,6 +4174,7 @@ RID RenderingDevice::shader_create_from_bytecode(const Vector<uint8_t> &p_shader
 }
 
 RID RenderingDevice::shader_create_from_bytecode_with_samplers(const Vector<uint8_t> &p_shader_binary, RID p_placeholder, const Vector<PipelineImmutableSampler> &p_immutable_samplers) {
+	GodotProfileZone("rd.shader_create");
 	_THREAD_SAFE_METHOD_
 
 	Ref<RenderingShaderContainer> shader_container = driver->get_shader_container_format().create_container();
@@ -4363,6 +4367,7 @@ void RenderingDevice::_uniform_set_update_clears(UniformSet *p_uniform_set) {
 }
 
 RID RenderingDevice::uniform_set_create(const VectorView<RD::Uniform> &p_uniforms, RID p_shader, uint32_t p_shader_set, bool p_linear_pool) {
+	GodotProfileZone("rd.uniform_set_create");
 	_THREAD_SAFE_METHOD_
 
 	ERR_FAIL_COND_V(p_uniforms.size() == 0, RID());
@@ -4821,6 +4826,7 @@ bool RenderingDevice::uniform_sets_have_linear_pools() const {
 /*******************/
 
 RID RenderingDevice::render_pipeline_create(RID p_shader, FramebufferFormatID p_framebuffer_format, VertexFormatID p_vertex_format, RenderPrimitive p_render_primitive, const PipelineRasterizationState &p_rasterization_state, const PipelineMultisampleState &p_multisample_state, const PipelineDepthStencilState &p_depth_stencil_state, const PipelineColorBlendState &p_blend_state, BitField<PipelineDynamicStateFlags> p_dynamic_state_flags, uint32_t p_for_render_pass, const Vector<PipelineSpecializationConstant> &p_specialization_constants) {
+	GodotProfileZone("rd.render_pipeline_create");
 	// Needs a shader.
 	Shader *shader = shader_owner.get_or_null(p_shader);
 	ERR_FAIL_NULL_V(shader, RID());
@@ -5020,6 +5026,7 @@ bool RenderingDevice::render_pipeline_is_valid(RID p_pipeline) {
 }
 
 RID RenderingDevice::compute_pipeline_create(RID p_shader, const Vector<PipelineSpecializationConstant> &p_specialization_constants) {
+	GodotProfileZone("rd.compute_pipeline_create");
 	Shader *shader;
 
 	{
@@ -7902,6 +7909,7 @@ void RenderingDevice::sync() {
 }
 
 void RenderingDevice::_free_pending_resources(int p_frame) {
+	GodotProfileZone("rd.free_pending");
 	// Free in dependency usage order, so nothing weird happens.
 	// Pipelines.
 	while (frames[p_frame].render_pipelines_to_dispose_of.front()) {
@@ -8616,6 +8624,7 @@ Vector<uint8_t> RenderingDevice::_load_pipeline_cache() {
 }
 
 void RenderingDevice::update_pipeline_cache(bool p_closing, bool p_force) {
+	GodotProfileZone("rd.update_pipeline_cache");
 	_THREAD_SAFE_METHOD_
 
 	{

@@ -28,6 +28,7 @@
 /* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                 */
 /**************************************************************************/
 
+#include "core/profiling/profiling.h"
 #include "material_storage.h"
 
 #include "core/config/engine.h"
@@ -2421,6 +2422,7 @@ void MaterialStorage::_material_queue_update(Material *material, bool p_uniform,
 }
 
 void MaterialStorage::_update_queued_materials() {
+	GodotProfileZone("material.update_queued");
 	SelfList<Material>::List copy;
 	{
 		MutexLock lock(material_update_list_mutex);

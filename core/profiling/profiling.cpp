@@ -245,3 +245,52 @@ void godot_cleanup_profiler() {
 	// Stub
 }
 #endif
+
+#if defined(LIGHTCYCLE_SLOWZONE) && !defined(GODOT_USE_TRACY) && !defined(GODOT_USE_PERFETTO) && !defined(GODOT_USE_INSTRUMENTS)
+#include "core/os/thread.h"
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+namespace slowzone {
+thread_local int depth = 0;
+static std::atomic<uint64_t> frames{ 0 };
+static int64_t origin = now_us();
+int64_t threshold_us() {
+	static int64_t t = [] { const char *e = getenv("GODOT_SLOWZONE_US"); return e ? int64_t(atoll(e)) : int64_t(8000); }();
+	return t;
+}
+void frame_mark() { frames.fetch_add(1, std::memory_order_relaxed); }
+void report(const char *p_name, int64_t p_start_us, int64_t p_dur_us, int p_depth) {
+	fprintf(stderr, "SLOWZONE t=%llu frame=%llu d=%d %.2fms at=%.3fs %s\n", (unsigned long long)Thread::get_caller_id(),
+			(unsigned long long)frames.load(std::memory_order_relaxed), p_depth, p_dur_us / 1000.0, (p_start_us - origin) / 1e6, p_name);
+	fflush(stderr);
+}
+void FlushStats::finish() {
+	int64_t wall = now_us() - start;
+	if (busy < threshold_us()) {
+		return;
+	}
+	fprintf(stderr, "SLOWFLUSH t=%llu frame=%llu busy=%.2fms wall=%.2fms at=%.3fs commands=%u kinds=%d\n", (unsigned long long)Thread::get_caller_id(),
+			(unsigned long long)frames.load(std::memory_order_relaxed), busy / 1000.0, wall / 1000.0, (start - origin) / 1e6, total, used);
+	for (int k = 0; k < 8; k++) {
+		int best = -1;
+		for (int i = 0; i < used; i++) {
+			if (us[i] >= 0 && (best < 0 || us[i] > us[best])) {
+				best = i;
+			}
+		}
+		if (best < 0 || us[best] < 200) {
+			break;
+		}
+		fprintf(stderr, "SLOWFLUSH  %.2fms x%u method=%llx %s\n", us[best] / 1000.0, count[best], (unsigned long long)method[best], name[best]);
+		us[best] = -1;
+	}
+	fflush(stderr);
+}
+void report_command(const char *p_name, uint64_t p_method, int64_t p_start_us, int64_t p_dur_us) {
+	fprintf(stderr, "SLOWZONE t=%llu frame=%llu d=-1 %.2fms at=%.3fs command method=%llx %s\n", (unsigned long long)Thread::get_caller_id(),
+			(unsigned long long)frames.load(std::memory_order_relaxed), p_dur_us / 1000.0, (p_start_us - origin) / 1e6, (unsigned long long)p_method, p_name);
+	fflush(stderr);
+}
+} //namespace slowzone
+#endif

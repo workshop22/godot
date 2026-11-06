@@ -28,6 +28,7 @@
 /* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                 */
 /**************************************************************************/
 
+#include "core/profiling/profiling.h"
 #include "mesh_storage.h"
 
 #include "servers/rendering/renderer_viewport.h"
@@ -2255,6 +2256,7 @@ MeshStorage::MultiMeshInterpolator *MeshStorage::_multimesh_get_interpolator(RID
 }
 
 void MeshStorage::_update_dirty_multimeshes() {
+	GodotProfileZone("mesh.dirty_multimeshes");
 	while (multimesh_dirty_list) {
 		MultiMesh *multimesh = multimesh_dirty_list;
 

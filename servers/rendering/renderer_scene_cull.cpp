@@ -28,6 +28,7 @@
 /* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                 */
 /**************************************************************************/
 
+#include "core/profiling/profiling.h"
 #include "renderer_scene_cull.h"
 
 #include "core/config/engine.h"
@@ -2379,6 +2380,7 @@ void RendererSceneCull::_light_instance_setup_directional_shadow(int p_shadow_in
 }
 
 bool RendererSceneCull::_light_instance_update_shadow(Instance *p_instance, const Transform3D p_cam_transform, const Projection &p_cam_projection, bool p_cam_orthogonal, bool p_cam_vaspect, RID p_shadow_atlas, Scenario *p_scenario, float p_screen_mesh_lod_threshold, uint32_t p_visible_layers) {
+	GodotProfileZone("cull.light_update_shadow");
 	InstanceLightData *light = static_cast<InstanceLightData *>(p_instance->base_data);
 
 	Transform3D light_transform = p_instance->transform;
@@ -2682,6 +2684,7 @@ bool RendererSceneCull::_light_instance_update_shadow(Instance *p_instance, cons
 }
 
 void RendererSceneCull::render_camera(const Ref<RenderSceneBuffers> &p_render_buffers, RID p_camera, RID p_scenario, RID p_viewport, Size2 p_viewport_size, uint32_t p_jitter_phase_count, float p_screen_mesh_lod_threshold, RID p_shadow_atlas, Ref<XRInterface> &p_xr_interface, float p_window_output_max_value, RenderingServerTypes::RenderInfo *r_render_info) {
+	GodotProfileZone("cull.render_camera");
 #ifndef _3D_DISABLED
 
 	Camera *camera = camera_owner.get_or_null(p_camera);
@@ -3311,6 +3314,7 @@ void RendererSceneCull::_scene_particles_set_view_axis(RID p_particles, const Ve
 }
 
 void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_camera_data, const Ref<RenderSceneBuffers> &p_render_buffers, RID p_environment, RID p_force_camera_attributes, RID p_compositor, uint32_t p_visible_layers, RID p_scenario, RID p_viewport, RID p_shadow_atlas, RID p_reflection_probe, int p_reflection_probe_pass, float p_screen_mesh_lod_threshold, float p_window_output_max_value, bool p_using_shadows, RenderingServerTypes::RenderInfo *r_render_info, const Vector3 *p_sdfgi_origin) {
+	GodotProfileZone("cull._render_scene");
 	Instance *render_reflection_probe = instance_owner.get_or_null(p_reflection_probe); //if null, not rendering to it
 
 	// Prepare the light - camera volume culling system.
@@ -3794,6 +3798,7 @@ void RendererSceneCull::render_empty_scene(const Ref<RenderSceneBuffers> &p_rend
 }
 
 bool RendererSceneCull::_render_reflection_probe_step(Instance *p_instance, int p_step) {
+	GodotProfileZone("cull.reflection_probe_step");
 	InstanceReflectionProbeData *reflection_probe = static_cast<InstanceReflectionProbeData *>(p_instance->base_data);
 	Scenario *scenario = p_instance->scenario;
 	ERR_FAIL_NULL_V(scenario, true);
@@ -4374,6 +4379,7 @@ void RendererSceneCull::_update_dirty_instance(Instance *p_instance) const {
 }
 
 void RendererSceneCull::update_dirty_instances() const {
+	GodotProfileZone("cull.update_dirty_instances");
 	while (_instance_update_list.first()) {
 		_update_dirty_instance(_instance_update_list.first()->self());
 	}

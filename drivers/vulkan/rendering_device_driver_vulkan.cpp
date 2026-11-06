@@ -31,6 +31,7 @@
 #include "rendering_device_driver_vulkan.h"
 
 #include "core/config/engine.h"
+#include "core/profiling/profiling.h"
 #include "core/config/project_settings.h"
 #include "core/os/os.h"
 #include "core/templates/fixed_vector.h"
@@ -1978,6 +1979,7 @@ static_assert(ENUM_MEMBERS_EQUAL(RDD::BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_
 static_assert(ENUM_MEMBERS_EQUAL(RDD::BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT, VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR));
 
 RDD::BufferID RenderingDeviceDriverVulkan::buffer_create(uint64_t p_size, BitField<BufferUsageBits> p_usage, MemoryAllocationType p_allocation_type, uint64_t p_frames_drawn) {
+	GodotProfileZone("vk.buffer_create");
 	uint32_t alignment = 16u; // 16 bytes is reasonable.
 	if (p_usage.has_flag(BUFFER_USAGE_UNIFORM_BIT)) {
 		// Some GPUs (e.g. NVIDIA) have absurdly high alignments, like 256 bytes.
@@ -2103,6 +2105,7 @@ bool RenderingDeviceDriverVulkan::buffer_set_texel_format(BufferID p_buffer, Dat
 }
 
 void RenderingDeviceDriverVulkan::buffer_free(BufferID p_buffer) {
+	GodotProfileZone("vk.buffer_free");
 	BufferInfo *buf_info = (BufferInfo *)p_buffer.id;
 	if (buf_info->vk_view) {
 		vkDestroyBufferView(vk_device, buf_info->vk_view, VKC::get_allocation_callbacks(VK_OBJECT_TYPE_BUFFER_VIEW));
@@ -2132,6 +2135,7 @@ uint64_t RenderingDeviceDriverVulkan::buffer_get_allocation_size(BufferID p_buff
 }
 
 uint8_t *RenderingDeviceDriverVulkan::buffer_map(BufferID p_buffer) {
+	GodotProfileZone("vk.buffer_map");
 	const BufferInfo *buf_info = (const BufferInfo *)p_buffer.id;
 	ERR_FAIL_COND_V_MSG(buf_info->is_dynamic(), nullptr, "Buffer must NOT have BUFFER_USAGE_DYNAMIC_PERSISTENT_BIT. Use buffer_persistent_map_advance() instead.");
 	void *data_ptr = nullptr;
@@ -2270,6 +2274,7 @@ VkSampleCountFlagBits RenderingDeviceDriverVulkan::_ensure_supported_sample_coun
 }
 
 RDD::TextureID RenderingDeviceDriverVulkan::texture_create(const TextureFormat &p_format, const TextureView &p_view) {
+	GodotProfileZone("vk.texture_create");
 	VkImageCreateInfo create_info = {};
 	create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
 
@@ -2624,6 +2629,7 @@ RDD::TextureID RenderingDeviceDriverVulkan::texture_create_shared_from_slice(Tex
 }
 
 void RenderingDeviceDriverVulkan::texture_free(TextureID p_texture) {
+	GodotProfileZone("vk.texture_free");
 	TextureInfo *tex_info = (TextureInfo *)p_texture.id;
 	vkDestroyImageView(vk_device, tex_info->vk_view, VKC::get_allocation_callbacks(VK_OBJECT_TYPE_IMAGE_VIEW));
 	if (tex_info->allocation.handle) {
@@ -3082,6 +3088,7 @@ RDD::FenceID RenderingDeviceDriverVulkan::fence_create() {
 }
 
 Error RenderingDeviceDriverVulkan::fence_wait(FenceID p_fence) {
+	GodotProfileZone("vk.fence_wait");
 	Fence *fence = (Fence *)(p_fence.id);
 	VkResult fence_status = vkGetFenceStatus(vk_device, fence->vk_fence);
 	if (fence_status == VK_NOT_READY) {
@@ -3293,9 +3300,12 @@ Error RenderingDeviceDriverVulkan::command_queue_execute_and_present(CommandQueu
 		submit_info.signalSemaphoreCount = signal_semaphores.size();
 		submit_info.pSignalSemaphores = signal_semaphores.ptr();
 
-		device_queue.submit_mutex.lock();
-		err = vkQueueSubmit(device_queue.queue, 1, &submit_info, vk_fence);
-		device_queue.submit_mutex.unlock();
+		{
+			GodotProfileZone("vk.queue_submit");
+			device_queue.submit_mutex.lock();
+			err = vkQueueSubmit(device_queue.queue, 1, &submit_info, vk_fence);
+			device_queue.submit_mutex.unlock();
+		}
 
 		if (err == VK_ERROR_DEVICE_LOST) {
 			print_lost_device_info();
@@ -3353,7 +3363,10 @@ Error RenderingDeviceDriverVulkan::command_queue_execute_and_present(CommandQueu
 			err = device_functions.QueuePresentKHR(device_queue.queue, &present_info);
 		}
 #else
-		err = device_functions.QueuePresentKHR(device_queue.queue, &present_info);
+		{
+			GodotProfileZone("vk.queue_present");
+			err = device_functions.QueuePresentKHR(device_queue.queue, &present_info);
+		}
 #endif
 
 		device_queue.submit_mutex.unlock();
@@ -3444,6 +3457,7 @@ RDD::CommandPoolID RenderingDeviceDriverVulkan::command_pool_create(CommandQueue
 }
 
 bool RenderingDeviceDriverVulkan::command_pool_reset(CommandPoolID p_cmd_pool) {
+	GodotProfileZone("vk.command_pool_reset");
 	DEV_ASSERT(p_cmd_pool);
 
 	CommandPool *command_pool = (CommandPool *)(p_cmd_pool.id);
@@ -3703,6 +3717,7 @@ RenderingDeviceDriver::SwapChainID RenderingDeviceDriverVulkan::swap_chain_creat
 }
 
 Error RenderingDeviceDriverVulkan::swap_chain_resize(CommandQueueID p_cmd_queue, SwapChainID p_swap_chain, uint32_t p_desired_framebuffer_count) {
+	GodotProfileZone("vk.swap_chain_resize");
 	DEV_ASSERT(p_cmd_queue.id != 0);
 	DEV_ASSERT(p_swap_chain.id != 0);
 
@@ -4057,6 +4072,7 @@ RDD::FramebufferID RenderingDeviceDriverVulkan::swap_chain_acquire_framebuffer(C
 	swap_chain->command_queues_acquired.push_back(command_queue);
 	swap_chain->command_queues_acquired_semaphores.push_back(semaphore_index);
 
+	GodotProfileZone("vk.acquire_next_image");
 	err = device_functions.AcquireNextImageKHR(vk_device, swap_chain->vk_swapchain, UINT64_MAX, semaphore, VK_NULL_HANDLE, &swap_chain->image_index);
 	if (err == VK_ERROR_OUT_OF_DATE_KHR) {
 		// Out of date leaves the semaphore in a signaled state that will never finish, so it's necessary to recreate it.
@@ -4271,6 +4287,7 @@ static VkShaderStageFlagBits RD_STAGE_TO_VK_SHADER_STAGE_BITS[RDD::SHADER_STAGE_
 };
 
 RDD::ShaderID RenderingDeviceDriverVulkan::shader_create_from_container(const Ref<RenderingShaderContainer> &p_shader_container, const Vector<ImmutableSampler> &p_immutable_samplers) {
+	GodotProfileZone("vk.shader_create");
 	ShaderReflection shader_refl = p_shader_container->get_shader_reflection();
 	ShaderInfo shader_info;
 	shader_info.name = p_shader_container->shader_name.get_data();
@@ -4701,6 +4718,7 @@ void RenderingDeviceDriverVulkan::_descriptor_set_pool_unreference(DescriptorSet
 }
 
 RDD::UniformSetID RenderingDeviceDriverVulkan::uniform_set_create(VectorView<BoundUniform> p_uniforms, ShaderID p_shader, uint32_t p_set_index, int p_linear_pool_index) {
+	GodotProfileZone("vk.uniform_set_create");
 	if (!linear_descriptor_pools_enabled) {
 		p_linear_pool_index = -1;
 	}
@@ -5290,6 +5308,7 @@ void RenderingDeviceDriverVulkan::command_copy_texture_to_buffer(CommandBufferID
 /******************/
 
 void RenderingDeviceDriverVulkan::pipeline_free(PipelineID p_pipeline) {
+	GodotProfileZone("vk.pipeline_free");
 	vkDestroyPipeline(vk_device, (VkPipeline)p_pipeline.id, VKC::get_allocation_callbacks(VK_OBJECT_TYPE_PIPELINE));
 }
 
@@ -5373,6 +5392,7 @@ void RenderingDeviceDriverVulkan::pipeline_cache_free() {
 }
 
 size_t RenderingDeviceDriverVulkan::pipeline_cache_query_size() {
+	GodotProfileZone("vk.pipeline_cache_query_size");
 	DEV_ASSERT(pipelines_cache.vk_cache);
 
 	// FIXME:
@@ -5385,6 +5405,7 @@ size_t RenderingDeviceDriverVulkan::pipeline_cache_query_size() {
 }
 
 Vector<uint8_t> RenderingDeviceDriverVulkan::pipeline_cache_serialize() {
+	GodotProfileZone("vk.pipeline_cache_serialize");
 	DEV_ASSERT(pipelines_cache.vk_cache);
 
 	pipelines_cache.buffer.resize(pipelines_cache.current_size + sizeof(PipelineCacheHeader));
@@ -5931,6 +5952,7 @@ RDD::PipelineID RenderingDeviceDriverVulkan::render_pipeline_create(
 		RenderPassID p_render_pass,
 		uint32_t p_render_subpass,
 		VectorView<PipelineSpecializationConstant> p_specialization_constants) {
+	GodotProfileZone("vk.render_pipeline_create");
 	// Vertex.
 	const VkPipelineVertexInputStateCreateInfo *vertex_input_state_create_info = nullptr;
 	if (p_vertex_format.id) {
@@ -6768,6 +6790,7 @@ void RenderingDeviceDriverVulkan::command_compute_dispatch_indirect(CommandBuffe
 // ----- PIPELINE -----
 
 RDD::PipelineID RenderingDeviceDriverVulkan::compute_pipeline_create(ShaderID p_shader, VectorView<PipelineSpecializationConstant> p_specialization_constants) {
+	GodotProfileZone("vk.compute_pipeline_create");
 	const ShaderInfo *shader_info = (const ShaderInfo *)p_shader.id;
 
 	VkComputePipelineCreateInfo pipeline_create_info = {};

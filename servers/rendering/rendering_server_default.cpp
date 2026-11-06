@@ -440,6 +440,7 @@ void RenderingServerDefault::set_physics_interpolation_enabled(bool p_enabled) {
 /* EVENT QUEUING */
 
 void RenderingServerDefault::sync() {
+	GodotProfileZone("rs.sync_wait(main)");
 	if (create_thread) {
 		command_queue.sync();
 	} else {
