@@ -32,6 +32,7 @@
 
 #include "enet_packet_peer.h"
 
+#include "core/config/project_settings.h"
 #include "core/io/compression.h"
 #include "core/io/ip.h"
 #include "core/object/class_db.h"
@@ -317,6 +318,12 @@ Error ENetConnection::_create(ENetAddress *p_address, int p_max_peers, int p_max
 			p_out_bandwidth /* limit outgoing bandwidth if > 0 */);
 
 	ERR_FAIL_NULL_V_MSG(host, ERR_CANT_CREATE, "Couldn't create an ENet host.");
+	int receive = -1;
+	int send = -1;
+	enet_socket_get_option(host->socket, ENET_SOCKOPT_RCVBUF, &receive);
+	enet_socket_get_option(host->socket, ENET_SOCKOPT_SNDBUF, &send);
+	print_line(vformat("ENet host socket buffers: receive %d B (requested %d), send %d B (requested %d).", receive,
+			int(GLOBAL_GET("network/enet/receive_buffer_size")), send, int(GLOBAL_GET("network/enet/send_buffer_size"))));
 	return OK;
 }
 
