@@ -4784,7 +4784,7 @@ void RenderForwardClustered::_drawn_passes_copy(LocalVector<DrawnPass> &r_passes
 	r_passes = drawn_passes;
 }
 
-void RenderForwardClustered::_mesh_compile_drawn_passes_for_surface(const SurfacePipelineData &p_surface, const GlobalPipelineData &p_global, const LocalVector<DrawnPass> &p_passes, uint32_t p_from, RSE::PipelineSource p_source, Vector<ShaderPipelinePair> *r_pipeline_pairs) {
+void RenderForwardClustered::_mesh_compile_drawn_passes_for_surface(const SurfacePipelineData &p_surface, const GlobalPipelineData &p_global, const LocalVector<DrawnPass> &p_passes, uint32_t p_from, RSE::PipelineSource p_source, bool p_high_priority, Vector<ShaderPipelinePair> *r_pipeline_pairs) {
 	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
 
 	const bool multiview_enabled = scene_shader.is_multiview_shader_group_enabled();
@@ -4793,13 +4793,15 @@ void RenderForwardClustered::_mesh_compile_drawn_passes_for_surface(const Surfac
 	pipeline_key.primitive_type = mesh_storage->mesh_surface_get_primitive(p_surface.mesh_surface);
 	pipeline_key.wireframe = false;
 	pipeline_key.ubershader = true;
-	// Low priority: these are ahead-of-time guesses; the stock prediction and draw-time requests keep the high-priority slots.
+	// A new surface may draw within frames, so it queues like the stock prediction (high priority); a draw waits for
+	// a queued task and a low-priority one can sit behind the whole backlog. Sweeps of existing surfaces for a newly
+	// drawn layout are guesses for surfaces that may never draw in it: low priority.
 	auto compile = [&](SceneShaderForwardClustered::ShaderData *p_shader, void *p_mesh_surface) {
 		const uint64_t input_mask = p_shader->get_vertex_input_mask(pipeline_key.version, pipeline_key.color_pass_flags, true);
 		const bool motion_vectors = pipeline_key.color_pass_flags & SceneShaderForwardClustered::PIPELINE_COLOR_PASS_FLAG_MOTION_VECTORS;
 		const bool emulate_point_size = p_shader->uses_point_size && scene_shader.emulate_point_size;
 		pipeline_key.vertex_format_id = mesh_storage->mesh_surface_get_vertex_format(p_mesh_surface, input_mask, p_surface.instanced, motion_vectors, emulate_point_size);
-		p_shader->pipeline_hash_map.compile_pipeline(pipeline_key, pipeline_key.hash(), p_source, false);
+		p_shader->pipeline_hash_map.compile_pipeline(pipeline_key, pipeline_key.hash(), p_source, p_high_priority);
 		if (r_pipeline_pairs != nullptr) {
 			r_pipeline_pairs->push_back({ p_shader, pipeline_key });
 		}
@@ -4843,7 +4845,7 @@ void RenderForwardClustered::_mesh_compile_pipelines_for_surface(const SurfacePi
 	_mesh_compile_stock_pipelines_for_surface(p_surface, p_global, p_source, r_pipeline_pairs);
 	thread_local LocalVector<DrawnPass> passes;
 	_drawn_passes_copy(passes);
-	_mesh_compile_drawn_passes_for_surface(p_surface, p_global, passes, 0, p_source, r_pipeline_pairs);
+	_mesh_compile_drawn_passes_for_surface(p_surface, p_global, passes, 0, p_source, true, r_pipeline_pairs);
 }
 
 void RenderForwardClustered::_mesh_compile_stock_pipelines_for_surface(const SurfacePipelineData &p_surface, const GlobalPipelineData &p_global, RSE::PipelineSource p_source, Vector<ShaderPipelinePair> *r_pipeline_pairs) {
@@ -5035,7 +5037,7 @@ void RenderForwardClustered::_update_dirty_geometry_pipelines() {
 			if (!surface_cache->compilation_dirty_element.in_list()) {
 				SurfacePipelineData surface;
 				_surface_pipeline_data_from_cache(surface_cache, surface);
-				_mesh_compile_drawn_passes_for_surface(surface, global_pipeline_data_compiled, passes, drawn_passes_compiled, RSE::PIPELINE_SOURCE_SURFACE, nullptr);
+				_mesh_compile_drawn_passes_for_surface(surface, global_pipeline_data_compiled, passes, drawn_passes_compiled, RSE::PIPELINE_SOURCE_SURFACE, false, nullptr);
 			}
 			list = list->next();
 		}

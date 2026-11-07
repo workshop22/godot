@@ -694,7 +694,7 @@ private:
 	void _geometry_instance_update(RenderGeometryInstance *p_geometry_instance);
 	void _mesh_compile_pipeline_for_surface(SceneShaderForwardClustered::ShaderData *p_shader, void *p_mesh_surface, bool p_ubershader, bool p_instanced_surface, RSE::PipelineSource p_source, SceneShaderForwardClustered::ShaderData::PipelineKey &r_pipeline_key, Vector<ShaderPipelinePair> *r_pipeline_pairs = nullptr);
 	void _mesh_compile_pipelines_for_surface(const SurfacePipelineData &p_surface, const GlobalPipelineData &p_global, RSE::PipelineSource p_source, Vector<ShaderPipelinePair> *r_pipeline_pairs = nullptr);
-	void _mesh_compile_drawn_passes_for_surface(const SurfacePipelineData &p_surface, const GlobalPipelineData &p_global, const LocalVector<DrawnPass> &p_passes, uint32_t p_from, RSE::PipelineSource p_source, Vector<ShaderPipelinePair> *r_pipeline_pairs);
+	void _mesh_compile_drawn_passes_for_surface(const SurfacePipelineData &p_surface, const GlobalPipelineData &p_global, const LocalVector<DrawnPass> &p_passes, uint32_t p_from, RSE::PipelineSource p_source, bool p_high_priority, Vector<ShaderPipelinePair> *r_pipeline_pairs);
 	void _mesh_compile_stock_pipelines_for_surface(const SurfacePipelineData &p_surface, const GlobalPipelineData &p_global, RSE::PipelineSource p_source, Vector<ShaderPipelinePair> *r_pipeline_pairs);
 	void _surface_pipeline_data_from_cache(GeometryInstanceSurfaceDataCache *p_surface_cache, SurfacePipelineData &r_surface);
 	void _mesh_generate_all_pipelines_for_surface_cache(GeometryInstanceSurfaceDataCache *p_surface_cache, const GlobalPipelineData &p_global);
