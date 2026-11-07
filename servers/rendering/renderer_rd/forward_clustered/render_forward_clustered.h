@@ -681,6 +681,7 @@ private:
 	HashSet<uint64_t> drawn_pass_keys;
 	LocalVector<DrawnPass> drawn_passes;
 	uint32_t drawn_passes_compiled = 0;
+	bool drawn_passes_high_priority = false; // a small batch of new surfaces (spawned in play), not a loading burst
 	void _note_drawn_pass(uint64_t p_key);
 	void _drawn_passes_copy(LocalVector<DrawnPass> &r_passes);
 
