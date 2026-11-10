@@ -238,6 +238,7 @@ public:
 		bool filtered_hits = false; // screen hits read the source copy's mips by how small the hit appears
 		// Emissive shapes sampled directly by every texel (the nearest to the camera): an oriented box each (centre and
 		// three half axes, world space) and the light its surface gives off.
+		int emissive_candidates = 6; // weighed by a texel for its one emissive shadow ray
 		static constexpr int MAX_EMISSIVES = 64;
 		int emissive_count = 0;
 		Vector3 emissive_center[MAX_EMISSIVES];

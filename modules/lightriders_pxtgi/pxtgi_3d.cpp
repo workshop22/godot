@@ -3659,6 +3659,7 @@ void PXTGI3D::_publish() {
 	s.debug = debug;
 	s.multi_bounce = multi_bounce;
 	s.rays_per_texel = rays_per_texel;
+	s.emissive_candidates = emissive_candidates;
 	s.blue_noise = blue_noise;
 	s.gi_history_clamp = gi_history_clamp;
 	s.filtered_hits = filtered_hits;
@@ -3982,6 +3983,8 @@ void PXTGI3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_reflection_resolution_scale"), &PXTGI3D::get_reflection_resolution_scale);
 	ClassDB::bind_method(D_METHOD("set_rays_per_texel", "rays"), &PXTGI3D::set_rays_per_texel);
 	ClassDB::bind_method(D_METHOD("get_rays_per_texel"), &PXTGI3D::get_rays_per_texel);
+	ClassDB::bind_method(D_METHOD("set_emissive_candidates", "candidates"), &PXTGI3D::set_emissive_candidates);
+	ClassDB::bind_method(D_METHOD("get_emissive_candidates"), &PXTGI3D::get_emissive_candidates);
 	ClassDB::bind_method(D_METHOD("set_blue_noise", "enabled"), &PXTGI3D::set_blue_noise);
 	ClassDB::bind_method(D_METHOD("get_blue_noise"), &PXTGI3D::get_blue_noise);
 	ClassDB::bind_method(D_METHOD("set_gi_history_clamp", "enabled"), &PXTGI3D::set_gi_history_clamp);
@@ -4006,6 +4009,7 @@ void PXTGI3D::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "reflection_softness", PROPERTY_HINT_RANGE, "1,8,0.1"), "set_reflection_softness", "get_reflection_softness");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "reflection_resolution_scale", PROPERTY_HINT_RANGE, "0.5,1,0.5"), "set_reflection_resolution_scale", "get_reflection_resolution_scale");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "rays_per_texel", PROPERTY_HINT_RANGE, "1,4,1"), "set_rays_per_texel", "get_rays_per_texel");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "emissive_candidates", PROPERTY_HINT_RANGE, "1,16,1"), "set_emissive_candidates", "get_emissive_candidates");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "multi_bounce"), "set_multi_bounce", "get_multi_bounce");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "blue_noise"), "set_blue_noise", "get_blue_noise");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "gi_history_clamp"), "set_gi_history_clamp", "get_gi_history_clamp");

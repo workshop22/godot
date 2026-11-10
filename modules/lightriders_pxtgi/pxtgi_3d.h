@@ -103,6 +103,7 @@ class PXTGI3D : public Node3D {
 	int debug = 0;
 	bool multi_bounce = true;
 	int rays_per_texel = 4;
+	int emissive_candidates = 6;
 	bool blue_noise = false;
 	bool gi_history_clamp = false;
 	bool filtered_hits = false;
@@ -457,6 +458,8 @@ public:
 	float get_reflection_resolution_scale() const { return reflection_resolution_scale; }
 	void set_rays_per_texel(int p_value) { rays_per_texel = CLAMP(p_value, 1, 4); }
 	int get_rays_per_texel() const { return rays_per_texel; }
+	void set_emissive_candidates(int p_value) { emissive_candidates = CLAMP(p_value, 1, 16); }
+	int get_emissive_candidates() const { return emissive_candidates; }
 	void set_blue_noise(bool p_value) { blue_noise = p_value; }
 	bool get_blue_noise() const { return blue_noise; }
 	void set_gi_history_clamp(bool p_value) { gi_history_clamp = p_value; }
