@@ -299,6 +299,15 @@ uint16_t SceneShaderForwardClustered::ShaderData::_get_shader_version(PipelineVe
 		case PIPELINE_VERSION_DEPTH_PASS_WITH_SDF:
 			return ShaderVersion::SHADER_VERSION_DEPTH_PASS_WITH_SDF + ubershader_base;
 		case PIPELINE_VERSION_COLOR_PASS: {
+			if (p_color_pass_flags & PIPELINE_COLOR_PASS_FLAG_DUAL_TRANSPARENCY) {
+				DEV_ASSERT(p_color_pass_flags & PIPELINE_COLOR_PASS_FLAG_TRANSPARENT);
+				DEV_ASSERT(p_color_pass_flags & PIPELINE_COLOR_PASS_FLAG_SEPARATE_TRANSPARENCY);
+				DEV_ASSERT(!(p_color_pass_flags & (PIPELINE_COLOR_PASS_FLAG_SEPARATE_SPECULAR | PIPELINE_COLOR_PASS_FLAG_MOTION_VECTORS)));
+				uint16_t variant = (p_ubershader ? 1 : 0) |
+						((p_color_pass_flags & PIPELINE_COLOR_PASS_FLAG_LIGHTMAP) ? 2 : 0) |
+						((p_color_pass_flags & PIPELINE_COLOR_PASS_FLAG_MULTIVIEW) ? 4 : 0);
+				return ShaderVersion::SHADER_VERSION_COLOR_PASS * 2 + SHADER_COLOR_PASS_FLAG_COUNT + variant;
+			}
 			int shader_flags = 0;
 
 			if (p_ubershader) {
@@ -463,10 +472,23 @@ void SceneShaderForwardClustered::ShaderData::_create_pipeline(PipelineKey p_pip
 					transmission.dst_alpha_blend_factor = RD::BLEND_FACTOR_SRC_ALPHA;
 				}
 				blend_state.attachments.write[1] = transmission;
+				if (p_pipeline_key.color_pass_flags & PIPELINE_COLOR_PASS_FLAG_DUAL_TRANSPARENCY) {
+					// A second E/T pair is the layer as traced reflections may sample it.
+					blend_state.attachments.resize(4);
+					blend_state.attachments.write[2] = blend_attachment;
+					blend_state.attachments.write[3] = transmission;
+					if (p_pipeline_key.color_pass_flags & PIPELINE_COLOR_PASS_FLAG_REFLECTION_SOURCE_EXCLUDED) {
+						for (int attachment = 2; attachment < 4; attachment++) {
+							auto &source = blend_state.attachments.write[attachment];
+							source.write_r = source.write_g = source.write_b = source.write_a = false;
+						}
+					}
+				}
 			}
-			if (!uses_transparent_motion_vectors) {
+			if (!(p_pipeline_key.color_pass_flags & PIPELINE_COLOR_PASS_FLAG_DUAL_TRANSPARENCY) && !uses_transparent_motion_vectors) {
 				// The transparent pass binds motion vectors only for materials that write them
 				// (render_mode transparent_motion_vectors); the rest leave the surface behind them.
+				// The dual pass has no motion attachment: its third and fourth are the source pair.
 				RD::PipelineColorBlendState::Attachment &motion = blend_state.attachments.write[2];
 				motion.write_r = motion.write_g = motion.write_b = motion.write_a = false;
 			}
@@ -713,6 +735,20 @@ void SceneShaderForwardClustered::init(const String p_defines) {
 				group = SHADER_GROUP_MULTIVIEW;
 			}
 
+			shader_versions.push_back(ShaderRD::VariantDefine(group, version, false));
+		}
+		for (uint32_t i = 0; i < SHADER_DUAL_TRANSPARENCY_COUNT; i++) {
+			String version = "\n#define MODE_SEPARATE_TRANSPARENCY\n#define MODE_DUAL_TRANSPARENCY\n";
+			if (i & 1) {
+				version += "#define UBERSHADER\n";
+			}
+			if (i & 2) {
+				version += "#define USE_LIGHTMAP\n";
+			}
+			if (i & 4) {
+				version += "#define USE_MULTIVIEW\n";
+			}
+			ShaderGroup group = (i & 4) ? ((i & 2) ? SHADER_GROUP_ADVANCED_MULTIVIEW : SHADER_GROUP_MULTIVIEW) : ((i & 2) ? SHADER_GROUP_ADVANCED : SHADER_GROUP_BASE);
 			shader_versions.push_back(ShaderRD::VariantDefine(group, version, false));
 		}
 

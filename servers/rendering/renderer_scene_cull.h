@@ -428,6 +428,7 @@ public:
 		bool ignore_all_culling;
 
 		Vector<RID> materials;
+		PackedInt32Array reflection_source_exclusions;
 
 		RSE::ShadowCastingSetting cast_shadows;
 
@@ -1066,6 +1067,7 @@ public:
 	virtual Vector<ObjectID> instances_cull_convex(const Vector<Plane> &p_convex, RID p_scenario = RID()) const;
 
 	virtual void instance_geometry_set_flag(RID p_instance, RSE::InstanceFlags p_flags, bool p_enabled);
+	virtual void instance_geometry_set_reflection_source_exclusions(RID p_instance, const PackedInt32Array &p_surfaces);
 	virtual void instance_geometry_set_cast_shadows_setting(RID p_instance, RSE::ShadowCastingSetting p_shadow_casting_setting);
 	virtual void instance_geometry_set_material_override(RID p_instance, RID p_material);
 	virtual void instance_geometry_set_material_overlay(RID p_instance, RID p_material);

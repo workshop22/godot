@@ -379,7 +379,11 @@ void RendererSceneRenderRD::_render_buffers_copy_screen_texture(const RenderData
 		RID dest = rb->get_texture_slice(RB_SCOPE_BUFFERS, texture_name, v, 0);
 
 		if (can_use_storage) {
-			copy_effects->copy_to_rect(texture, dest, Rect2i(0, 0, size.x, size.y));
+			if (rb->has_separate_reflections()) {
+				copy_effects->copy_scene_layers(texture, rb->get_texture_slice(SNAME("forward_clustered"), SNAME("specular"), v, 0), RID(), RID(), dest, size);
+			} else {
+				copy_effects->copy_to_rect(texture, dest, Rect2i(0, 0, size.x, size.y));
+			}
 		} else {
 			RID fb = FramebufferCacheRD::get_singleton()->get_cache(dest);
 			copy_effects->copy_to_fb_rect(texture, fb, Rect2i(0, 0, size.x, size.y));
@@ -1342,7 +1346,11 @@ void RendererSceneRenderRD::_update_vrs(Ref<RenderSceneBuffersRD> p_render_buffe
 bool RendererSceneRenderRD::_needs_post_prepass_render(RenderDataRD *p_render_data, bool p_use_gi) {
 	if (p_render_data->render_buffers.is_valid()) {
 		if (p_render_data->render_buffers->has_custom_data(RB_SCOPE_SDFGI)) {
-			return true;
+			Ref<RendererRD::GI::SDFGI> sdfgi = p_render_data->render_buffers->get_custom_data(RB_SCOPE_SDFGI);
+			// The owned helper launches no probe compute. Let the actual depth pass
+			// clear its attachments instead of opening a separate clear-only pass.
+			// Regional draws retain the preceding whole-target clear.
+			return !sdfgi->buffer_only || p_render_data->render_region != Rect2i();
 		}
 	}
 	return false;

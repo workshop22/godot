@@ -822,6 +822,8 @@ void RendererEnvironmentStorage::environment_set_sdfgi(RID p_env, bool p_enable,
 		WARN_PRINT_ONCE_ED("SDFGI is only available when using the Forward+ renderer.");
 	}
 #endif
+	// An authored setter always takes ownership back from the opaque-buffer helper.
+	env->sdfgi_buffer_only = false;
 	env->sdfgi_enabled = p_enable;
 	env->sdfgi_cascades = p_cascades;
 	env->sdfgi_min_cell_size = p_min_cell_size;
@@ -832,6 +834,18 @@ void RendererEnvironmentStorage::environment_set_sdfgi(RID p_env, bool p_enable,
 	env->sdfgi_normal_bias = p_normal_bias;
 	env->sdfgi_probe_bias = p_probe_bias;
 	env->sdfgi_y_scale = p_y_scale;
+}
+
+void RendererEnvironmentStorage::environment_set_sdfgi_buffer_only(RID p_env) {
+	Environment *env = environment_owner.get_or_null(p_env);
+	ERR_FAIL_NULL(env);
+	env->sdfgi_buffer_only = true;
+}
+
+bool RendererEnvironmentStorage::environment_get_sdfgi_buffer_only(RID p_env) const {
+	Environment *env = environment_owner.get_or_null(p_env);
+	ERR_FAIL_NULL_V(env, false);
+	return env->sdfgi_buffer_only;
 }
 
 bool RendererEnvironmentStorage::environment_get_sdfgi_enabled(RID p_env) const {

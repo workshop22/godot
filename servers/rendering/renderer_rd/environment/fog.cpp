@@ -1028,7 +1028,9 @@ void Fog::volumetric_fog_update(const VolumetricFogSettings &p_settings, const P
 		}
 	}
 
-	bool using_sdfgi = RendererSceneRenderRD::get_singleton()->environment_get_volumetric_fog_gi_inject(p_settings.env) > 0.0001 && RendererSceneRenderRD::get_singleton()->environment_get_sdfgi_enabled(p_settings.env) && (p_settings.sdfgi.is_valid());
+	// Zero-energy SDFGI can retain opaque GI-buffer plumbing without lighting fog.
+	// VoxelGI uses its own energy and remains independent of this SDFGI-only gate.
+	bool using_sdfgi = RendererSceneRenderRD::get_singleton()->environment_get_volumetric_fog_gi_inject(p_settings.env) > 0.0001 && RendererSceneRenderRD::get_singleton()->environment_get_sdfgi_enabled(p_settings.env) && RendererSceneRenderRD::get_singleton()->environment_get_sdfgi_energy(p_settings.env) > 0.0f && (p_settings.sdfgi.is_valid());
 
 	if (using_sdfgi) {
 		if (fog->sdfgi_uniform_set.is_null() || !RD::get_singleton()->uniform_set_is_valid(fog->sdfgi_uniform_set)) {

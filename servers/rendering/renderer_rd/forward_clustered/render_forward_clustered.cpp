@@ -110,9 +110,11 @@ bool RenderForwardClustered::RenderBufferDataForwardClustered::ensure_mfx_tempor
 #endif
 
 void RenderForwardClustered::RenderBufferDataForwardClustered::free_data() {
+	dual_transparency_allocation_failed = false;
 	// JIC, should already have been cleared
 	if (render_buffers) {
 		render_buffers->clear_context(RB_SCOPE_FORWARD_CLUSTERED);
+		render_buffers->clear_context(RB_SCOPE_REFLECTION_SOURCE_LAYERS);
 		render_buffers->clear_context(RB_SCOPE_SSDS);
 		render_buffers->clear_context(RB_SCOPE_SSIL);
 		render_buffers->clear_context(RB_SCOPE_SSAO);
@@ -177,6 +179,10 @@ RID RenderForwardClustered::RenderBufferDataForwardClustered::get_color_only_fb(
 
 RID RenderForwardClustered::RenderBufferDataForwardClustered::get_color_pass_fb(uint32_t p_color_pass_flags) {
 	ERR_FAIL_NULL_V(render_buffers, RID());
+	const bool dual_transparency = p_color_pass_flags & COLOR_PASS_FLAG_DUAL_TRANSPARENCY;
+	if (dual_transparency && dual_transparency_allocation_failed) {
+		return RID(); // Keep the original path after an allocation failure until reconfiguration.
+	}
 	bool use_msaa = render_buffers->get_msaa_3d() != RSE::VIEWPORT_MSAA_DISABLED;
 
 	int v_count = (p_color_pass_flags & COLOR_PASS_FLAG_MULTIVIEW) ? render_buffers->get_view_count() : 1;
@@ -221,6 +227,38 @@ RID RenderForwardClustered::RenderBufferDataForwardClustered::get_color_pass_fb(
 		specular = render_buffers->get_texture(RB_SCOPE_FORWARD_CLUSTERED, use_msaa ? RB_TEX_TRANSMISSION_MSAA : RB_TEX_TRANSMISSION);
 	}
 
+	if (dual_transparency) {
+		DEV_ASSERT(p_color_pass_flags & COLOR_PASS_FLAG_SEPARATE_TRANSPARENCY);
+		DEV_ASSERT(velocity_buffer.is_null());
+		// One additional E/T pair, with the same samples/layers as the full pair.
+		// The existing resolved E/T textures can resolve the source first and the
+		// full pair afterward; no second resolved pair or opaque-buffer aliasing.
+		const uint32_t usage = RD::TEXTURE_USAGE_COLOR_ATTACHMENT_BIT | RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT;
+		const RD::TextureSamples samples = use_msaa ? render_buffers->get_texture_samples() : RD::TEXTURE_SAMPLES_1;
+		for (StringName name : { RB_TEX_TRANSPARENCY, RB_TEX_TRANSMISSION }) {
+			if (!render_buffers->has_texture(RB_SCOPE_REFLECTION_SOURCE_LAYERS, name)) {
+				RID texture = render_buffers->create_texture(RB_SCOPE_REFLECTION_SOURCE_LAYERS, name, render_buffers->get_base_data_format(), usage, samples);
+				if (texture.is_null()) {
+					render_buffers->clear_context(RB_SCOPE_REFLECTION_SOURCE_LAYERS);
+					dual_transparency_allocation_failed = true;
+					return RID();
+				}
+			}
+		}
+		const RID source_color = render_buffers->get_texture(RB_SCOPE_REFLECTION_SOURCE_LAYERS, RB_TEX_TRANSPARENCY);
+		const RID source_transmission = render_buffers->get_texture(RB_SCOPE_REFLECTION_SOURCE_LAYERS, RB_TEX_TRANSMISSION);
+		RID framebuffer;
+		if (render_buffers->has_texture(RB_SCOPE_VRS, RB_TEXTURE)) {
+			framebuffer = FramebufferCacheRD::get_singleton()->get_cache_multiview(v_count, color, specular, source_color, source_transmission, depth, render_buffers->get_texture(RB_SCOPE_VRS, RB_TEXTURE));
+		} else {
+			framebuffer = FramebufferCacheRD::get_singleton()->get_cache_multiview(v_count, color, specular, source_color, source_transmission, depth);
+		}
+		if (framebuffer.is_null()) {
+			render_buffers->clear_context(RB_SCOPE_REFLECTION_SOURCE_LAYERS);
+			dual_transparency_allocation_failed = true;
+		}
+		return framebuffer;
+	}
 
 	if (render_buffers->has_texture(RB_SCOPE_VRS, RB_TEXTURE)) {
 		RID vrs_texture = render_buffers->get_texture(RB_SCOPE_VRS, RB_TEXTURE);
@@ -367,6 +405,10 @@ void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p
 	for (uint32_t i = p_from_element; i < p_to_element; i++) {
 		const GeometryInstanceSurfaceDataCache *surf = p_params->elements[i];
 		const RenderElementInfo &element_info = p_params->element_info[i];
+		if (p_params->exclude_reflection_sources && surf->reflection_source_excluded) {
+			i += element_info.repeat - 1;
+			continue;
+		}
 
 		if (p_pass_mode == PASS_MODE_COLOR && surf->color_pass_inclusion_mask && (p_color_pass_flags & surf->color_pass_inclusion_mask) == 0) {
 			// Some surfaces can be repeated in multiple render lists. We exclude them from being rendered on the color pass based on the
@@ -472,6 +514,12 @@ void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p
 
 				if constexpr ((p_color_pass_flags & COLOR_PASS_FLAG_SEPARATE_TRANSPARENCY) != 0) {
 					pipeline_key.color_pass_flags |= SceneShaderForwardClustered::PIPELINE_COLOR_PASS_FLAG_SEPARATE_TRANSPARENCY;
+				}
+				if constexpr ((p_color_pass_flags & COLOR_PASS_FLAG_DUAL_TRANSPARENCY) != 0) {
+					pipeline_key.color_pass_flags |= SceneShaderForwardClustered::PIPELINE_COLOR_PASS_FLAG_DUAL_TRANSPARENCY;
+					if (surf->reflection_source_excluded) {
+						pipeline_key.color_pass_flags |= SceneShaderForwardClustered::PIPELINE_COLOR_PASS_FLAG_REFLECTION_SOURCE_EXCLUDED;
+					}
 				}
 
 				if constexpr ((p_color_pass_flags & COLOR_PASS_FLAG_MOTION_VECTORS) != 0) {
@@ -677,6 +725,8 @@ void RenderForwardClustered::_render_list(RenderingDevice::DrawListID p_draw_lis
 				VALID_FLAG_COMBINATION(COLOR_PASS_FLAG_TRANSPARENT);
 				VALID_FLAG_COMBINATION(COLOR_PASS_FLAG_TRANSPARENT | COLOR_PASS_FLAG_SEPARATE_TRANSPARENCY);
 				VALID_FLAG_COMBINATION(COLOR_PASS_FLAG_TRANSPARENT | COLOR_PASS_FLAG_SEPARATE_TRANSPARENCY | COLOR_PASS_FLAG_MULTIVIEW);
+				VALID_FLAG_COMBINATION(COLOR_PASS_FLAG_TRANSPARENT | COLOR_PASS_FLAG_SEPARATE_TRANSPARENCY | COLOR_PASS_FLAG_DUAL_TRANSPARENCY);
+				VALID_FLAG_COMBINATION(COLOR_PASS_FLAG_TRANSPARENT | COLOR_PASS_FLAG_SEPARATE_TRANSPARENCY | COLOR_PASS_FLAG_DUAL_TRANSPARENCY | COLOR_PASS_FLAG_MULTIVIEW);
 				VALID_FLAG_COMBINATION(COLOR_PASS_FLAG_TRANSPARENT | COLOR_PASS_FLAG_MULTIVIEW);
 				VALID_FLAG_COMBINATION(COLOR_PASS_FLAG_TRANSPARENT | COLOR_PASS_FLAG_MOTION_VECTORS);
 				VALID_FLAG_COMBINATION(COLOR_PASS_FLAG_SEPARATE_SPECULAR);
@@ -765,6 +815,7 @@ uint32_t RenderForwardClustered::_setup_environment(const RenderDataRD *p_render
 
 	scene_state.ubo.gi_upscale_for_msaa = false;
 	scene_state.ubo.volumetric_fog_enabled = false;
+	scene_state.ubo.late_indirect_specular = p_opaque_render_buffers && rd.is_valid() && rd->has_separate_reflections();
 
 	if (rd.is_valid()) {
 		if (rd->get_msaa_3d() != RSE::VIEWPORT_MSAA_DISABLED) {
@@ -803,6 +854,11 @@ uint32_t RenderForwardClustered::_setup_environment(const RenderDataRD *p_render
 			ss_flags |= environment_get_ssr_enabled(p_render_data->environment) ? (1 << 2) : 0;
 
 			if (rd.is_valid()) {
+				// PXTGI has already resolved visibility for its reflection contribution.
+				// A current-frame producer tag excludes cleared/fallback and stale buffers.
+				if (rd->get_reflection_motion_frame() == RSG::rasterizer->get_frame_number() && rd->has_texture(SNAME("pxtgi"), SNAME("reflection_motion"))) {
+					ss_flags |= (1 << 4);
+				}
 				Ref<RenderBufferDataForwardClustered> rb_data;
 				if (rd->has_custom_data(RB_SCOPE_FORWARD_CLUSTERED)) {
 					rb_data = rd->get_custom_data(RB_SCOPE_FORWARD_CLUSTERED);
@@ -917,7 +973,7 @@ void RenderForwardClustered::_fill_instance_data(RenderListType p_render_list, i
 
 		const bool cant_repeat = instance_data.flags & INSTANCE_DATA_FLAG_MULTIMESH || inst->mesh_instance.is_valid();
 
-		if (prev_surface != nullptr && !cant_repeat && prev_surface->sort.sort_key1 == surface->sort.sort_key1 && prev_surface->sort.sort_key2 == surface->sort.sort_key2 && inst->mirror == prev_surface->owner->mirror && repeats < RenderElementInfo::MAX_REPEATS) {
+		if (prev_surface != nullptr && !cant_repeat && prev_surface->sort.sort_key1 == surface->sort.sort_key1 && prev_surface->sort.sort_key2 == surface->sort.sort_key2 && inst->mirror == prev_surface->owner->mirror && prev_surface->reflection_source_excluded == surface->reflection_source_excluded && repeats < RenderElementInfo::MAX_REPEATS) {
 			//this element is the same as the previous one, count repeats to draw it using instancing
 			repeats++;
 		} else {
@@ -961,6 +1017,8 @@ _FORCE_INLINE_ static uint32_t _indices_to_primitives(RSE::PrimitiveType p_primi
 }
 void RenderForwardClustered::_fill_render_list(RenderListType p_render_list, const RenderDataRD *p_render_data, PassMode p_pass_mode, bool p_using_sdfgi, bool p_using_opaque_gi, bool p_using_motion_pass, bool p_append) {
 	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
+	const bool source_probe = p_render_data->reflection_probe.is_valid() && RendererRD::LightStorage::get_singleton()->reflection_probe_instance_get_capture_source_policy(p_render_data->reflection_probe) != 0;
+	const bool sdfgi_has_energy = p_using_sdfgi && environment_get_sdfgi_energy(p_render_data->environment) > 0.0f;
 	uint64_t frame = RSG::rasterizer->get_frame_number();
 
 	if (p_render_list == RENDER_LIST_OPAQUE) {
@@ -1099,7 +1157,11 @@ void RenderForwardClustered::_fill_render_list(RenderListType p_render_list, con
 					uses_gi = true;
 				} else {
 					if (p_using_sdfgi && inst->can_sdfgi) {
-						flags |= INSTANCE_DATA_FLAG_USE_SDFGI;
+						if (sdfgi_has_energy) {
+							flags |= INSTANCE_DATA_FLAG_USE_SDFGI;
+						}
+						// Alpha must stay on its forward path even when a zero-energy helper
+						// contributes no SDFGI; it must not read the opaque GI buffers instead.
 						uses_gi = true;
 					}
 					inst->gi_offset_cache = 0xFFFFFFFF;
@@ -1154,6 +1216,10 @@ void RenderForwardClustered::_fill_render_list(RenderListType p_render_list, con
 		inst->rendered_transform = inst->transform;
 
 		while (surf) {
+			if (source_probe && surf->reflection_source_excluded) {
+				surf = surf->next;
+				continue;
+			}
 			surf->sort.uses_forward_gi = 0;
 			surf->sort.uses_lightmap = 0;
 
@@ -1321,8 +1387,11 @@ void RenderForwardClustered::_update_sdfgi(RenderDataRD *p_render_data) {
 	}
 
 	if (rb.is_valid() && rb->has_custom_data(RB_SCOPE_SDFGI)) {
-		RENDER_TIMESTAMP("Render SDFGI");
 		Ref<RendererRD::GI::SDFGI> sdfgi = rb->get_custom_data(RB_SCOPE_SDFGI);
+		if (sdfgi->buffer_only) {
+			return;
+		}
+		RENDER_TIMESTAMP("Render SDFGI");
 		float exposure_normalization = 1.0;
 
 		if (p_render_data->camera_attributes.is_valid()) {
@@ -1769,6 +1838,10 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	Ref<RenderSceneBuffersRD> rb = p_render_data->render_buffers;
 	ERR_FAIL_COND(rb.is_null());
 	Ref<RenderBufferDataForwardClustered> rb_data;
+	rb->set_reflection_motion_frame(UINT64_MAX);
+	rb->set_separate_reflections_active(false);
+	rb->set_separate_transparency_active(false);
+	rb->request_reflection_source(0);
 	if (rb->has_custom_data(RB_SCOPE_FORWARD_CLUSTERED)) {
 		// Our forward clustered custom data buffer will only be available when we're rendering our normal view.
 		// This will not be available when rendering reflection probes.
@@ -1785,9 +1858,12 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 
 	// get info about our rendering effects
 	bool ce_needs_motion_vectors = _compositor_effects_has_flag(p_render_data, RSE::COMPOSITOR_EFFECT_FLAG_NEEDS_MOTION_VECTORS);
-	bool separate_transparency = rb_data.is_valid() && _compositor_effects_has_flag(p_render_data, RSE::COMPOSITOR_EFFECT_FLAG_NEEDS_SEPARATE_TRANSPARENCY);
+	bool ce_needs_separate_reflections = rb_data.is_valid() && _compositor_effects_has_flag(p_render_data, RSE::COMPOSITOR_EFFECT_FLAG_NEEDS_SEPARATE_REFLECTIONS);
+	// A late reflected layer must still pass through transparent transmission.
+	bool separate_transparency = rb_data.is_valid() && (ce_needs_separate_reflections || _compositor_effects_has_flag(p_render_data, RSE::COMPOSITOR_EFFECT_FLAG_NEEDS_SEPARATE_TRANSPARENCY));
+	rb->set_separate_transparency_active(separate_transparency);
 	bool ce_needs_normal_roughness = _compositor_effects_has_flag(p_render_data, RSE::COMPOSITOR_EFFECT_FLAG_NEEDS_ROUGHNESS);
-	bool ce_needs_separate_specular = _compositor_effects_has_flag(p_render_data, RSE::COMPOSITOR_EFFECT_FLAG_NEEDS_SEPARATE_SPECULAR);
+	bool ce_needs_separate_specular = ce_needs_separate_reflections || _compositor_effects_has_flag(p_render_data, RSE::COMPOSITOR_EFFECT_FLAG_NEEDS_SEPARATE_SPECULAR);
 
 	// sdfgi first
 	_update_sdfgi(p_render_data);
@@ -2058,6 +2134,11 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	if (using_separate_specular || global_surface_data.sss_used) {
 		global_pipeline_data_required.use_separate_specular = true;
 	}
+	if (separate_transparency) {
+		// Viewport settings can differ from the project default and from one
+		// another. Retain each observed sample count without toggling requirements.
+		global_pipeline_data_required.transparency_sample_mask |= 1u << rb->get_texture_samples();
+	}
 
 	// Update the compiled pipelines if any of the requirements have changed.
 	_update_dirty_geometry_pipelines();
@@ -2231,6 +2312,18 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		RENDER_TIMESTAMP("Process Pre Opaque Compositor Effects");
 		_process_compositor_effects(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_PRE_OPAQUE, p_render_data);
 	}
+	// The producer requests its source in PRE_OPAQUE, after this frame's request
+	// was reset. Admit the dual variants once that request actually exists.
+	if (separate_transparency && !global_pipeline_data_required.use_dual_transparency && rb->get_reflection_source_request() != 0 && RD::get_singleton()->limit_get(RD::LIMIT_MAX_FRAMEBUFFER_COLOR_ATTACHMENTS) >= 4) {
+		global_pipeline_data_required.use_dual_transparency = true;
+		_update_dirty_geometry_pipelines();
+	}
+	// The producer can decline a frame (first use, unavailable buffers, unsupported view).
+	// Texture existence alone is insufficient: it may belong to an earlier frame or scene.
+	bool separate_reflections = ce_needs_separate_reflections && !using_sss && !using_ssr && !using_ssil && !load_color && !is_reflection_probe && rb->get_can_be_storage() && rb->get_view_count() == 1 &&
+			get_debug_draw_mode() != RSE::VIEWPORT_DEBUG_DRAW_UNSHADED && rb->get_reflection_motion_frame() == RSG::rasterizer->get_frame_number() &&
+			rb->has_texture(SNAME("pxtgi"), SNAME("reflection_motion"));
+	rb->set_separate_reflections_active(separate_reflections);
 
 	RID normal_roughness_views[RendererSceneRender::MAX_RENDER_VIEWS];
 	if (rb_data.is_valid() && rb_data->has_normal_roughness()) {
@@ -2399,14 +2492,14 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			RD::get_singleton()->draw_command_end_label();
 		}
 
-		{
-			//just mix specular back
+		if (!separate_reflections) {
+			// The ordinary path includes direct and indirect specular.
 			RENDER_TIMESTAMP("Merge Specular");
 			copy_effects->merge_specular(color_only_framebuffer, rb_data->get_specular(), !use_msaa ? RID() : rb->get_internal_texture(), RID(), p_render_data->scene_data->view_count);
 		}
 	}
 
-	if (using_separate_specular && is_environment(p_render_data->environment) && (environment_get_background(p_render_data->environment) == RSE::ENV_BG_CANVAS)) {
+	if (using_separate_specular && !separate_reflections && is_environment(p_render_data->environment) && (environment_get_background(p_render_data->environment) == RSE::ENV_BG_CANVAS)) {
 		// Canvas background mode does not clear the color buffer, but copies over it. If screen-space specular effects are enabled and the background is blank,
 		// this results in ghosting due to the separate specular buffer copy. Need to explicitly clear the specular buffer once we're done with it to fix it.
 		RENDER_TIMESTAMP("Clear Separate Specular (Canvas Background Mode)");
@@ -2475,11 +2568,13 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 
 	rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_ALPHA, p_render_data, radiance_texture, samplers, transparent_pass_uniform_buffer_index, true);
 
+	bool opaque_color_resolved_for_source = false;
 	{
 		uint32_t transparent_color_pass_flags = (color_pass_flags | uint32_t(COLOR_PASS_FLAG_TRANSPARENT)) & ~uint32_t(COLOR_PASS_FLAG_SEPARATE_SPECULAR);
 		// Motion vectors are overwritten only by transparent materials that write them (render_mode
 		// transparent_motion_vectors: light walls that should blur with their own motion); the
-		// others' pipelines mask the attachment.
+		// others' pipelines mask the attachment. Separate alpha layers have their own
+		// color/transmission, never the opaque receiver's motion.
 		if (separate_transparency || !scene_state.used_transparent_motion_vectors) {
 			transparent_color_pass_flags &= ~uint32_t(COLOR_PASS_FLAG_MOTION_VECTORS);
 		}
@@ -2488,9 +2583,119 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			transparent_color_pass_flags |= COLOR_PASS_FLAG_SEPARATE_TRANSPARENCY;
 		}
 
-		RID alpha_framebuffer = rb_data.is_valid() ? rb_data->get_color_pass_fb(transparent_color_pass_flags) : color_only_framebuffer;
 		RenderListParameters render_list_params(render_list[RENDER_LIST_ALPHA].elements.ptr(), render_list[RENDER_LIST_ALPHA].element_info.ptr(), render_list[RENDER_LIST_ALPHA].elements.size(), reverse_cull, PASS_MODE_COLOR, transparent_color_pass_flags, rb_data.is_null(), p_render_data->directional_light_soft_shadows, rp_uniform_set, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_WIREFRAME, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count, 0, base_specialization);
-		_render_list_with_draw_list(&render_list_params, alpha_framebuffer, separate_transparency ? RD::DRAW_CLEAR_COLOR_0 | RD::DRAW_CLEAR_COLOR_1 : RD::DRAW_DEFAULT_ALL, separate_transparency ? Vector<Color>({Color(0, 0, 0, 0), Color(1, 1, 1, 1)}) : Vector<Color>(), 0.0f, 0u, p_render_data->render_region);
+		uint64_t source_policy = rb->get_reflection_source_request();
+		bool filtered_source = false;
+		bool source_depth_unchanged = get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_DISABLED;
+		bool dual_source_eligible = source_depth_unchanged && rb_data.is_valid() && !is_reflection_probe && RD::get_singleton()->limit_get(RD::LIMIT_MAX_FRAMEBUFFER_COLOR_ATTACHMENTS) >= 4;
+		RID alpha_framebuffer;
+		if (source_policy != 0 && !separate_transparency) {
+			ERR_PRINT_ONCE("A reflection source producer must request separate transparency.");
+			source_policy = 0;
+		}
+		if (source_policy != 0) {
+			for (uint32_t i = 0; i < render_list[RENDER_LIST_ALPHA].elements.size(); i++) {
+				const GeometryInstanceSurfaceDataCache *surface = render_list[RENDER_LIST_ALPHA].elements[i];
+				if (surface->owner->instance_count == 0) {
+					continue;
+				}
+				if (surface->reflection_source_excluded) {
+					filtered_source = true;
+					// Exclusions forbid an opaque prepass, but can still write alpha
+					// depth. Such draws (and any excluded stencil use) make the two
+					// depth histories differ, so retain the independent replay.
+					if (surface->shader->depth_draw == SceneShaderForwardClustered::ShaderData::DEPTH_DRAW_ALWAYS || surface->shader->stencil_enabled) {
+						dual_source_eligible = false;
+					}
+				} else if (surface->shader->depth_draw == SceneShaderForwardClustered::ShaderData::DEPTH_DRAW_ALWAYS || surface->shader->stencil_enabled) {
+					// Opaque-only and disabled depth modes do not write in the alpha
+					// pipeline. Keep the reset for depth writers and all stencil users.
+					source_depth_unchanged = false;
+				}
+				// Plain alpha-to-coverage uses the unchanged output 0 alpha for both
+				// pairs. Alpha-to-one changes only output 0, so source E at output 2
+				// would differ from its independent pass; retain that replay path.
+				if (surface->shader->alpha_antialiasing_mode == SceneShaderForwardClustered::ShaderData::ALPHA_ANTIALIASING_ALPHA_TO_COVERAGE_AND_TO_ONE) {
+					dual_source_eligible = false;
+				}
+			}
+		}
+		RID dual_framebuffer;
+		if (filtered_source && dual_source_eligible) {
+			dual_framebuffer = rb_data->get_color_pass_fb(transparent_color_pass_flags | COLOR_PASS_FLAG_DUAL_TRANSPARENCY);
+		}
+		const bool dual_source = dual_framebuffer.is_valid();
+		if (!dual_source && rb->has_texture(RB_SCOPE_REFLECTION_SOURCE_LAYERS, RB_TEX_TRANSPARENCY)) {
+			// The extra multisampled pair is large. Do not retain it in views
+			// that disable this producer or need the original replay path.
+			rb->clear_context(RB_SCOPE_REFLECTION_SOURCE_LAYERS);
+		}
+		if (filtered_source) {
+			// Both paths use the existing sorted list and stable pre-transparent
+			// screen/depth inputs. With identical depth histories, one ordered
+			// walk can shade common draws once into two independent E/T pairs.
+			// Independent attachment blending is already required by separate E/T.
+			if (dual_source) {
+				RENDER_TIMESTAMP("Render 3D Dual Alpha");
+				render_list_params.color_pass_flags |= COLOR_PASS_FLAG_DUAL_TRANSPARENCY;
+				_render_list_with_draw_list(&render_list_params, dual_framebuffer, RD::DRAW_CLEAR_COLOR_ALL, Vector<Color>({ Color(0, 0, 0, 0), Color(1, 1, 1, 1), Color(0, 0, 0, 0), Color(1, 1, 1, 1) }), 0.0f, 0u, p_render_data->render_region);
+				render_list_params.color_pass_flags = transparent_color_pass_flags;
+			} else {
+				RENDER_TIMESTAMP("Reflection Source Alpha");
+				render_list_params.exclude_reflection_sources = true;
+				RID source_framebuffer = rb_data->get_color_pass_fb(transparent_color_pass_flags);
+				_render_list_with_draw_list(&render_list_params, source_framebuffer, RD::DRAW_CLEAR_COLOR_0 | RD::DRAW_CLEAR_COLOR_1, Vector<Color>({ Color(0, 0, 0, 0), Color(1, 1, 1, 1) }), 0.0f, 0u, p_render_data->render_region);
+				if (source_depth_unchanged) {
+					alpha_framebuffer = source_framebuffer;
+				}
+			}
+			RENDER_TIMESTAMP("Reflection Source Resolve");
+			render_list_params.exclude_reflection_sources = false;
+			if (use_msaa) {
+				for (uint32_t v = 0; v < rb->get_view_count(); v++) {
+					// A PRE_TRANSPARENT effect may already have edited resolved color.
+					if (!ce_pre_transparent_resolved_color) {
+						RD::get_singleton()->texture_resolve_multisample(rb->get_color_msaa(v), rb->get_internal_texture(v));
+					}
+					RID source_color = dual_source ? rb->get_texture_slice(RB_SCOPE_REFLECTION_SOURCE_LAYERS, RB_TEX_TRANSPARENCY, v, 0) : rb->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSPARENCY_MSAA, v, 0);
+					RID source_transmission = dual_source ? rb->get_texture_slice(RB_SCOPE_REFLECTION_SOURCE_LAYERS, RB_TEX_TRANSMISSION, v, 0) : rb->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSMISSION_MSAA, v, 0);
+					RD::get_singleton()->texture_resolve_multisample(source_color, rb->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSPARENCY, v, 0));
+					RD::get_singleton()->texture_resolve_multisample(source_transmission, rb->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSMISSION, v, 0));
+				}
+				opaque_color_resolved_for_source = !ce_pre_transparent_resolved_color;
+			}
+			static const StringName source_name = "reflection_source";
+			const Size2i source_size = rb->get_internal_size();
+			uint32_t mipmaps = 1;
+			for (int edge = MAX(source_size.x, source_size.y); edge > 1 && mipmaps < 6; edge >>= 1) {
+				mipmaps++;
+			}
+			if (!rb->has_texture(RB_SCOPE_FORWARD_CLUSTERED, source_name)) {
+				rb->create_texture(RB_SCOPE_FORWARD_CLUSTERED, source_name, RD::DATA_FORMAT_R16G16B16A16_SFLOAT, RD::TEXTURE_USAGE_STORAGE_BIT | RD::TEXTURE_USAGE_SAMPLING_BIT, RD::TEXTURE_SAMPLES_1, source_size, 0, mipmaps);
+			}
+			for (uint32_t v = 0; v < rb->get_view_count(); v++) {
+				const RID specular = rb->has_separate_reflections() ? rb_data->get_specular(v) : RID();
+				const StringName source_scope = dual_source && !use_msaa ? RB_SCOPE_REFLECTION_SOURCE_LAYERS : RB_SCOPE_FORWARD_CLUSTERED;
+				RENDER_TIMESTAMP("Reflection Source Composite");
+				copy_effects->copy_scene_layers(rb->get_internal_texture(v), specular, rb->get_texture_slice(source_scope, RB_TEX_TRANSPARENCY, v, 0), rb->get_texture_slice(source_scope, RB_TEX_TRANSMISSION, v, 0), rb->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, source_name, v, 0), source_size);
+				RENDER_TIMESTAMP("Reflection Source Mipmaps");
+				Size2i level_size = source_size;
+				for (uint32_t m = 1; m < mipmaps; m++) {
+					level_size = Size2i(MAX(1, level_size.x >> 1), MAX(1, level_size.y >> 1));
+					copy_effects->make_mipmap(rb->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, source_name, v, m - 1), rb->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, source_name, v, m), level_size);
+				}
+			}
+		}
+		// Only the fallback needs another walk. Reset its private depth if source
+		// draws changed it; otherwise keep the established framebuffer reuse.
+		if (!dual_source) {
+			RENDER_TIMESTAMP("Render 3D Alpha Replay");
+			if (alpha_framebuffer.is_null()) {
+				alpha_framebuffer = rb_data.is_valid() ? rb_data->get_color_pass_fb(transparent_color_pass_flags) : color_only_framebuffer;
+			}
+			_render_list_with_draw_list(&render_list_params, alpha_framebuffer, separate_transparency ? RD::DRAW_CLEAR_COLOR_0 | RD::DRAW_CLEAR_COLOR_1 : RD::DRAW_DEFAULT_ALL, separate_transparency ? Vector<Color>({ Color(0, 0, 0, 0), Color(1, 1, 1, 1) }) : Vector<Color>(), 0.0f, 0u, p_render_data->render_region);
+		}
+		rb->set_reflection_source_complete(RSG::rasterizer->get_frame_number(), source_policy, filtered_source);
 	}
 
 	RD::get_singleton()->draw_command_end_label();
@@ -2502,7 +2707,11 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	if (rb_data.is_valid() && use_msaa) {
 		bool resolve_velocity_buffer = (using_taa || using_upscaling || ce_needs_motion_vectors) && rb->has_velocity_buffer(true);
 		for (uint32_t v = 0; v < rb->get_view_count(); v++) {
-			RD::get_singleton()->texture_resolve_multisample(rb->get_color_msaa(v), rb->get_internal_texture(v));
+			// Separate alpha only writes E/T and private depth. A color resolve made
+			// for this frame's filtered source is still current after that replay.
+			if (!opaque_color_resolved_for_source) {
+				RD::get_singleton()->texture_resolve_multisample(rb->get_color_msaa(v), rb->get_internal_texture(v));
+			}
 			resolve_effects->resolve_depth(rb->get_depth_msaa(v), rb->get_depth_texture(v), rb->get_internal_size(), texture_multisamples[msaa]);
 			if (separate_transparency) {
 				RD::get_singleton()->texture_resolve_multisample(rb->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSPARENCY_MSAA, v, 0), rb->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSPARENCY, v, 0));
@@ -2613,9 +2822,26 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		}
 	}
 
+	if (separate_reflections) {
+		// Seed a complete layer even when a consumer suppresses blur for a camera cut.
+		// It is independent of TAA/FSR's receiver history and uses the producer's own history.
+		rb->create_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_REFLECTION_OUTPUT, RD::DATA_FORMAT_R16G16B16A16_SFLOAT,
+				RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT, RD::TEXTURE_SAMPLES_1, rb->get_output_size());
+		for (uint32_t v = 0; v < rb->get_view_count(); v++) {
+			copy_effects->copy_scene_layers(rb_data->get_specular(v), RID(), RID(), RID(), rb->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_REFLECTION_OUTPUT, v, 0), rb->get_output_size(), p_render_data->scene_data->taa_jitter * 0.5);
+		}
+	}
+
 	{
 		RENDER_TIMESTAMP("Process Post Upscale Compositor Effects");
 		_process_compositor_effects(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_POST_UPSCALE, p_render_data);
+	}
+
+	if (separate_reflections) {
+		RENDER_TIMESTAMP("Composite Reflected Layer");
+		for (uint32_t v = 0; v < rb->get_view_count(); v++) {
+			copy_effects->merge_reflection(rb->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_REFLECTION_OUTPUT, v, 0), rb->get_output_texture(v), rb->get_output_size());
+		}
 	}
 
 	if (separate_transparency) {
@@ -4139,7 +4365,9 @@ void RenderForwardClustered::sdfgi_update(const Ref<RenderSceneBuffers> &p_rende
 	static const uint32_t history_frames_to_converge[RSE::ENV_SDFGI_CONVERGE_MAX] = { 5, 10, 15, 20, 25, 30 };
 	uint32_t requested_history_size = history_frames_to_converge[gi.sdfgi_frames_to_converge];
 
-	if (sdfgi.is_valid() && (sdfgi->num_cascades != environment_get_sdfgi_cascades(p_environment) || sdfgi->min_cell_size != environment_get_sdfgi_min_cell_size(p_environment) || requested_history_size != sdfgi->history_size || sdfgi->uses_occlusion != environment_get_sdfgi_use_occlusion(p_environment) || sdfgi->y_scale_mode != environment_get_sdfgi_y_scale(p_environment))) {
+	// A buffer-only helper skips native lighting work. Renewed demand recreates
+	// its volumes/history before authored lighting, debug or native opaque use.
+	if (sdfgi.is_valid() && (sdfgi->buffer_only != gi.can_use_sdfgi_buffer_only(p_environment) || sdfgi->num_cascades != environment_get_sdfgi_cascades(p_environment) || sdfgi->min_cell_size != environment_get_sdfgi_min_cell_size(p_environment) || requested_history_size != sdfgi->history_size || sdfgi->uses_occlusion != environment_get_sdfgi_use_occlusion(p_environment) || sdfgi->y_scale_mode != environment_get_sdfgi_y_scale(p_environment))) {
 		//configuration changed, erase
 		sdfgi.unref();
 		rb->set_custom_data(RB_SCOPE_SDFGI, sdfgi);
@@ -4163,6 +4391,11 @@ int RenderForwardClustered::sdfgi_get_pending_region_count(const Ref<RenderScene
 		return 0;
 	}
 	Ref<RendererRD::GI::SDFGI> sdfgi = rb->get_custom_data(RB_SCOPE_SDFGI);
+	// Avoid gathering geometry/static lights for unused helper volumes. Native
+	// demand recreates this allocation before culling, including debug views.
+	if (sdfgi->buffer_only) {
+		return 0;
+	}
 
 	int dirty_count = 0;
 	for (const RendererRD::GI::SDFGI::Cascade &c : sdfgi->cascades) {
@@ -4242,7 +4475,7 @@ void RenderForwardClustered::_update_global_pipeline_data_requirements_from_ligh
 	global_pipeline_data_required.use_shadow_dual_paraboloid = light_storage->get_shadow_dual_paraboloid_used();
 }
 
-void RenderForwardClustered::_geometry_instance_add_surface_with_material(GeometryInstanceForwardClustered *ginstance, uint32_t p_surface, SceneShaderForwardClustered::MaterialData *p_material, uint32_t p_material_id, uint32_t p_shader_id, RID p_mesh) {
+void RenderForwardClustered::_geometry_instance_add_surface_with_material(GeometryInstanceForwardClustered *ginstance, uint32_t p_surface, SceneShaderForwardClustered::MaterialData *p_material, uint32_t p_material_id, uint32_t p_shader_id, RID p_mesh, bool p_source_excluded) {
 	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
 	uint32_t flags = 0;
 
@@ -4333,6 +4566,13 @@ void RenderForwardClustered::_geometry_instance_add_surface_with_material(Geomet
 	sdcache->surface = mesh_storage->mesh_get_surface(p_mesh, p_surface);
 	sdcache->primitive = mesh_storage->mesh_surface_get_primitive(sdcache->surface);
 	sdcache->surface_index = p_surface;
+	// Only the represented base alpha draw is excluded. Material overlays and
+	// next passes stay in the source, and an opaque/prepass surface cannot be
+	// undone by replaying alpha after the opaque scene has already been drawn.
+	sdcache->reflection_source_excluded = p_source_excluded && (flags & GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA) && !(flags & GeometryInstanceSurfaceDataCache::FLAG_PASS_DEPTH);
+	if (p_source_excluded && !sdcache->reflection_source_excluded) {
+		WARN_PRINT_ONCE("Reflection source exclusions require an alpha surface without an opaque depth prepass.");
+	}
 
 	if (ginstance->data->dirty_dependencies) {
 		RSG::utilities->base_update_dependency(p_mesh, &ginstance->data->dependency_tracker);
@@ -4382,11 +4622,11 @@ void RenderForwardClustered::_geometry_instance_add_surface_with_material(Geomet
 #endif
 }
 
-void RenderForwardClustered::_geometry_instance_add_surface_with_material_chain(GeometryInstanceForwardClustered *ginstance, uint32_t p_surface, SceneShaderForwardClustered::MaterialData *p_material, RID p_mat_src, RID p_mesh) {
+void RenderForwardClustered::_geometry_instance_add_surface_with_material_chain(GeometryInstanceForwardClustered *ginstance, uint32_t p_surface, SceneShaderForwardClustered::MaterialData *p_material, RID p_mat_src, RID p_mesh, bool p_source_excluded) {
 	SceneShaderForwardClustered::MaterialData *material = p_material;
 	RendererRD::MaterialStorage *material_storage = RendererRD::MaterialStorage::get_singleton();
 
-	_geometry_instance_add_surface_with_material(ginstance, p_surface, material, p_mat_src.get_local_index(), material_storage->material_get_shader_id(p_mat_src), p_mesh);
+	_geometry_instance_add_surface_with_material(ginstance, p_surface, material, p_mat_src.get_local_index(), material_storage->material_get_shader_id(p_mat_src), p_mesh, p_source_excluded);
 
 	while (material->next_pass.is_valid()) {
 		RID next_pass = material->next_pass;
@@ -4427,7 +4667,7 @@ void RenderForwardClustered::_geometry_instance_add_surface(GeometryInstanceForw
 
 	ERR_FAIL_NULL(material);
 
-	_geometry_instance_add_surface_with_material_chain(ginstance, p_surface, material, m_src, p_mesh);
+	_geometry_instance_add_surface_with_material_chain(ginstance, p_surface, material, m_src, p_mesh, ginstance->data->reflection_source_exclusions.has(p_surface));
 
 	if (ginstance->data->material_overlay.is_valid()) {
 		m_src = ginstance->data->material_overlay;
@@ -4651,6 +4891,38 @@ static RD::FramebufferFormatID _get_color_framebuffer_format_for_pipeline(RD::Da
 
 	passes.ptrw()[0].depth_attachment = attachments.size() - 1;
 
+	return RD::get_singleton()->framebuffer_format_create_multipass(attachments, passes, p_view_count);
+}
+
+static RD::FramebufferFormatID _get_transparency_framebuffer_format_for_pipeline(RD::DataFormat p_color_format, bool p_can_be_storage, RD::TextureSamples p_samples, bool p_dual, uint32_t p_view_count) {
+	// Match get_color_pass_fb: E/T, an unused velocity slot (or the second
+	// E/T pair), and the independent transparency depth attachment.
+	RD::AttachmentFormat attachment;
+	attachment.samples = p_samples;
+	attachment.format = p_color_format;
+	attachment.usage_flags = RD::TEXTURE_USAGE_COLOR_ATTACHMENT_BIT | RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT | RD::TEXTURE_USAGE_CAN_COPY_TO_BIT;
+	Vector<RD::AttachmentFormat> attachments;
+	attachments.push_back(attachment);
+	attachments.push_back(attachment);
+	if (p_dual) {
+		attachment.usage_flags &= ~RD::TEXTURE_USAGE_CAN_COPY_TO_BIT;
+		attachments.push_back(attachment);
+		attachments.push_back(attachment);
+	} else {
+		RD::AttachmentFormat unused;
+		unused.usage_flags = RD::AttachmentFormat::UNUSED_ATTACHMENT;
+		attachments.push_back(unused);
+	}
+	attachment.format = RenderSceneBuffersRD::get_depth_format(false, p_samples > RD::TEXTURE_SAMPLES_1, p_can_be_storage);
+	attachment.usage_flags = RD::TEXTURE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | RD::TEXTURE_USAGE_CAN_COPY_TO_BIT;
+	attachments.push_back(attachment);
+	RD::FramebufferPass pass;
+	for (int i = 0; i < attachments.size() - 1; i++) {
+		pass.color_attachments.push_back(attachments[i].usage_flags == RD::AttachmentFormat::UNUSED_ATTACHMENT ? RD::ATTACHMENT_UNUSED : i);
+	}
+	pass.depth_attachment = attachments.size() - 1;
+	Vector<RD::FramebufferPass> passes;
+	passes.push_back(pass);
 	return RD::get_singleton()->framebuffer_format_create_multipass(attachments, passes, p_view_count);
 }
 
@@ -4892,6 +5164,24 @@ void RenderForwardClustered::_mesh_compile_stock_pipelines_for_surface(const Sur
 				const uint32_t separate_specular_iterations = p_global.use_separate_specular ? 2 : 1;
 				const uint32_t motion_vectors_iterations = p_global.use_motion_vectors ? 2 : 1;
 				uint32_t base_color_pass_flags = pipeline_key.color_pass_flags;
+				if (alpha) {
+					for (uint32_t samples = 0; samples < RD::TEXTURE_SAMPLES_MAX; samples++) {
+						if (!(p_global.transparency_sample_mask & (1u << samples))) {
+							continue;
+						}
+						pipeline_key.color_pass_flags = base_color_pass_flags | SceneShaderForwardClustered::PIPELINE_COLOR_PASS_FLAG_SEPARATE_TRANSPARENCY;
+						pipeline_key.framebuffer_format_id = _get_transparency_framebuffer_format_for_pipeline(buffers_color_format, buffers_can_be_storage, RD::TextureSamples(samples), false, view_count);
+						_mesh_compile_pipeline_for_surface(p_surface.shader, p_surface.mesh_surface, true, p_surface.instanced, p_source, pipeline_key, r_pipeline_pairs);
+						if (p_global.use_dual_transparency) {
+							pipeline_key.color_pass_flags |= SceneShaderForwardClustered::PIPELINE_COLOR_PASS_FLAG_DUAL_TRANSPARENCY;
+							pipeline_key.framebuffer_format_id = _get_transparency_framebuffer_format_for_pipeline(buffers_color_format, buffers_can_be_storage, RD::TextureSamples(samples), true, view_count);
+							_mesh_compile_pipeline_for_surface(p_surface.shader, p_surface.mesh_surface, true, p_surface.instanced, p_source, pipeline_key, r_pipeline_pairs);
+							// The same material can appear in either reflection-source class.
+							pipeline_key.color_pass_flags |= SceneShaderForwardClustered::PIPELINE_COLOR_PASS_FLAG_REFLECTION_SOURCE_EXCLUDED;
+							_mesh_compile_pipeline_for_surface(p_surface.shader, p_surface.mesh_surface, true, p_surface.instanced, p_source, pipeline_key, r_pipeline_pairs);
+						}
+					}
+				}
 				for (uint32_t separate_specular = 0; separate_specular < separate_specular_iterations; separate_specular++) {
 					for (uint32_t motion_vectors = 0; motion_vectors < motion_vectors_iterations; motion_vectors++) {
 						if (!separate_specular && !motion_vectors) {

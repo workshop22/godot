@@ -523,6 +523,7 @@ public:
 	FUNC2(reflection_probe_set_enable_shadows, RID, bool)
 	FUNC2(reflection_probe_set_cull_mask, RID, uint32_t)
 	FUNC2(reflection_probe_set_reflection_mask, RID, uint32_t)
+	FUNC2(reflection_probe_set_reflection_source_policy, RID, uint64_t)
 	FUNC2(reflection_probe_set_resolution, RID, int)
 	FUNC2(reflection_probe_set_mesh_lod_threshold, RID, float)
 
@@ -963,6 +964,7 @@ public:
 	FUNC2RC(Vector<ObjectID>, instances_cull_convex, const Vector<Plane> &, RID)
 
 	FUNC3(instance_geometry_set_flag, RID, RSE::InstanceFlags, bool)
+	FUNC2(instance_geometry_set_reflection_source_exclusions, RID, const PackedInt32Array &)
 	FUNC2(instance_geometry_set_cast_shadows_setting, RID, RSE::ShadowCastingSetting)
 	FUNC2(instance_geometry_set_material_override, RID, RID)
 	FUNC2(instance_geometry_set_material_overlay, RID, RID)

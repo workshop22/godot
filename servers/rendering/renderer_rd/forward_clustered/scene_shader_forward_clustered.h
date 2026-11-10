@@ -74,6 +74,9 @@ public:
 		SHADER_COLOR_PASS_FLAG_SEPARATE_TRANSPARENCY = 1 << 5,
 		SHADER_COLOR_PASS_FLAG_COUNT = 1 << 6
 	};
+	// Only the eight valid ubershader/lightmap/multiview combinations need a
+	// dual-transparency variant; do not multiply unrelated shader variants.
+	static constexpr uint32_t SHADER_DUAL_TRANSPARENCY_COUNT = 8;
 
 	enum PipelineVersion {
 		PIPELINE_VERSION_DEPTH_PASS,
@@ -96,7 +99,9 @@ public:
 		PIPELINE_COLOR_PASS_FLAG_MULTIVIEW = 1 << 3,
 		PIPELINE_COLOR_PASS_FLAG_MOTION_VECTORS = 1 << 4,
 		PIPELINE_COLOR_PASS_FLAG_SEPARATE_TRANSPARENCY = 1 << 5,
-		PIPELINE_COLOR_PASS_FLAG_OPTIONS = 6,
+		PIPELINE_COLOR_PASS_FLAG_DUAL_TRANSPARENCY = 1 << 6,
+		PIPELINE_COLOR_PASS_FLAG_REFLECTION_SOURCE_EXCLUDED = 1 << 7, // Blend write masks only.
+		PIPELINE_COLOR_PASS_FLAG_OPTIONS = 8,
 		PIPELINE_COLOR_PASS_FLAG_COMBINATIONS = 1 << PIPELINE_COLOR_PASS_FLAG_OPTIONS,
 	};
 
@@ -222,7 +227,7 @@ public:
 
 		RID version;
 
-		static const uint32_t VERTEX_INPUT_MASKS_SIZE = ShaderVersion::SHADER_VERSION_COLOR_PASS * 2 + SHADER_COLOR_PASS_FLAG_COUNT;
+		static const uint32_t VERTEX_INPUT_MASKS_SIZE = ShaderVersion::SHADER_VERSION_COLOR_PASS * 2 + SHADER_COLOR_PASS_FLAG_COUNT + SHADER_DUAL_TRANSPARENCY_COUNT;
 		std::atomic<uint64_t> vertex_input_masks[VERTEX_INPUT_MASKS_SIZE] = {};
 
 		Vector<ShaderCompiler::GeneratedCode::Texture> texture_uniforms;
