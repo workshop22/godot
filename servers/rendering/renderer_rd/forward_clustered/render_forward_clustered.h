@@ -51,9 +51,7 @@
 #define RB_SCOPE_FORWARD_CLUSTERED SNAME("forward_clustered")
 
 #define RB_TEX_TRANSPARENCY SNAME("transparency")
-#define RB_TEX_TRANSMISSION SNAME("transmission")
 #define RB_TEX_TRANSPARENCY_MSAA SNAME("transparency_msaa")
-#define RB_TEX_TRANSMISSION_MSAA SNAME("transmission_msaa")
 #define RB_TEX_TRANSPARENCY_DEPTH SNAME("transparency_depth")
 
 #define RB_TEX_SPECULAR SNAME("specular")

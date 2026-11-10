@@ -196,31 +196,32 @@ RID RenderForwardClustered::RenderBufferDataForwardClustered::get_color_pass_fb(
 
 	RID depth = use_msaa ? render_buffers->get_texture(RB_SCOPE_BUFFERS, RB_TEX_DEPTH_MSAA) : render_buffers->get_depth_texture();
 	if (p_color_pass_flags & COLOR_PASS_FLAG_SEPARATE_TRANSPARENCY) {
-		RD *rd = RD::get_singleton();
+		// One layer: the transparent surfaces' own light in RGB and what they leave of the
+		// background in A (scene_shader_forward_clustered.cpp sets the blend).
 		uint32_t usage = RD::TEXTURE_USAGE_COLOR_ATTACHMENT_BIT | RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT | RD::TEXTURE_USAGE_CAN_COPY_TO_BIT;
-		RD::TextureSamples samples = use_msaa ? render_buffers->get_texture_format(RB_SCOPE_BUFFERS, RB_TEX_COLOR_MSAA).samples : RD::TEXTURE_SAMPLES_1;
-		for (StringName name : { RB_TEX_TRANSPARENCY, RB_TEX_TRANSMISSION }) {
-			if (!render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, name)) {
-				render_buffers->create_texture(RB_SCOPE_FORWARD_CLUSTERED, name, render_buffers->get_base_data_format(), usage);
+		if (!render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSPARENCY)) {
+			render_buffers->create_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSPARENCY, render_buffers->get_base_data_format(), usage);
+		}
+		if (use_msaa) {
+			// The layer tests and writes the scene's multisampled depth: the opaque depth later
+			// effects read was resolved before this pass (_render_scene).
+			if (!render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSPARENCY_MSAA)) {
+				render_buffers->create_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSPARENCY_MSAA, render_buffers->get_base_data_format(), usage, render_buffers->get_texture_format(RB_SCOPE_BUFFERS, RB_TEX_COLOR_MSAA).samples);
 			}
+		} else {
+			// Without MSAA the scene's depth is the one later effects read: the layer writes a copy.
+			if (!render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSPARENCY_DEPTH)) {
+				render_buffers->create_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSPARENCY_DEPTH, render_buffers->get_depth_format(false, false, render_buffers->get_can_be_storage()), RD::TEXTURE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | RD::TEXTURE_USAGE_CAN_COPY_TO_BIT);
+			}
+			RID layer_depth = render_buffers->get_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSPARENCY_DEPTH);
+			Size2i size = render_buffers->get_internal_size();
+			for (int v = 0; v < v_count; v++) {
+				RD::get_singleton()->texture_copy(depth, layer_depth, Vector3(), Vector3(), Vector3(size.x, size.y, 1), 0, 0, v, v);
+			}
+			depth = layer_depth;
 		}
-		if (use_msaa && !render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSPARENCY_MSAA)) {
-			render_buffers->create_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSPARENCY_MSAA, render_buffers->get_base_data_format(), usage, samples);
-			render_buffers->create_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSMISSION_MSAA, render_buffers->get_base_data_format(), usage, samples);
-		}
-		if (!render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSPARENCY_DEPTH)) {
-			render_buffers->create_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSPARENCY_DEPTH, render_buffers->get_depth_format(false, use_msaa, render_buffers->get_can_be_storage()), RD::TEXTURE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | RD::TEXTURE_USAGE_CAN_COPY_TO_BIT, samples);
-		}
-		RID layer_depth = render_buffers->get_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSPARENCY_DEPTH);
-		Size2i size = render_buffers->get_internal_size();
-		for (int v = 0; v < v_count; v++) {
-			rd->texture_copy(depth, layer_depth, Vector3(), Vector3(), Vector3(size.x, size.y, 1), 0, 0, v, v);
-		}
-		depth = layer_depth;
 		color = render_buffers->get_texture(RB_SCOPE_FORWARD_CLUSTERED, use_msaa ? RB_TEX_TRANSPARENCY_MSAA : RB_TEX_TRANSPARENCY);
-		specular = render_buffers->get_texture(RB_SCOPE_FORWARD_CLUSTERED, use_msaa ? RB_TEX_TRANSMISSION_MSAA : RB_TEX_TRANSMISSION);
 	}
-
 
 	if (render_buffers->has_texture(RB_SCOPE_VRS, RB_TEXTURE)) {
 		RID vrs_texture = render_buffers->get_texture(RB_SCOPE_VRS, RB_TEXTURE);
@@ -2364,6 +2365,12 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		RD::get_singleton()->draw_command_end_label();
 	}
 
+	// Whether the resolved depth holds the opaque depth when the transparent pass starts: a
+	// separate transparent layer writes the multisampled depth, so the final resolve must not
+	// resolve it again. (The scene color is always resolved again at the end: effects before the
+	// transparent pass may write the resolved color for the screen copy alone.)
+	bool opaque_depth_resolved = false;
+
 	if (use_msaa) {
 		RENDER_TIMESTAMP("Resolve MSAA");
 
@@ -2378,10 +2385,12 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			}
 		}
 
-		if (scene_state.used_depth_texture || scene_state.used_normal_texture || using_separate_specular || ce_needs_normal_roughness || ce_pre_transparent_resolved_depth) {
+		// A separate transparent layer writes the multisampled depth: resolve the opaque depth first.
+		if (scene_state.used_depth_texture || scene_state.used_normal_texture || using_separate_specular || ce_needs_normal_roughness || ce_pre_transparent_resolved_depth || separate_transparency) {
 			for (uint32_t v = 0; v < rb->get_view_count(); v++) {
 				resolve_effects->resolve_depth(rb->get_depth_msaa(v), rb->get_depth_texture(v), rb->get_internal_size(), texture_multisamples[msaa]);
 			}
+			opaque_depth_resolved = true;
 		}
 	}
 
@@ -2490,7 +2499,8 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 
 		RID alpha_framebuffer = rb_data.is_valid() ? rb_data->get_color_pass_fb(transparent_color_pass_flags) : color_only_framebuffer;
 		RenderListParameters render_list_params(render_list[RENDER_LIST_ALPHA].elements.ptr(), render_list[RENDER_LIST_ALPHA].element_info.ptr(), render_list[RENDER_LIST_ALPHA].elements.size(), reverse_cull, PASS_MODE_COLOR, transparent_color_pass_flags, rb_data.is_null(), p_render_data->directional_light_soft_shadows, rp_uniform_set, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_WIREFRAME, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count, 0, base_specialization);
-		_render_list_with_draw_list(&render_list_params, alpha_framebuffer, separate_transparency ? RD::DRAW_CLEAR_COLOR_0 | RD::DRAW_CLEAR_COLOR_1 : RD::DRAW_DEFAULT_ALL, separate_transparency ? Vector<Color>({Color(0, 0, 0, 0), Color(1, 1, 1, 1)}) : Vector<Color>(), 0.0f, 0u, p_render_data->render_region);
+		// The layer starts with no light of its own and the whole background showing through.
+		_render_list_with_draw_list(&render_list_params, alpha_framebuffer, separate_transparency ? RD::DRAW_CLEAR_COLOR_0 : RD::DRAW_DEFAULT_ALL, separate_transparency ? Vector<Color>({ Color(0, 0, 0, 1) }) : Vector<Color>(), 0.0f, 0u, p_render_data->render_region);
 	}
 
 	RD::get_singleton()->draw_command_end_label();
@@ -2503,10 +2513,11 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		bool resolve_velocity_buffer = (using_taa || using_upscaling || ce_needs_motion_vectors) && rb->has_velocity_buffer(true);
 		for (uint32_t v = 0; v < rb->get_view_count(); v++) {
 			RD::get_singleton()->texture_resolve_multisample(rb->get_color_msaa(v), rb->get_internal_texture(v));
-			resolve_effects->resolve_depth(rb->get_depth_msaa(v), rb->get_depth_texture(v), rb->get_internal_size(), texture_multisamples[msaa]);
+			if (!(separate_transparency && opaque_depth_resolved)) {
+				resolve_effects->resolve_depth(rb->get_depth_msaa(v), rb->get_depth_texture(v), rb->get_internal_size(), texture_multisamples[msaa]);
+			}
 			if (separate_transparency) {
 				RD::get_singleton()->texture_resolve_multisample(rb->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSPARENCY_MSAA, v, 0), rb->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSPARENCY, v, 0));
-				RD::get_singleton()->texture_resolve_multisample(rb->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSMISSION_MSAA, v, 0), rb->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSMISSION, v, 0));
 			}
 
 			if (resolve_velocity_buffer) {
@@ -2621,7 +2632,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	if (separate_transparency) {
 		RENDER_TIMESTAMP("Composite Transparent Layer");
 		for (uint32_t v = 0; v < rb->get_view_count(); v++) {
-			copy_effects->merge_transparency(rb->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSPARENCY, v, 0), rb->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSMISSION, v, 0), rb->get_output_texture(v), rb->get_output_size(), p_render_data->scene_data->taa_jitter * 0.5);
+			copy_effects->merge_transparency(rb->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSPARENCY, v, 0), rb->get_output_texture(v), rb->get_output_size(), p_render_data->scene_data->taa_jitter * 0.5);
 		}
 	}
 
