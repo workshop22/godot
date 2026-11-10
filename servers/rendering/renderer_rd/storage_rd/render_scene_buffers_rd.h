@@ -331,6 +331,9 @@ public:
 		return is_output_upscaled() ? target_size : internal_size;
 	}
 
+	// Which of TAA's two alternating history textures holds the last resolved frame (effects/taa.cpp).
+	uint32_t taa_history_index = 0;
+
 	// Velocity, currently only used by TAA (Clustered) but we'll be using this in other places soon too.
 
 	void ensure_velocity();
