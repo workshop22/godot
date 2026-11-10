@@ -61,6 +61,7 @@ public:
 	RID filtered[2]; // trace size: the edge-aware filter's passes, ping-ponged
 	RID filtered_variance[2];
 	RID reflect_filtered; // softened output; temporal history remains sharp
+	RID reflect_glossy[2]; // reflection size: the accumulated reflections after each glossy filter pass (for the resolve only)
 	RID reflect_trace; // reflection size: this frame's reflection rays (light, found)
 	RID reflect_hit; // reflection size: how far each ray went to what it found (negative: a moving object; 0: none)
 	RID reflect_motion; // previous minus current UV of the reflected point, virtual depth, valid
@@ -272,6 +273,7 @@ private:
 		PASS_REFLECT_TEMPORAL,
 		PASS_CACHE,
 		PASS_REFLECT_BLUR,
+		PASS_REFLECT_FILTER,
 		PASS_RESOLVE,
 		PASS_MAX,
 	};
