@@ -778,9 +778,10 @@ int cache_slot(vec3 x, vec3 n, bool claim, out bool claimed) {
 	return -1;
 }
 
-// The bounce light arriving at x (facing n), blended from the eight refined cells around it as a texture is filtered:
-// one cell's own value shows as a square patch where a reflection looks at it. Black when none is refined yet.
-vec3 smooth_incoming(vec3 x, vec3 n) {
+// The bounce light arriving at x (facing n), or with leaving the light leaving it, blended from the eight refined cells
+// around it as a texture is filtered: one cell's own value shows as a square patch where a reflection looks at it.
+// Black when none is refined yet.
+vec3 smooth_cache(vec3 x, vec3 n, bool leaving) {
 	float dist = length(x - f.view_to_world[3].xyz);
 	uint level = uint(clamp(floor(log2(max(dist, 1.0) / 8.0)) + 1.0, 0.0, 5.0));
 	vec3 c = x / (0.25 * float(1u << level)) - 0.5;
@@ -801,7 +802,7 @@ vec3 smooth_incoming(vec3 x, vec3 n) {
 				if (cells.c[slot].normal.w > 0.5) {
 					vec3 w3 = mix(1.0 - t, t, vec3(o));
 					float w = w3.x * w3.y * w3.z;
-					sum += vec4(cells.c[slot].incoming.rgb * w, w);
+					sum += vec4((leaving ? cells.c[slot].outgoing.rgb : cells.c[slot].incoming.rgb) * w, w);
 				}
 				break;
 			}
@@ -1000,7 +1001,18 @@ vec3 world_light(vec3 x, vec3 n, int hit, sampler2D depth_tex, sampler2D color_t
 					cells.c[slot].pos.w = uintBitsToFloat(f.cache.x);
 				}
 				if (cells.c[slot].normal.w > 0.5) {
-					return glow + (sharp ? albedo * (direct_light(x, n, false) + smooth_incoming(x, n)) : cells.c[slot].outgoing.rgb);
+					// A sharp ray (a reflection, which shows the point itself) takes the cells around it blended; a
+					// mirror's (mirror_hit) lights the point directly and takes only their bounce light. A glossy
+					// surface's rays land somewhere new each frame: lit directly they'd flicker between light and shadow.
+#ifdef PROBE_SOURCES
+					bool lit_here = sharp && mirror_hit;
+#else
+					bool lit_here = sharp;
+#endif
+					if (!sharp) {
+						return glow + cells.c[slot].outgoing.rgb;
+					}
+					return glow + (lit_here ? albedo * (direct_light(x, n, false) + smooth_cache(x, n, false)) : smooth_cache(x, n, true));
 				}
 			}
 		}
@@ -1009,7 +1021,7 @@ vec3 world_light(vec3 x, vec3 n, int hit, sampler2D depth_tex, sampler2D color_t
 }
 )";
 
-const char *SHADERS[8] = {
+const char *SHADERS[9] = {
 	// PASS_TRACE: a few rays per texel from the surface, cosine-weighted about its normal, marched against the depth
 	// buffer; a hit takes the light that point had on last frame's image. Stores the hits' light / rays (so,
 	// premultiplied) and the fraction of rays that hit: misses are left to Godot's own ambient light.
@@ -1427,6 +1439,9 @@ bool probe_source(vec3 x, vec3 n, int hit, out vec3 seen);
 // a roughness of 0.25 (a blurred reflection doesn't show the texture, and the line-of-sight ray costs), picked at
 // random in between so the change is a blend rather than an edge.
 bool probe_texture = false;
+// Whether this texel's off-screen hits are lit at the point (a mirror's, or coherent mirror rays: the same point every
+// frame), or take the radiance cache's light (glossy rays, somewhere new each frame).
+bool mirror_hit = false;
 
 @WORLD@
 @PROBE_REFLECTION@
@@ -1569,6 +1584,7 @@ void main() {
 	if (f.trace_settings.y > 0.5) {
 		probe_texture = true;
 	}
+	mirror_hit = rough < 0.06 || f.trace_settings.y > 0.5;
 	vec3 light = vec3(0.0);
 	bool found = false;
 	// How far the ray went to what it found, and whether that moves (Godot's dynamic-object flag on screen, a body
@@ -1806,7 +1822,12 @@ void main() {
 						kept = from_ycocg(clamp(to_ycocg(past.rgb), m1 - sigma, m1 + sigma));
 					}
 					float frames = min(past_state.x + 1.0, longest);
-					result = vec4(mix(kept, now.rgb, 1.0 / frames), mix(past.a, now.a, 1.0 / frames));
+					// Each side weighted down by its brightness (as tone mapped), so a lone bright ray (a light, a
+					// glint) doesn't flare the accumulated reflection for frames.
+					float take = 1.0 / frames;
+					float w_was = (1.0 - take) / (1.0 + dot(kept, vec3(0.2126, 0.7152, 0.0722)));
+					float w_now = take / (1.0 + dot(now.rgb, vec3(0.2126, 0.7152, 0.0722)));
+					result = vec4((kept * w_was + now.rgb * w_now) / (w_was + w_now), mix(past.a, now.a, take));
 					state = vec4(frames, hit_distance > 0.0 ? hit_distance : past_state.y, moving, 0.0);
 				}
 			}
@@ -1909,6 +1930,77 @@ void main() {
 	imageStore(dst, px, weights > 1e-4 ? sum / weights : texelFetch(source_tex, px, 0));
 }
 )",
+	// PASS_REFLECT_FILTER: one pass of an edge-avoiding a-trous filter over the accumulated reflections (5x5 taps, spaced
+	// by the pass's step): a glossy surface's one-ray-a-texel reflection averaged with its neighbours on the same surface
+	// (the same plane, facing the same way, about as rough), over a reach growing with its roughness; a mirror's left as
+	// it is. The history itself stays unfiltered: this only feeds the resolve. (Upstream de31a18.)
+	R"(
+#[compute]
+#version 450
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+@COMMON@
+layout(push_constant, std430) uniform Params {
+	ivec4 step; // x: the tap spacing, zw: the reflection texture's size
+}
+pc;
+layout(set = 0, binding = 0) uniform sampler2D light_in;
+layout(set = 0, binding = 1) uniform sampler2D reflect_depth_tex;
+layout(set = 0, binding = 2) uniform sampler2D normal_tex;
+layout(rgba16f, set = 0, binding = 3) uniform restrict writeonly image2D light_out;
+
+void main() {
+	ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 size = pc.step.zw;
+	if (any(greaterThanEqual(px, size))) {
+		return;
+	}
+	vec4 c = texelFetch(light_in, px, 0);
+	float z = texelFetch(reflect_depth_tex, px, 0).r;
+	vec2 fpc = vec2(frame_pixel(px, size));
+	vec4 nr = texelFetch(normal_tex, ivec2(fpc), 0);
+	float rough = clamp(decode_roughness(nr.w), 0.0, 1.0);
+	// The reach in texels a roughness spreads a reflection over: none for a mirror.
+	float reach = 16.0 * rough;
+	// Nothing to do for a mirror, nor past the roughness cutoff (no traced reflection there).
+	if (z <= 0.0 || reach < 0.3 || rough > f.reflect.y) {
+		imageStore(light_out, px, c);
+		return;
+	}
+	vec3 pos = view_from_linear(fpc, z, f.proj_info);
+	vec3 n = normalize(nr.xyz * 2.0 - 1.0);
+	const float k[3] = float[](0.375, 0.25, 0.0625);
+	vec4 sum = vec4(0.0);
+	float weights = 0.0;
+	for (int y = -2; y <= 2; y++) {
+		for (int x = -2; x <= 2; x++) {
+			ivec2 q = px + ivec2(x, y) * pc.step.x;
+			if (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, size))) {
+				continue;
+			}
+			float zq = texelFetch(reflect_depth_tex, q, 0).r;
+			if (zq <= 0.0) {
+				continue;
+			}
+			vec2 fq = vec2(frame_pixel(q, size));
+			vec4 nrq = texelFetch(normal_tex, ivec2(fq), 0);
+			vec3 nq = normalize(nrq.xyz * 2.0 - 1.0);
+			float rq = clamp(decode_roughness(nrq.w), 0.0, 1.0);
+			float d2 = float(x * x + y * y) * float(pc.step.x * pc.step.x);
+			float plane = abs(dot(n, view_from_linear(fq, zq, f.proj_info) - pos));
+			float w = k[abs(x)] * k[abs(y)];
+			w *= exp(-d2 / (2.0 * reach * reach));
+			w *= exp(-plane / (0.02 + 0.01 * z));
+			// Facing about the same way: a normal map's bumps are one surface (their reflections vary, and that's
+			// what averages out), a corner isn't.
+			w *= pow(max(dot(n, nq), 0.0), 8.0);
+			w *= exp(-abs(rq - rough) / 0.05);
+			sum += texelFetch(light_in, q, 0) * w;
+			weights += w;
+		}
+	}
+	imageStore(light_out, px, weights > 1e-6 ? sum / weights : c);
+}
+)",
 	// PASS_RESOLVE: up to Godot's GI buffer size, each pixel taking the accumulated texels around it that lie on the
 	// same surface (close in depth, facing the same way). Written as Godot's ambient buffer: rgb the light the hits
 	// saw, alpha the fraction that hit, which the surface shader mixes over its own ambient light, then multiplies by
@@ -1963,7 +2055,9 @@ void main() {
 	if (int(f.reflect.x) != 0 && rough <= f.reflect.y) {
 		vec2 rc = (vec2(fp) + 0.5) * vec2(pc.out_size.zw) / vec2(f.sizes.xy) - 0.5;
 		ivec2 rb = ivec2(floor(rc));
-		float spread = 0.35 + 2.5 * rough;
+		// Stochastic glossy rays gather from a little further around; coherent mirror rays keep their reach (the
+		// separate softening pass sets their blur).
+		float spread = f.trace_settings.y > 0.5 ? 0.35 + 2.5 * rough : 0.35 + 4.0 * sqrt(rough);
 		vec4 rsum = vec4(0.0);
 		float rweights = 0.0;
 		for (int y = -1; y <= 2; y++) {
@@ -1976,7 +2070,12 @@ void main() {
 				vec3 tn = normalize(texelFetch(normal_tex, frame_pixel(t, pc.out_size.zw), 0).xyz * 2.0 - 1.0);
 				vec2 o = vec2(t) - rc;
 				float w = exp(-dot(o, o) / (2.0 * spread * spread)) * exp(-abs(tz - d) / (0.03 * d + 0.01)) * pow(max(dot(tn, n), 0.0), 32.0);
-				rsum += texelFetch(reflect_tex, t, 0) * w;
+				// Weighted down by brightness too: a lone bright texel among dim ones is a glint, not the surface.
+				vec4 rt = texelFetch(reflect_tex, t, 0);
+				if (f.trace_settings.y <= 0.5) {
+					w /= 1.0 + dot(rt.rgb, vec3(0.2126, 0.7152, 0.0722));
+				}
+				rsum += rt * w;
 				rweights += w;
 			}
 		}
@@ -2084,7 +2183,7 @@ void main() {
 )",
 };
 
-const char *PASS_NAMES[8] = { "trace", "temporal", "atrous", "reflect", "reflect temporal", "cache", "reflect blur", "resolve" };
+const char *PASS_NAMES[9] = { "trace", "temporal", "atrous", "reflect", "reflect temporal", "cache", "reflect blur", "reflect filter", "resolve" };
 
 struct FrameData {
 	float view_to_world[16];
@@ -3245,7 +3344,7 @@ void PhysXGIView::free_data() {
 		}
 	}
 	source_levels.clear();
-	for (RID *r : { &trace, &accum[0], &accum[1], &accum_depth[0], &accum_depth[1], &moments[0], &moments[1], &variance, &filtered[0], &filtered[1], &filtered_variance[0], &filtered_variance[1], &reflect_filtered, &reflect_trace, &reflect_hit, &reflect_motion, &primitive_motion, &reflect_accum[0], &reflect_accum[1], &reflect_info[0], &reflect_info[1], &reflect_depth[0], &reflect_depth[1], &source }) {
+	for (RID *r : { &trace, &accum[0], &accum[1], &accum_depth[0], &accum_depth[1], &moments[0], &moments[1], &variance, &filtered[0], &filtered[1], &filtered_variance[0], &filtered_variance[1], &reflect_filtered, &reflect_glossy[0], &reflect_glossy[1], &reflect_trace, &reflect_hit, &reflect_motion, &primitive_motion, &reflect_accum[0], &reflect_accum[1], &reflect_info[0], &reflect_info[1], &reflect_depth[0], &reflect_depth[1], &source }) {
 		if (r->is_valid()) {
 			rd->free_rid(*r);
 			*r = RID();
@@ -3308,6 +3407,9 @@ void PhysXGIView::ensure(RenderingDevice *p_rd, const Size2i &p_frame, float p_r
 	reflect_motion = p_rd->texture_create(tf, RD::TextureView());
 	reflect_trace = p_rd->texture_create(tf, RD::TextureView());
 	reflect_filtered = p_rd->texture_create(tf, RD::TextureView());
+	for (int i = 0; i < 2; i++) {
+		reflect_glossy[i] = p_rd->texture_create(tf, RD::TextureView());
+	}
 	for (int i = 0; i < 2; i++) {
 		reflect_accum[i] = p_rd->texture_create(tf, RD::TextureView());
 		reflect_info[i] = p_rd->texture_create(tf, RD::TextureView());
@@ -4058,10 +4160,18 @@ void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_rende
 	}
 
 	RID reflect_result = v.reflect_accum[v.current];
+	if (!s.filtered_reflections && s.reflection_mode != 0) {
+		// Two filter passes, the taps 1 and 2 texels apart, into their own textures (the history stays unfiltered).
+		for (int i = 0; i < 2; i++) {
+			int32_t step[4] = { 1 << i, 0, v.reflect_size.x, v.reflect_size.y };
+			_dispatch(rd, PASS_REFLECT_FILTER, { sampled(0, nearest_sampler, reflect_result), sampled(1, nearest_sampler, v.reflect_depth[v.current]), sampled(2, nearest_sampler, normal), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 3, v.reflect_glossy[i]) }, v.reflect_size, step, sizeof(step));
+			reflect_result = v.reflect_glossy[i];
+		}
+	}
 	if (s.reflection_softness > 1.0f && s.reflection_mode != 0) {
 		for (int axis = 0; axis < 2; axis++) {
 			int32_t size[4] = { v.reflect_size.x, v.reflect_size.y, axis == 0 ? 1 : 0, axis == 0 ? 0 : 1 };
-			RID source = axis == 0 ? v.reflect_accum[v.current] : v.reflect_trace;
+			RID source = axis == 0 ? reflect_result : v.reflect_trace;
 			RID target = axis == 0 ? v.reflect_trace : v.reflect_filtered;
 			_dispatch(rd, PASS_REFLECT_BLUR, { sampled(0, nearest_sampler, source), sampled(1, nearest_sampler, v.reflect_depth[v.current]), sampled(2, nearest_sampler, normal), RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 3, target) }, v.reflect_size, size, sizeof(size));
 		}
