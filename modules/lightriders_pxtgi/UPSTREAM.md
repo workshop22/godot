@@ -30,3 +30,19 @@ replaces border-sampler reads. Lens extraction bounds non-finite HDR inputs. A l
 `reflection_softness` setting adds a separable depth/normal-aware reflection-only blur
 without feeding blurred output back into temporal history. These effects remain
 opt-in through the game experiment.
+
+## Upstream audit
+
+Port basis `e2b3875` (2026-10-28). Audited through `7d46568e4e` (2026-11-09): the PXTGI
+sources (`modules/godot_physx/nodes/pxtgi_3d.*`, `physx_gi_effect.*`) last changed upstream at
+`fe01d53` (2026-11-04). Our shaders and scene bookkeeping have diverged, so each upstream change
+is ported by hand, one commit each, with its local differences in the commit message.
+
+| Upstream | Change | Here |
+| --- | --- | --- |
+| `de31a18` | Less sparkle and noise on glossy reflections (brightness-weighted history and gather, a-trous filter pass, cache light for glossy off-screen hits) | Ported. The filter serves stochastic glossy rays (`filtered_reflections` off); coherent mirror rays keep their on-screen softening. |
+| `0b92bba` | Emissives light the scene evenly: 64 chosen by contribution, shadow rays stop at the emitter's box, the cache samples emissives, light-change watch on the scene | Ported. One-sided emission comes from an authored `pxtgi_emission_facing`, not a glowing mesh's normals; only `pxtgi_sample_emission` emitters count. |
+| `27644cf`, `fe01d53` | Emissive noise hashed by texel; `emissive_candidates` (1 to 16, default 6) | Ported. |
+| `9587db4` | Scenes with triangle meshes walk the shapes and meshes in one loop (software trace speed) | Not ported. A cost-phase candidate for the software walk: our static and moving trees changed this code. |
+| `dbd0db9`, `567cc68` | An emissive shines from its glowing mesh surface; a glowing mesh with collision no longer shadows by its bounds | Not ported: our emitters are authored boxes and our proxies are explicit. |
+| `8bad468`, `0d7c8d4`, `c6db02e`, `7e4845f` | Reflection probe warning, editor light deletion, hidden collision shapes, upstream GCC warnings | Not ported: editor or upstream-file concerns that do not reach the game's proxies. |
