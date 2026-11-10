@@ -37,6 +37,7 @@
 #include "core/config/project_settings.h"
 #include "core/crypto/crypto_core.h"
 #include "core/math/convex_hull.h"
+#include "core/math/geometry_3d.h"
 #include "core/object/callable_mp.h"
 #include "core/object/ref_counted.h"
 #include "core/os/os.h"
@@ -472,6 +473,12 @@ const StringName &meta_ignore() {
 
 const StringName &meta_sample_emission() {
 	static const StringName name = "pxtgi_sample_emission";
+	return name;
+}
+
+// A Vector3 in the body's own space: the way an authored one-sided emitter (a strip, a panel) faces.
+const StringName &meta_emission_facing() {
+	static const StringName name = "pxtgi_emission_facing";
 	return name;
 }
 
@@ -1636,6 +1643,7 @@ bool PXTGI3D::_membership_changed(Node *p_node, const ShapeEntry *p_entry) const
 				body->get_instance_id() != p_entry->body_node ||
 				(cs->get_shape().is_valid() ? cs->get_shape()->get_instance_id() : ObjectID()) != p_entry->shape_resource ||
 				bool(body->get_meta(meta_sample_emission(), true)) != p_entry->sample_emission ||
+				Vector3(body->get_meta(meta_emission_facing(), Vector3())) != p_entry->emission_facing ||
 				bool(body->get_meta(meta_manual_updates(), false)) != p_entry->manual_updates;
 	}
 	const MeshInstance3D *mesh = Object::cast_to<MeshInstance3D>(p_node);
@@ -1705,6 +1713,7 @@ bool PXTGI3D::_sync_member(ObjectID p_id) {
 		entry.fixed = Object::cast_to<StaticBody3D>(body) && !Object::cast_to<AnimatableBody3D>(body);
 		entry.moving = !entry.fixed;
 		entry.sample_emission = bool(body->get_meta(meta_sample_emission(), true));
+		entry.emission_facing = body->get_meta(meta_emission_facing(), Vector3());
 		entry.manual_updates = bool(body->get_meta(meta_manual_updates(), false));
 		same = index >= 0 && shapes[index].collision_node && shapes[index].body_node == entry.body_node && shapes[index].shape_resource == entry.shape_resource;
 		if (!same && shape.is_valid()) {
@@ -1728,6 +1737,7 @@ bool PXTGI3D::_sync_member(ObjectID p_id) {
 			(current.moving ? moving_dirty : static_dirty) = true;
 		}
 		current.sample_emission = entry.sample_emission;
+		current.emission_facing = entry.emission_facing;
 		current.manual_updates = entry.manual_updates;
 		const bool dynamic = !current.mesh_proxy && !current.fixed && !current.manual_updates;
 		if (dynamic && current.dynamic_slot < 0) {
@@ -3667,28 +3677,55 @@ void PXTGI3D::_publish() {
 	_update_primitives(s);
 	const Camera3D *camera = get_viewport() ? get_viewport()->get_camera_3d() : nullptr;
 	const Vector3 eye = camera ? camera->get_global_position() : get_global_position();
+	const Vector3 eye_forward = camera ? -camera->get_global_basis().get_column(2).normalized() : Vector3(0, 0, -1);
 	{
 		const uint64_t select_since = OS::get_singleton()->get_ticks_usec();
-		// The nearest by their records' bounds (a box's world bounds share its centre): no node is read.
-		LocalVector<Pair<float, int>> nearby_emitters;
-		nearby_emitters.reserve(emissive_entries.size());
+		// The emissives sampled directly (up to MAX_EMISSIVES), and how often each is picked: by the light each could give
+		// what the camera sees -- its glow times its largest face over the squared distance to the view (the first
+		// metres straight ahead of the camera) -- so a big bright panel a room away beats a dim strip at the camera's
+		// feet. Those chosen last frame get a head start, so the set changes gradually as the camera moves. Scored from
+		// the records' world bounds: no node is read.
+		const Vector3 view_end = eye + eye_forward * 3.0f;
+		if (chosen_emissives_for != shapes.size()) {
+			// Shape indices moved: the head start would go to other shapes.
+			chosen_emissives.clear();
+			chosen_emissives_for = shapes.size();
+		}
+		LocalVector<Pair<float, int>> scored;
+		scored.reserve(emissive_entries.size());
 		for (int i : emissive_entries) {
-			if (shapes[i].sample_emission && entry_valid[i] && shapes[i].emission.get_luminance() > 0.0f) {
-				nearby_emitters.push_back(Pair<float, int>(entry_bounds[i].get_center().distance_squared_to(eye), i));
+			if (!shapes[i].sample_emission || !entry_valid[i]) {
+				continue;
+			}
+			const AABB &bounds = entry_bounds[i];
+			const Vector3 center = bounds.get_center();
+			const float face = MAX(MAX(bounds.size.x * bounds.size.y, bounds.size.y * bounds.size.z), bounds.size.x * bounds.size.z);
+			const Vector3 nearest = Geometry3D::get_closest_point_to_segment(center, eye, view_end);
+			float score = shapes[i].emission.get_luminance() * face / MAX(center.distance_squared_to(nearest), 1.0f);
+			if (chosen_emissives.has(i)) {
+				score *= 2.0f;
+			}
+			if (score > 0.0f) {
+				scored.push_back(Pair<float, int>(-score, i));
 			}
 		}
-		const uint32_t chosen = MIN(nearby_emitters.size(), uint32_t(PhysXGIEffect::Snapshot::MAX_EMISSIVES));
-		std::partial_sort(nearby_emitters.ptr(), nearby_emitters.ptr() + chosen, nearby_emitters.ptr() + nearby_emitters.size(), [](const Pair<float, int> &a, const Pair<float, int> &b) {
-			return a.first < b.first;
+		const uint32_t chosen = MIN(scored.size(), uint32_t(PhysXGIEffect::Snapshot::MAX_EMISSIVES));
+		std::partial_sort(scored.ptr(), scored.ptr() + chosen, scored.ptr() + scored.size(), [](const Pair<float, int> &a, const Pair<float, int> &b) {
+			return a.first < b.first || (a.first == b.first && a.second < b.second);
 		});
+		float total = 0.0f;
+		for (uint32_t c = 0; c < chosen; c++) {
+			total += -scored[c].first;
+		}
+		chosen_emissives.clear();
 		s.emissive_count = 0;
 		for (uint32_t c = 0; c < chosen; c++) {
-			const Pair<float, int> &e = nearby_emitters[c];
+			const int e = scored[c].second;
 			Transform3D frame;
 			AABB local;
-			_record_frame(e.second, frame, local);
+			_record_frame(e, frame, local);
 			const int k = s.emissive_count++;
-			s.emissive_primitive[k] = entry_slot[e.second];
+			s.emissive_primitive[k] = entry_slot[e];
 			const Vector3 half = local.size * 0.5f;
 			s.emissive_center[k] = frame.xform(local.get_center());
 			for (int a = 0; a < 3; a++) {
@@ -3696,7 +3733,14 @@ void PXTGI3D::_publish() {
 				axis[a] = half[a];
 				s.emissive_axis[k][a] = frame.basis.xform(axis);
 			}
-			s.emissive_color[k] = shapes[e.second].emission;
+			s.emissive_color[k] = shapes[e].emission;
+			// An authored one-sided emitter says which way it faces, in its own space (pxtgi_emission_facing). Upstream
+			// reads this from a glowing mesh's normals; our emitters are authored boxes with no mesh of their own.
+			const Vector3 &facing = shapes[e].emission_facing;
+			s.emissive_facing[k] = facing.length_squared() > 0.0f ? frame.basis.xform(facing).normalized() : Vector3();
+			// Three quarters by the light it gives, a quarter evenly: none goes unpicked for long.
+			s.emissive_pick[k] = 0.75f * (-scored[c].first) / MAX(total, 1e-12f) + 0.25f / float(chosen);
+			chosen_emissives.insert(e);
 		}
 		_stage(STAGE_SELECT, select_since);
 	}
@@ -3821,20 +3865,31 @@ void PXTGI3D::_publish() {
 	}
 	// The light sources themselves (which and how bright): a lamp switched off or an emitter gone shouldn't glow on in
 	// the radiance cache for seconds. Published from the next frame, for 60 frames.
-	uint32_t sources = hash_murmur3_one_32(s.omni_count | (s.spot_count << 8) | (s.emissive_count << 16));
+	// Every light and sampled emissive of the scene, not the ones chosen for the camera: riding about changes which are
+	// chosen, not the light. Glowing shapes that are only ever hit by rays (ribbon walls, merged city meshes) come and
+	// go all match long and are left out: the cache follows them at its ordinary pace.
+	uint32_t sampled_emitters = 0;
+	uint32_t sources = hash_murmur3_one_32(omnis.size() | (spots.size() << 10));
 	sources = hash_murmur3_one_float(s.sun_color.r + s.sun_color.g * 3.1f + s.sun_color.b * 7.3f, sources);
 	sources = hash_murmur3_one_float(s.gi_sun_color.r + s.gi_sun_color.g * 3.1f + s.gi_sun_color.b * 7.3f, sources);
-	for (int i = 0; i < s.omni_count; i++) {
-		sources = hash_murmur3_one_float(s.omni_color[i].r + s.omni_color[i].g * 3.1f + s.omni_color[i].b * 7.3f, sources);
-		sources = hash_murmur3_one_float(s.omni_indirect[i], sources);
+	for (const LocalVector<ObjectID> *list : { &omnis, &spots }) {
+		for (const ObjectID &id : *list) {
+			const Light3D *light = ObjectDB::get_instance<Light3D>(id);
+			const bool lit = light != nullptr && light->is_visible_in_tree();
+			const Color c = lit ? light_strength(light) : Color(0, 0, 0);
+			sources = hash_murmur3_one_float(c.r + c.g * 3.1f + c.b * 7.3f, sources);
+			sources = hash_murmur3_one_float(lit ? indirect_strength(light) : 0.0f, sources);
+		}
 	}
-	for (int i = 0; i < s.spot_count; i++) {
-		sources = hash_murmur3_one_float(s.spot_color[i].r + s.spot_color[i].g * 3.1f + s.spot_color[i].b * 7.3f, sources);
-		sources = hash_murmur3_one_float(s.spot_indirect[i], sources);
+	for (int i : emissive_entries) {
+		if (!shapes[i].sample_emission || !entry_valid[i]) {
+			continue;
+		}
+		const Color &c = shapes[i].emission;
+		sources = hash_murmur3_one_float(c.r + c.g * 3.1f + c.b * 7.3f, sources);
+		sampled_emitters++;
 	}
-	for (int i = 0; i < s.emissive_count; i++) {
-		sources = hash_murmur3_one_float(s.emissive_color[i].r + s.emissive_color[i].g * 3.1f + s.emissive_color[i].b * 7.3f, sources);
-	}
+	sources = hash_murmur3_one_32(sampled_emitters, sources);
 	if (sources != last_sources_hash) {
 		last_sources_hash = sources;
 		fresh_frames = 60;

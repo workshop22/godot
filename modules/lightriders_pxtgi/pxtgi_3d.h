@@ -139,6 +139,7 @@ class PXTGI3D : public Node3D {
 		bool fixed = false; // a static body's shape (not animatable): a reflection probe's capture of it stays true
 		ObjectID shape_resource; // a collision shape's Shape3D when found: another one means finding the shapes again
 		bool sample_emission = true; // its body lets the trace sample it as a box light (pxtgi_sample_emission)
+		Vector3 emission_facing; // body space: the way a one-sided emitter faces (pxtgi_emission_facing); zero: all round
 		// In the moving part of the tree (rebuilt whenever one of its shapes changes), else the static part (built when
 		// the static shapes change): bodies that can move, emissive meshes, and a static shape found to have moved.
 		bool moving = false;
@@ -277,6 +278,8 @@ class PXTGI3D : public Node3D {
 	LocalVector<int> dynamic_entries; // moving presentation bodies, excluding explicitly notified ribbons
 	LocalVector<int> proxy_entries; // emissive meshes outside any body: checked every frame
 	LocalVector<int> emissive_entries; // shapes that give off light: sampled directly
+	HashSet<int> chosen_emissives; // the emissives sampled directly last frame (shape indices): a head start this one
+	uint32_t chosen_emissives_for = 0; // the shape count those indices belong to
 	LocalVector<int> moving_entries; // the shapes in the moving part of the tree
 	bool moving_entries_dirty = true; // membership/index order changed, independent of pose/tree dirtiness
 	// The tree's records in leaf order and its nodes: the static part first, then the moving part, joined under one

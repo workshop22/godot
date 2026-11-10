@@ -238,11 +238,13 @@ public:
 		bool filtered_hits = false; // screen hits read the source copy's mips by how small the hit appears
 		// Emissive shapes sampled directly by every texel (the nearest to the camera): an oriented box each (centre and
 		// three half axes, world space) and the light its surface gives off.
-		static constexpr int MAX_EMISSIVES = 16;
+		static constexpr int MAX_EMISSIVES = 64;
 		int emissive_count = 0;
 		Vector3 emissive_center[MAX_EMISSIVES];
 		Vector3 emissive_axis[MAX_EMISSIVES][3];
 		Color emissive_color[MAX_EMISSIVES];
+		Vector3 emissive_facing[MAX_EMISSIVES]; // the way a one-sided glow faces; zero: it glows all round
+		float emissive_pick[MAX_EMISSIVES] = {}; // how often each is picked (the shares add up to 1)
 		int emissive_primitive[MAX_EMISSIVES] = {};
 		bool multi_bounce = true; // off-screen hits light from the radiance cache
 		bool light_changed = false; // the light sources just changed: the radiance cache follows quickly
