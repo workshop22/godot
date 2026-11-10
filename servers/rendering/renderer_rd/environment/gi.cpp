@@ -39,6 +39,7 @@
 #include "servers/rendering/renderer_rd/storage_rd/texture_storage.h"
 #include "servers/rendering/renderer_rd/uniform_set_cache_rd.h"
 #include "servers/rendering/rendering_server_globals.h"
+#include "servers/rendering/storage/environment_storage.h"
 
 using namespace RendererRD;
 
@@ -416,6 +417,7 @@ void GI::SDFGI::create(RID p_env, const Vector3 &p_world_position, uint32_t p_re
 	RendererRD::MaterialStorage *material_storage = RendererRD::MaterialStorage::get_singleton();
 
 	gi = p_gi;
+	buffer_only = gi->can_use_sdfgi_buffer_only(p_env);
 	num_cascades = RendererSceneRenderRD::get_singleton()->environment_get_sdfgi_cascades(p_env);
 	min_cell_size = RendererSceneRenderRD::get_singleton()->environment_get_sdfgi_min_cell_size(p_env);
 	uses_occlusion = RendererSceneRenderRD::get_singleton()->environment_get_sdfgi_use_occlusion(p_env);
@@ -1247,6 +1249,9 @@ void GI::SDFGI::update(RID p_env, const Vector3 &p_world_position) {
 }
 
 void GI::SDFGI::update_light() {
+	if (buffer_only) {
+		return;
+	}
 	RD::get_singleton()->draw_command_begin_label("SDFGI Update Dynamic Light");
 
 	for (uint32_t i = 0; i < cascades.size(); i++) {
@@ -1309,6 +1314,9 @@ void GI::SDFGI::update_light() {
 }
 
 void GI::SDFGI::update_probes(RID p_env, SkyRD::Sky *p_sky) {
+	if (buffer_only) {
+		return;
+	}
 	RD::get_singleton()->draw_command_begin_label("SDFGI Update Probes");
 
 	SDFGIShader::IntegratePushConstant push_constant;
@@ -1412,6 +1420,9 @@ void GI::SDFGI::update_probes(RID p_env, SkyRD::Sky *p_sky) {
 }
 
 void GI::SDFGI::store_probes() {
+	if (buffer_only) {
+		return;
+	}
 	RD::get_singleton()->draw_command_begin_label("SDFGI Store Probes");
 
 	SDFGIShader::IntegratePushConstant push_constant;
@@ -1512,6 +1523,9 @@ int GI::SDFGI::get_pending_region_data(int p_region, Vector3i &r_local_offset, V
 }
 
 void GI::SDFGI::update_cascades() {
+	if (buffer_only) {
+		return;
+	}
 	//update cascades
 	SDFGI::Cascade::UBO cascade_data[SDFGI::MAX_CASCADES];
 	int32_t probe_divisor = cascade_size / SDFGI::PROBE_DIVISOR;
@@ -1903,6 +1917,12 @@ void GI::SDFGI::pre_process_gi(const Transform3D &p_transform, RenderDataRD *p_r
 	}
 
 	RD::get_singleton()->buffer_update(gi->sdfgi_ubo, 0, sizeof(SDFGIData), &sdfgi_data);
+
+	// Keep the shared per-view UBO current even when this owned helper has no
+	// native fog, forward-surface or opaque consumer of its lighting volumes.
+	if (buffer_only) {
+		return;
+	}
 
 	/* Update dynamic lights in SDFGI cascades */
 
@@ -3827,6 +3847,19 @@ void GI::free() {
 	}
 }
 
+bool GI::can_use_sdfgi_buffer_only(RID p_env) const {
+	if (!sdfgi_opaque_override_active || p_env.is_null()) {
+		return false;
+	}
+	const RendererEnvironmentStorage *storage = RendererEnvironmentStorage::get_singleton();
+	// Only an explicitly owned zero-energy helper is unused: authored SDFGI still
+	// lights native fog/transparency, and native VoxelGI is a separate path. Debug
+	// views need the actual probes even when the helper has no visible contribution.
+	return storage->environment_get_sdfgi_buffer_only(p_env) && storage->environment_get_sdfgi_enabled(p_env) &&
+			storage->environment_get_sdfgi_energy(p_env) == 0.0f &&
+			RendererSceneRenderRD::get_singleton()->get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_DISABLED;
+}
+
 Ref<GI::SDFGI> GI::create_sdfgi(RID p_env, const Vector3 &p_world_position, uint32_t p_requested_history_size) {
 	Ref<SDFGI> sdfgi;
 	sdfgi.instantiate();
@@ -4074,7 +4107,7 @@ void GI::process_gi(Ref<RenderSceneBuffersRD> p_render_buffers, const RID *p_nor
 		pipeline_specialization |= SHADER_SPECIALIZATION_USE_VRS;
 	}
 
-	bool without_sampler = RD::get_singleton()->sampler_is_format_supported_for_filter(RD::DATA_FORMAT_R8G8_UINT, RD::SAMPLER_FILTER_LINEAR);
+	bool without_sampler = !RD::get_singleton()->sampler_is_format_supported_for_filter(RD::DATA_FORMAT_R8G8_UINT, RD::SAMPLER_FILTER_LINEAR);
 	Mode mode;
 	if (use_sdfgi && use_voxel_gi_instances) {
 		mode = without_sampler ? MODE_COMBINED_WITHOUT_SAMPLER : MODE_COMBINED;
@@ -4212,7 +4245,7 @@ void GI::process_gi(Ref<RenderSceneBuffersRD> p_render_buffers, const RID *p_nor
 				RD::Uniform u;
 				u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
 				u.binding = 14;
-				RID buffer = p_voxel_gi_buffer.is_valid() ? p_voxel_gi_buffer : texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK);
+				RID buffer = p_voxel_gi_buffer.is_valid() ? p_voxel_gi_buffer : texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_UINT);
 				u.append_id(buffer);
 				uniforms.push_back(u);
 			}

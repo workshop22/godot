@@ -660,6 +660,8 @@ public:
 		RID lightprobe_average_scroll; //used for scrolling lightprobes
 
 		uint32_t history_size = 0;
+		// Fixed for this native allocation; renewed native lighting demand recreates it.
+		bool buffer_only = false;
 		float solid_cell_ratio = 0;
 		uint32_t solid_cell_count = 0;
 
@@ -836,6 +838,9 @@ public:
 	void init(RendererRD::SkyRD *p_sky);
 	void free();
 
+	// Set on the render thread only when the SDFGI/combined opaque pipelines are hooked.
+	bool sdfgi_opaque_override_active = false;
+	bool can_use_sdfgi_buffer_only(RID p_env) const;
 	Ref<SDFGI> create_sdfgi(RID p_env, const Vector3 &p_world_position, uint32_t p_requested_history_size);
 
 	void setup_voxel_gi_instances(RenderDataRD *p_render_data, Ref<RenderSceneBuffersRD> p_render_buffers, const Transform3D &p_transform, const PagedArray<RID> &p_voxel_gi_instances, uint32_t &r_voxel_gi_instances_used);

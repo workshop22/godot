@@ -73,6 +73,13 @@ private:
 	RD::DataFormat preferred_data_format = RD::DATA_FORMAT_MAX;
 	RendererRD::VRS *vrs = nullptr;
 	uint64_t auto_exposure_version = 1;
+	uint64_t reflection_motion_frame = UINT64_MAX;
+	bool separate_reflections_active = false;
+	bool separate_transparency_active = false;
+	uint64_t reflection_source_request = 0;
+	uint64_t reflection_source_frame = UINT64_MAX;
+	uint64_t reflection_source_policy = 0;
+	bool filtered_reflection_source = false;
 	RSE::ViewportVRSMode vrs_mode = RSE::VIEWPORT_VRS_DISABLED;
 
 	// Our render target represents our final destination that we display on screen.
@@ -233,6 +240,25 @@ public:
 	Ref<RenderBufferCustomDataRD> get_custom_data(const StringName &p_name) const;
 
 	// Getters
+	// A reflection producer stamps this only after publishing the current frame's motion.
+	void set_reflection_motion_frame(uint64_t p_frame) { reflection_motion_frame = p_frame; }
+	uint64_t get_reflection_motion_frame() const { return reflection_motion_frame; }
+	void set_separate_reflections_active(bool p_active) { separate_reflections_active = p_active; }
+	bool has_separate_reflections() const { return separate_reflections_active; }
+	void set_separate_transparency_active(bool p_active) { separate_transparency_active = p_active; }
+	bool has_separate_transparency() const { return separate_transparency_active; }
+	// PRE_OPAQUE producers request a source for this view. The previous completed
+	// source remains readable until the alpha pass finishes the replacement.
+	void request_reflection_source(uint64_t p_policy) { reflection_source_request = p_policy; }
+	uint64_t get_reflection_source_request() const { return reflection_source_request; }
+	void set_reflection_source_complete(uint64_t p_frame, uint64_t p_policy, bool p_filtered) {
+		reflection_source_frame = p_frame;
+		reflection_source_policy = p_policy;
+		filtered_reflection_source = p_filtered;
+	}
+	uint64_t get_reflection_source_frame() const { return reflection_source_frame; }
+	uint64_t get_reflection_source_policy() const { return reflection_source_policy; }
+	bool has_filtered_reflection_source() const { return filtered_reflection_source; }
 
 	_FORCE_INLINE_ RID get_render_target() const { return render_target; }
 	_FORCE_INLINE_ uint32_t get_view_count() const { return view_count; }

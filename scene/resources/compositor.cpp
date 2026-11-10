@@ -56,6 +56,9 @@ void CompositorEffect::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_needs_separate_transparency", "enable"), &CompositorEffect::set_needs_separate_transparency);
 	ClassDB::bind_method(D_METHOD("get_needs_separate_transparency"), &CompositorEffect::get_needs_separate_transparency);
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "needs_separate_transparency"), "set_needs_separate_transparency", "get_needs_separate_transparency");
+	ClassDB::bind_method(D_METHOD("set_needs_separate_reflections", "enable"), &CompositorEffect::set_needs_separate_reflections);
+	ClassDB::bind_method(D_METHOD("get_needs_separate_reflections"), &CompositorEffect::get_needs_separate_reflections);
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "needs_separate_reflections"), "set_needs_separate_reflections", "get_needs_separate_reflections");
 
 	ClassDB::bind_method(D_METHOD("set_needs_motion_vectors", "enable"), &CompositorEffect::set_needs_motion_vectors);
 	ClassDB::bind_method(D_METHOD("get_needs_motion_vectors"), &CompositorEffect::get_needs_motion_vectors);
@@ -166,6 +169,19 @@ void CompositorEffect::set_needs_separate_transparency(bool p_enabled) {
 
 bool CompositorEffect::get_needs_separate_transparency() const {
 	return needs_separate_transparency;
+}
+
+void CompositorEffect::set_needs_separate_reflections(bool p_enabled) {
+	needs_separate_reflections = p_enabled;
+	if (rid.is_valid()) {
+		RenderingServer *rs = RenderingServer::get_singleton();
+		ERR_FAIL_NULL(rs);
+		rs->compositor_effect_set_flag(rid, RSE::COMPOSITOR_EFFECT_FLAG_NEEDS_SEPARATE_REFLECTIONS, p_enabled);
+	}
+}
+
+bool CompositorEffect::get_needs_separate_reflections() const {
+	return needs_separate_reflections;
 }
 
 void CompositorEffect::set_needs_motion_vectors(bool p_enabled) {

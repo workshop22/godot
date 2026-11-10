@@ -102,6 +102,8 @@ CopyEffects::CopyEffects(BitField<RasterEffects> p_raster_effects) {
 		copy_modes.push_back("\n#define MODE_OCTMAP_TO_PANORAMA\n");
 		copy_modes.push_back("\n#define MODE_OCTMAP_ARRAY_TO_PANORAMA\n");
 		copy_modes.push_back("\n#define MODE_MERGE_TRANSPARENCY\n");
+		copy_modes.push_back("\n#define MODE_SCENE_LAYERS\n");
+		copy_modes.push_back("\n#define MODE_MERGE_REFLECTION\n");
 
 		copy.shader.initialize(copy_modes);
 		memset(&copy.push_constant, 0, sizeof(CopyPushConstant));
@@ -1465,6 +1467,58 @@ void CopyEffects::merge_transparency(RID p_layer, RID p_destination, const Size2
 	rd->compute_list_bind_uniform_set(list, cache->get_cache(shader, 0, layer), 0);
 	rd->compute_list_bind_uniform_set(list, cache->get_cache(shader, 3, destination), 3);
 	rd->compute_list_set_push_constant(list, &copy.push_constant, sizeof(CopyPushConstant));
+	rd->compute_list_dispatch_threads(list, p_size.x, p_size.y, 1);
+	rd->compute_list_end();
+}
+
+void CopyEffects::copy_scene_layers(RID p_base, RID p_reflection, RID p_layer, RID p_destination, const Size2i &p_size, const Vector2 &p_jitter) {
+	ERR_FAIL_COND(p_base.is_null() || p_destination.is_null());
+	ERR_FAIL_COND(p_base == p_destination || p_reflection == p_destination || p_layer == p_destination);
+	UniformSetCacheRD *cache = UniformSetCacheRD::get_singleton();
+	ERR_FAIL_NULL(cache);
+	MaterialStorage *materials = MaterialStorage::get_singleton();
+	ERR_FAIL_NULL(materials);
+	CopyPushConstant params = {};
+	params.section[2] = p_size.x;
+	params.section[3] = p_size.y;
+	params.set_color[0] = p_jitter.x;
+	params.set_color[1] = p_jitter.y;
+	params.flags = (p_reflection.is_valid() ? 1u : 0u) | (p_layer.is_valid() ? 2u : 0u);
+	RID sampler = materials->sampler_rd_get_default(RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
+	RID shader = copy.shader.version_get_shader(copy.shader_version, COPY_MODE_SCENE_LAYERS);
+	ERR_FAIL_COND(shader.is_null());
+	auto sampled = [&](uint32_t p_binding, RID p_texture) {
+		return RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, p_binding, Vector<RID>({ sampler, p_texture.is_valid() ? p_texture : p_base }));
+	};
+	RD *rd = RD::get_singleton();
+	RD::ComputeListID list = rd->compute_list_begin();
+	rd->compute_list_bind_compute_pipeline(list, copy.pipelines[COPY_MODE_SCENE_LAYERS].get_rid());
+	rd->compute_list_bind_uniform_set(list, cache->get_cache(shader, 0, sampled(0, p_base)), 0);
+	rd->compute_list_bind_uniform_set(list, cache->get_cache(shader, 1, sampled(0, p_reflection), sampled(1, p_layer)), 1);
+	rd->compute_list_bind_uniform_set(list, cache->get_cache(shader, 3, RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 0, p_destination)), 3);
+	rd->compute_list_set_push_constant(list, &params, sizeof(params));
+	rd->compute_list_dispatch_threads(list, p_size.x, p_size.y, 1);
+	rd->compute_list_end();
+}
+
+void CopyEffects::merge_reflection(RID p_reflection, RID p_destination, const Size2i &p_size) {
+	ERR_FAIL_COND(p_reflection.is_null() || p_destination.is_null() || p_reflection == p_destination);
+	UniformSetCacheRD *cache = UniformSetCacheRD::get_singleton();
+	ERR_FAIL_NULL(cache);
+	MaterialStorage *materials = MaterialStorage::get_singleton();
+	ERR_FAIL_NULL(materials);
+	CopyPushConstant params = {};
+	params.section[2] = p_size.x;
+	params.section[3] = p_size.y;
+	RID sampler = materials->sampler_rd_get_default(RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
+	RID shader = copy.shader.version_get_shader(copy.shader_version, COPY_MODE_MERGE_REFLECTION);
+	ERR_FAIL_COND(shader.is_null());
+	RD *rd = RD::get_singleton();
+	RD::ComputeListID list = rd->compute_list_begin();
+	rd->compute_list_bind_compute_pipeline(list, copy.pipelines[COPY_MODE_MERGE_REFLECTION].get_rid());
+	rd->compute_list_bind_uniform_set(list, cache->get_cache(shader, 0, RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ sampler, p_reflection }))), 0);
+	rd->compute_list_bind_uniform_set(list, cache->get_cache(shader, 3, RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 0, p_destination)), 3);
+	rd->compute_list_set_push_constant(list, &params, sizeof(params));
 	rd->compute_list_dispatch_threads(list, p_size.x, p_size.y, 1);
 	rd->compute_list_end();
 }

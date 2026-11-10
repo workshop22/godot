@@ -49,6 +49,7 @@
 #endif
 
 #define RB_SCOPE_FORWARD_CLUSTERED SNAME("forward_clustered")
+#define RB_SCOPE_REFLECTION_SOURCE_LAYERS SNAME("reflection_source_layers")
 
 #define RB_TEX_TRANSPARENCY SNAME("transparency")
 #define RB_TEX_TRANSPARENCY_MSAA SNAME("transparency_msaa")
@@ -56,6 +57,7 @@
 
 #define RB_TEX_SPECULAR SNAME("specular")
 #define RB_TEX_SPECULAR_MSAA SNAME("specular_msaa")
+#define RB_TEX_REFLECTION_OUTPUT SNAME("reflection_output")
 #define RB_TEX_NORMAL_ROUGHNESS SNAME("normal_roughness")
 #define RB_TEX_NORMAL_ROUGHNESS_MSAA SNAME("normal_roughness_msaa")
 #define RB_TEX_VOXEL_GI SNAME("voxel_gi")
@@ -101,6 +103,7 @@ public:
 
 	private:
 		RenderSceneBuffersRD *render_buffers = nullptr;
+		bool dual_transparency_allocation_failed = false;
 		RendererRD::FSR2Context *fsr2_context = nullptr;
 #ifdef METAL_MFXTEMPORAL_ENABLED
 		RendererRD::MFXTemporalContext *mfx_temporal_context = nullptr;
@@ -157,7 +160,8 @@ public:
 #endif
 
 		RID get_color_only_fb();
-		RID get_color_pass_fb(uint32_t p_color_pass_flags);
+		// p_private_depth: a separate transparent layer writes a copy of the depth under MSAA too.
+		RID get_color_pass_fb(uint32_t p_color_pass_flags, bool p_private_depth = false);
 		RID get_depth_fb(DepthFrameBufferType p_type = DEPTH_FB);
 		RID get_specular_only_fb();
 		RID get_velocity_only_fb();
@@ -221,6 +225,7 @@ private:
 		COLOR_PASS_FLAG_MULTIVIEW = 1 << 2,
 		COLOR_PASS_FLAG_MOTION_VECTORS = 1 << 3,
 		COLOR_PASS_FLAG_SEPARATE_TRANSPARENCY = 1 << 4,
+		COLOR_PASS_FLAG_DUAL_TRANSPARENCY = 1 << 5,
 	};
 
 	struct GeometryInstanceSurfaceDataCache;
@@ -237,6 +242,7 @@ private:
 		uint32_t view_count = 1;
 		RID render_pass_uniform_set;
 		bool force_wireframe = false;
+		bool exclude_reflection_sources = false;
 		Vector2 uv_offset;
 		float lod_distance_multiplier = 0.0;
 		float screen_mesh_lod_threshold = 0.0;
@@ -309,7 +315,7 @@ private:
 			uint32_t ss_effects_flags;
 			float ssao_light_affect;
 			float ssao_ao_affect;
-			uint32_t pad1;
+			uint32_t late_indirect_specular;
 
 			float sdf_to_bounds[16];
 
@@ -544,6 +550,7 @@ private:
 		uint32_t flags = 0;
 		uint32_t surface_index = 0;
 		uint32_t color_pass_inclusion_mask = 0;
+		bool reflection_source_excluded = false;
 
 		void *surface = nullptr;
 		RID material_uniform_set;
@@ -659,6 +666,8 @@ private:
 				uint32_t use_32_bit_shadows : 1;
 				uint32_t use_shadow_cubemaps : 1;
 				uint32_t use_shadow_dual_paraboloid : 1;
+				uint32_t transparency_sample_mask : 7;
+				uint32_t use_dual_transparency : 1;
 			};
 		};
 	};
@@ -687,8 +696,8 @@ private:
 
 	void _update_global_pipeline_data_requirements_from_project();
 	void _update_global_pipeline_data_requirements_from_light_storage();
-	void _geometry_instance_add_surface_with_material(GeometryInstanceForwardClustered *ginstance, uint32_t p_surface, SceneShaderForwardClustered::MaterialData *p_material, uint32_t p_material_id, uint32_t p_shader_id, RID p_mesh);
-	void _geometry_instance_add_surface_with_material_chain(GeometryInstanceForwardClustered *ginstance, uint32_t p_surface, SceneShaderForwardClustered::MaterialData *p_material, RID p_mat_src, RID p_mesh);
+	void _geometry_instance_add_surface_with_material(GeometryInstanceForwardClustered *ginstance, uint32_t p_surface, SceneShaderForwardClustered::MaterialData *p_material, uint32_t p_material_id, uint32_t p_shader_id, RID p_mesh, bool p_source_excluded = false);
+	void _geometry_instance_add_surface_with_material_chain(GeometryInstanceForwardClustered *ginstance, uint32_t p_surface, SceneShaderForwardClustered::MaterialData *p_material, RID p_mat_src, RID p_mesh, bool p_source_excluded = false);
 	void _geometry_instance_add_surface(GeometryInstanceForwardClustered *ginstance, uint32_t p_surface, RID p_material, RID p_mesh);
 	void _geometry_instance_update(RenderGeometryInstance *p_geometry_instance);
 	void _mesh_compile_pipeline_for_surface(SceneShaderForwardClustered::ShaderData *p_shader, void *p_mesh_surface, bool p_ubershader, bool p_instanced_surface, RSE::PipelineSource p_source, SceneShaderForwardClustered::ShaderData::PipelineKey &r_pipeline_key, Vector<ShaderPipelinePair> *r_pipeline_pairs = nullptr);

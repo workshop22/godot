@@ -162,6 +162,8 @@ private:
 
 		// SDFGI
 		bool sdfgi_enabled = false;
+		// Internal ownership: the native allocation exists only for an opaque GI override.
+		bool sdfgi_buffer_only = false;
 		int sdfgi_cascades = 4;
 		float sdfgi_min_cell_size = 0.2;
 		bool sdfgi_use_occlusion = false;
@@ -313,6 +315,9 @@ public:
 
 	// SDFGI
 	void environment_set_sdfgi(RID p_env, bool p_enable, int p_cascades, float p_min_cell_size, RSE::EnvironmentSDFGIYScale p_y_scale, bool p_use_occlusion, float p_bounce_feedback, bool p_read_sky, float p_energy, float p_normal_bias, float p_probe_bias);
+	// Internal only; called after the ordinary setter within one render-thread callback.
+	void environment_set_sdfgi_buffer_only(RID p_env);
+	bool environment_get_sdfgi_buffer_only(RID p_env) const;
 	bool environment_get_sdfgi_enabled(RID p_env) const;
 	int environment_get_sdfgi_cascades(RID p_env) const;
 	float environment_get_sdfgi_min_cell_size(RID p_env) const;

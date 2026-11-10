@@ -1959,6 +1959,15 @@
 				Sets a material that will override the material for all surfaces on the mesh associated with this instance. Equivalent to [member GeometryInstance3D.material_override].
 			</description>
 		</method>
+		<method name="instance_geometry_set_reflection_source_exclusions">
+			<return type="void" />
+			<param index="0" name="instance" type="RID" />
+			<param index="1" name="surfaces" type="PackedInt32Array" />
+			<description>
+				Sets the mesh surface indices whose base alpha draws are represented separately by a reflection producer. An empty array clears the exclusions. These draws are omitted only from requested filtered reflection sources and probes with a nonzero reflection source policy. Ordinary views, material overlays and next passes are unchanged.
+				Only alpha surfaces without an opaque depth prepass are supported. The caller must provide a complete replacement representation and update its source policy when membership changes. This is available only in the Forward+ renderer.
+			</description>
+		</method>
 		<method name="instance_geometry_set_shader_parameter">
 			<return type="void" />
 			<param index="0" name="instance" type="RID" />
@@ -3513,6 +3522,14 @@
 			<param index="1" name="layers" type="int" />
 			<description>
 				Sets the render reflection mask for this reflection probe. Only instances with a matching layer will have reflections applied from this probe. Equivalent to [member ReflectionProbe.reflection_mask].
+			</description>
+		</method>
+		<method name="reflection_probe_set_reflection_source_policy">
+			<return type="void" />
+			<param index="0" name="probe" type="RID" />
+			<param index="1" name="policy" type="int" />
+			<description>
+				Sets the membership generation for a filtered reflection-source capture. Zero retains ordinary probe content. A nonzero policy excludes surfaces set by [method instance_geometry_set_reflection_source_exclusions]. Changing the policy requests a new capture; source consumers must reject completed images from a different policy. This is available only in the Forward+ renderer.
 			</description>
 		</method>
 		<method name="reflection_probe_set_resolution" deprecated="This method has not done anything since Godot 3.">

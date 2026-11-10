@@ -743,6 +743,7 @@ void RendererSceneCull::instance_set_base(RID p_instance, RID p_base) {
 				geom->geometry_instance->set_material_override(instance->material_override);
 				geom->geometry_instance->set_material_overlay(instance->material_overlay);
 				geom->geometry_instance->set_surface_materials(instance->materials);
+				geom->geometry_instance->set_reflection_source_exclusions(instance->reflection_source_exclusions);
 				geom->geometry_instance->set_transform(instance->transform, instance->aabb, instance->transformed_aabb);
 				geom->geometry_instance->set_layer_mask(instance->layer_mask);
 				geom->geometry_instance->set_pivot_data(instance->sorting_offset, instance->use_aabb_center);
@@ -1252,6 +1253,22 @@ Vector<ObjectID> RendererSceneCull::instances_cull_convex(const Vector<Plane> &p
 	scenario->indexers[Scenario::INDEXER_GEOMETRY].convex_query(p_convex.ptr(), p_convex.size(), points.ptr(), points.size(), cull_convex);
 	scenario->indexers[Scenario::INDEXER_VOLUMES].convex_query(p_convex.ptr(), p_convex.size(), points.ptr(), points.size(), cull_convex);
 	return cull_convex.instances;
+}
+
+void RendererSceneCull::instance_geometry_set_reflection_source_exclusions(RID p_instance, const PackedInt32Array &p_surfaces) {
+	Instance *instance = instance_owner.get_or_null(p_instance);
+	ERR_FAIL_NULL(instance);
+	if (instance->reflection_source_exclusions == p_surfaces) {
+		return;
+	}
+	for (int32_t surface : p_surfaces) {
+		ERR_FAIL_COND(surface < 0);
+	}
+	instance->reflection_source_exclusions = p_surfaces;
+	if (((1 << instance->base_type) & RSE::INSTANCE_GEOMETRY_MASK) && instance->base_data) {
+		InstanceGeometryData *geom = static_cast<InstanceGeometryData *>(instance->base_data);
+		geom->geometry_instance->set_reflection_source_exclusions(p_surfaces);
+	}
 }
 
 void RendererSceneCull::instance_geometry_set_flag(RID p_instance, RSE::InstanceFlags p_flags, bool p_enabled) {

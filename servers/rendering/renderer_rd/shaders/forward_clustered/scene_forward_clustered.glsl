@@ -1066,6 +1066,10 @@ layout(location = 1) out vec4 specular_buffer; //specular and SSS (subsurface sc
 #else
 
 layout(location = 0) out vec4 frag_color;
+#ifdef MODE_DUAL_TRANSPARENCY
+// The transparent layer a second time, as traced reflections may sample it.
+layout(location = 1) out vec4 reflection_source_layer;
+#endif
 #endif // MODE_SEPARATE_SPECULAR
 
 #endif // RENDER DEPTH
@@ -1678,6 +1682,7 @@ void fragment_shader(in SceneData scene_data) {
 
 	vec3 direct_specular_light = vec3(0.0, 0.0, 0.0);
 	vec3 indirect_specular_light = vec3(0.0, 0.0, 0.0);
+	vec3 traced_indirect_specular = vec3(0.0);
 	vec3 diffuse_light = vec3(0.0, 0.0, 0.0);
 	vec3 ambient_light = vec3(0.0, 0.0, 0.0);
 #ifndef MODE_UNSHADED
@@ -2025,6 +2030,9 @@ void fragment_shader(in SceneData scene_data) {
 
 		ambient_light = mix(ambient_light, buffer_ambient.rgb, buffer_ambient.a);
 		indirect_specular_light = mix(indirect_specular_light, buffer_reflection.rgb, buffer_reflection.a);
+		if (bool(implementation_data.ss_effects_flags & SCREEN_SPACE_EFFECTS_FLAGS_TRACED_REFLECTIONS)) {
+			traced_indirect_specular = buffer_reflection.rgb * buffer_reflection.a;
+		}
 	}
 #endif // !USE_LIGHTMAP
 
@@ -2124,6 +2132,8 @@ void fragment_shader(in SceneData scene_data) {
 
 		if (reflection_accum.a > 0.0) {
 			indirect_specular_light = reflection_accum.rgb;
+			// Preserve the probes' existing blend/override of the traced contribution.
+			traced_indirect_specular *= max(1.0 - reflection_accum.a, 0.0);
 		}
 
 #ifdef LIGHT_CLEARCOAT_USED
@@ -2183,6 +2193,10 @@ void fragment_shader(in SceneData scene_data) {
 		// Low enough for occlusion, high enough for reaction to lights and shadows.
 		specular_occlusion = max(min(reflective_f * specular_occlusion * 10.0, 1.0), specular_occlusion);
 		indirect_specular_light *= specular_occlusion;
+		// Diffuse ambient brightness estimates visibility for environment lighting.
+		// Applying it again to a traced reflection erases visible lights in dark rooms.
+		// Keep only that contribution, after probe blending; the BRDF still follows.
+		indirect_specular_light += traced_indirect_specular * (1.0 - specular_occlusion);
 #endif // BENT_NORMAL_MAP_USED
 #endif // SPECULAR_OCCLUSION_DISABLED
 		ambient_light *= albedo.rgb;
@@ -3076,6 +3090,11 @@ void fragment_shader(in SceneData scene_data) {
 #endif
 	diffuse_buffer = vec4(emission + diffuse_light + ambient_light, sss_strength);
 	specular_buffer = vec4(direct_specular_light + indirect_specular_light, metallic);
+	if (implementation_data.late_indirect_specular != 0u) {
+		// Receiver lighting follows its geometry; the reflected scene has separate motion.
+		diffuse_buffer.rgb += direct_specular_light;
+		specular_buffer.rgb = indirect_specular_light;
+	}
 #endif
 
 #ifndef FOG_DISABLED
@@ -3101,6 +3120,12 @@ void fragment_shader(in SceneData scene_data) {
 #if defined(PREMUL_ALPHA_USED) && !defined(MODE_RENDER_DEPTH)
 	frag_color.rgb *= premul_alpha;
 #endif //PREMUL_ALPHA_USED
+
+#ifdef MODE_DUAL_TRANSPARENCY
+	// The same value under the same blend: each layer keeps its own history in the alpha draw
+	// order. Source-excluded draws mask attachment 1 in the pipeline, not in shading.
+	reflection_source_layer = frag_color;
+#endif
 
 #endif //MODE_SEPARATE_SPECULAR
 

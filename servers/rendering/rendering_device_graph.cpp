@@ -406,6 +406,24 @@ void RenderingDeviceGraph::_add_command_to_graph(ResourceTracker **p_resource_tr
 
 		resource_tracker->reset_if_outdated(tracking_frame);
 
+		// An already-readable BLAS with no writer this frame only adds a read.
+		// Keep the generic path for new builds, transitions, and shared slices.
+		if (r_command->type == RecordedCommand::TYPE_TOP_LEVEL_ACCELERATION_STRUCTURE_BUILD &&
+				p_resource_usages[i] == RESOURCE_USAGE_ACCELERATION_STRUCTURE_READ &&
+				resource_tracker->acceleration_structure_driver_id.id != 0 &&
+				resource_tracker->usage == RESOURCE_USAGE_ACCELERATION_STRUCTURE_READ &&
+				resource_tracker->parent == nullptr && resource_tracker->dirty_shared_list == nullptr &&
+				resource_tracker->write_command_or_list_index < 0) {
+			resource_tracker->usage_access = _usage_to_access_bits(RESOURCE_USAGE_ACCELERATION_STRUCTURE_READ);
+			resource_tracker->current_frame_stages = resource_tracker->current_frame_stages | r_command->self_stages;
+			if (!resource_tracker->previous_frame_stages.is_empty()) {
+				r_command->previous_stages = r_command->previous_stages | resource_tracker->previous_frame_stages;
+				resource_tracker->previous_frame_stages.clear();
+			}
+			resource_tracker->read_full_command_list_index = _add_to_command_list(p_command_index, resource_tracker->read_full_command_list_index);
+			continue;
+		}
+
 		const RDD::TextureSubresourceRange &subresources = resource_tracker->texture_subresources;
 		const Rect2i resource_tracker_rect(subresources.base_mipmap, subresources.base_layer, subresources.mipmap_count, subresources.layer_count);
 		Rect2i search_tracker_rect = resource_tracker_rect;

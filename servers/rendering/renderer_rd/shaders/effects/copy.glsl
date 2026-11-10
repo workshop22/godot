@@ -52,11 +52,16 @@ layout(set = 0, binding = 0) uniform sampler2D source_color;
 layout(set = 0, binding = 0) uniform sampler2D source_color;
 #endif
 
+#ifdef MODE_SCENE_LAYERS
+layout(set = 1, binding = 0) uniform sampler2D source_reflection;
+layout(set = 1, binding = 1) uniform sampler2D source_layer;
+#endif
+
 #ifdef GLOW_USE_AUTO_EXPOSURE
 layout(set = 1, binding = 0) uniform sampler2D source_auto_exposure;
 #endif
 
-#if defined(MODE_MERGE_TRANSPARENCY)
+#if defined(MODE_MERGE_TRANSPARENCY) || defined(MODE_MERGE_REFLECTION)
 layout(rgba16f, set = 3, binding = 0) uniform image2D dest_buffer;
 #elif defined(MODE_LINEARIZE_DEPTH_COPY) || defined(MODE_SIMPLE_COPY_DEPTH)
 layout(r32f, set = 3, binding = 0) uniform restrict writeonly image2D dest_buffer;
@@ -76,6 +81,28 @@ shared vec4 temp_cache[128];
 void main() {
 	// Pixel being shaded
 	ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+#if defined(MODE_SCENE_LAYERS) || defined(MODE_MERGE_REFLECTION)
+	if (any(greaterThanEqual(pos, params.section.zw))) {
+		return;
+	}
+	vec2 layer_uv = (vec2(pos) + 0.5) / vec2(params.section.zw) + params.set_color.xy;
+#ifdef MODE_SCENE_LAYERS
+	vec4 result = textureLod(source_color, layer_uv, 0.0);
+	if ((params.flags & 1u) != 0u) {
+		result.rgb += textureLod(source_reflection, layer_uv, 0.0).rgb;
+	}
+	if ((params.flags & 2u) != 0u) {
+		// The transparent layer: its own light in RGB, what it leaves of the image below in A.
+		vec4 layer = textureLod(source_layer, layer_uv, 0.0);
+		result = vec4(layer.rgb + layer.a * result.rgb, 1.0 - layer.a * (1.0 - result.a));
+	}
+#else
+	vec4 result = imageLoad(dest_buffer, pos);
+	result.rgb += textureLod(source_color, layer_uv, 0.0).rgb;
+#endif
+	imageStore(dest_buffer, pos, result);
+	return;
+#endif
 #ifdef MODE_MERGE_TRANSPARENCY
 	if (any(greaterThanEqual(pos, params.section.zw))) {
 		return;
