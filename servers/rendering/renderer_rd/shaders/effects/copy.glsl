@@ -52,10 +52,6 @@ layout(set = 0, binding = 0) uniform sampler2D source_color;
 layout(set = 0, binding = 0) uniform sampler2D source_color;
 #endif
 
-#ifdef MODE_MERGE_TRANSPARENCY
-layout(set = 1, binding = 0) uniform sampler2D source_transmission;
-#endif
-
 #ifdef GLOW_USE_AUTO_EXPOSURE
 layout(set = 1, binding = 0) uniform sampler2D source_auto_exposure;
 #endif
@@ -85,11 +81,15 @@ void main() {
 		return;
 	}
 	// The layer was rasterized with this frame's jitter; temporal AA/upscalers have
-	// removed that jitter from the opaque image. Sample both layer terms together.
+	// removed that jitter from the opaque image. RGB is the layer's own light, A what it
+	// leaves of the image below; untouched texels keep the image as it is.
 	vec2 uv = (vec2(pos) + 0.5) / vec2(params.section.zw) + params.set_color.xy;
-	vec4 emission = textureLod(source_color, uv, 0.0);
-	vec4 transmission = textureLod(source_transmission, uv, 0.0);
-	imageStore(dest_buffer, pos, emission + transmission * imageLoad(dest_buffer, pos));
+	vec4 layer = textureLod(source_color, uv, 0.0);
+	if (layer.a == 1.0 && layer.rgb == vec3(0.0)) {
+		return;
+	}
+	vec4 below = imageLoad(dest_buffer, pos);
+	imageStore(dest_buffer, pos, vec4(layer.rgb + layer.a * below.rgb, 1.0 - layer.a * (1.0 - below.a)));
 	return;
 #endif
 

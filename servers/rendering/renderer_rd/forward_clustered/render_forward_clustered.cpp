@@ -196,31 +196,32 @@ RID RenderForwardClustered::RenderBufferDataForwardClustered::get_color_pass_fb(
 
 	RID depth = use_msaa ? render_buffers->get_texture(RB_SCOPE_BUFFERS, RB_TEX_DEPTH_MSAA) : render_buffers->get_depth_texture();
 	if (p_color_pass_flags & COLOR_PASS_FLAG_SEPARATE_TRANSPARENCY) {
-		RD *rd = RD::get_singleton();
+		// One layer: the transparent surfaces' own light in RGB and what they leave of the
+		// background in A (scene_shader_forward_clustered.cpp sets the blend).
 		uint32_t usage = RD::TEXTURE_USAGE_COLOR_ATTACHMENT_BIT | RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT | RD::TEXTURE_USAGE_CAN_COPY_TO_BIT;
-		RD::TextureSamples samples = use_msaa ? render_buffers->get_texture_format(RB_SCOPE_BUFFERS, RB_TEX_COLOR_MSAA).samples : RD::TEXTURE_SAMPLES_1;
-		for (StringName name : { RB_TEX_TRANSPARENCY, RB_TEX_TRANSMISSION }) {
-			if (!render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, name)) {
-				render_buffers->create_texture(RB_SCOPE_FORWARD_CLUSTERED, name, render_buffers->get_base_data_format(), usage);
+		if (!render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSPARENCY)) {
+			render_buffers->create_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSPARENCY, render_buffers->get_base_data_format(), usage);
+		}
+		if (use_msaa) {
+			// The layer tests and writes the scene's multisampled depth: the opaque depth later
+			// effects read was resolved before this pass (_render_scene).
+			if (!render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSPARENCY_MSAA)) {
+				render_buffers->create_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSPARENCY_MSAA, render_buffers->get_base_data_format(), usage, render_buffers->get_texture_format(RB_SCOPE_BUFFERS, RB_TEX_COLOR_MSAA).samples);
 			}
+		} else {
+			// Without MSAA the scene's depth is the one later effects read: the layer writes a copy.
+			if (!render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSPARENCY_DEPTH)) {
+				render_buffers->create_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSPARENCY_DEPTH, render_buffers->get_depth_format(false, false, render_buffers->get_can_be_storage()), RD::TEXTURE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | RD::TEXTURE_USAGE_CAN_COPY_TO_BIT);
+			}
+			RID layer_depth = render_buffers->get_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSPARENCY_DEPTH);
+			Size2i size = render_buffers->get_internal_size();
+			for (int v = 0; v < v_count; v++) {
+				RD::get_singleton()->texture_copy(depth, layer_depth, Vector3(), Vector3(), Vector3(size.x, size.y, 1), 0, 0, v, v);
+			}
+			depth = layer_depth;
 		}
-		if (use_msaa && !render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSPARENCY_MSAA)) {
-			render_buffers->create_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSPARENCY_MSAA, render_buffers->get_base_data_format(), usage, samples);
-			render_buffers->create_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSMISSION_MSAA, render_buffers->get_base_data_format(), usage, samples);
-		}
-		if (!render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSPARENCY_DEPTH)) {
-			render_buffers->create_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSPARENCY_DEPTH, render_buffers->get_depth_format(false, use_msaa, render_buffers->get_can_be_storage()), RD::TEXTURE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | RD::TEXTURE_USAGE_CAN_COPY_TO_BIT, samples);
-		}
-		RID layer_depth = render_buffers->get_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSPARENCY_DEPTH);
-		Size2i size = render_buffers->get_internal_size();
-		for (int v = 0; v < v_count; v++) {
-			rd->texture_copy(depth, layer_depth, Vector3(), Vector3(), Vector3(size.x, size.y, 1), 0, 0, v, v);
-		}
-		depth = layer_depth;
 		color = render_buffers->get_texture(RB_SCOPE_FORWARD_CLUSTERED, use_msaa ? RB_TEX_TRANSPARENCY_MSAA : RB_TEX_TRANSPARENCY);
-		specular = render_buffers->get_texture(RB_SCOPE_FORWARD_CLUSTERED, use_msaa ? RB_TEX_TRANSMISSION_MSAA : RB_TEX_TRANSMISSION);
 	}
-
 
 	if (render_buffers->has_texture(RB_SCOPE_VRS, RB_TEXTURE)) {
 		RID vrs_texture = render_buffers->get_texture(RB_SCOPE_VRS, RB_TEXTURE);
@@ -511,6 +512,15 @@ void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p
 				ERR_FAIL_COND_MSG(p_params->view_count > 1, "Multiview not supported for SDF pass");
 				pipeline_key.version = SceneShaderForwardClustered::PIPELINE_VERSION_DEPTH_PASS_WITH_SDF;
 			} break;
+		}
+
+		if constexpr (p_pass_mode != PASS_MODE_DEPTH_MATERIAL && p_pass_mode != PASS_MODE_SDF) {
+			const uint64_t drawn_key = (uint64_t(pipeline_key.version) << 56) | (uint64_t(pipeline_key.color_pass_flags & ~uint32_t(SceneShaderForwardClustered::PIPELINE_COLOR_PASS_FLAG_LIGHTMAP)) << 48) | (uint64_t(framebuffer_format) & 0xFFFFFFFFFFFFull);
+			thread_local uint64_t last_drawn_key = UINT64_MAX;
+			if (unlikely(drawn_key != last_drawn_key)) {
+				last_drawn_key = drawn_key;
+				_note_drawn_pass(drawn_key);
+			}
 		}
 
 		pipeline_key.framebuffer_format_id = framebuffer_format;
@@ -2167,6 +2177,11 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 
 	bool using_ssao = depth_pre_pass && !is_reflection_probe && p_render_data->environment.is_valid() && environment_get_ssao_enabled(p_render_data->environment);
 
+	// Every opaque surface is in the depth pre-pass and the color passes after it add no depth
+	// (they test it and write the same values, or none), so a depth resolved here is the opaque
+	// depth until the transparent pass: later resolves of it are skipped.
+	bool prepass_depth_resolved = false;
+
 	if (depth_pre_pass) { //depth pre pass
 		bool needs_pre_resolve = _needs_post_prepass_render(p_render_data, using_sdfgi || using_voxelgi);
 		if (needs_pre_resolve) {
@@ -2199,10 +2214,12 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 				for (uint32_t v = 0; v < rb->get_view_count(); v++) {
 					resolve_effects->resolve_gi(rb->get_depth_msaa(v), rb_data->get_normal_roughness_msaa(v), using_voxelgi ? rb_data->get_voxelgi_msaa(v) : RID(), rb->get_depth_texture(v), rb_data->get_normal_roughness(v), using_voxelgi ? rb_data->get_voxelgi(v) : RID(), rb->get_internal_size(), texture_multisamples[msaa]);
 				}
+				prepass_depth_resolved = true;
 			} else if (finish_depth) {
 				for (uint32_t v = 0; v < rb->get_view_count(); v++) {
 					resolve_effects->resolve_depth(rb->get_depth_msaa(v), rb->get_depth_texture(v), rb->get_internal_size(), texture_multisamples[msaa]);
 				}
+				prepass_depth_resolved = true;
 			}
 			RD::get_singleton()->draw_command_end_label();
 		}
@@ -2310,7 +2327,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			}
 		}
 
-		if (ce_post_opaque_resolved_depth) {
+		if (ce_post_opaque_resolved_depth && !prepass_depth_resolved) {
 			for (uint32_t v = 0; v < rb->get_view_count(); v++) {
 				resolve_effects->resolve_depth(rb->get_depth_msaa(v), rb->get_depth_texture(v), rb->get_internal_size(), texture_multisamples[msaa]);
 			}
@@ -2355,6 +2372,12 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		RD::get_singleton()->draw_command_end_label();
 	}
 
+	// Whether the resolved depth holds the opaque depth when the transparent pass starts: a
+	// separate transparent layer writes the multisampled depth, so the final resolve must not
+	// resolve it again. (The scene color is always resolved again at the end: effects before the
+	// transparent pass may write the resolved color for the screen copy alone.)
+	bool opaque_depth_resolved = false;
+
 	if (use_msaa) {
 		RENDER_TIMESTAMP("Resolve MSAA");
 
@@ -2369,10 +2392,14 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			}
 		}
 
-		if (scene_state.used_depth_texture || scene_state.used_normal_texture || using_separate_specular || ce_needs_normal_roughness || ce_pre_transparent_resolved_depth) {
+		// A separate transparent layer writes the multisampled depth: resolve the opaque depth first.
+		if (prepass_depth_resolved) {
+			opaque_depth_resolved = true;
+		} else if (scene_state.used_depth_texture || scene_state.used_normal_texture || using_separate_specular || ce_needs_normal_roughness || ce_pre_transparent_resolved_depth || separate_transparency) {
 			for (uint32_t v = 0; v < rb->get_view_count(); v++) {
 				resolve_effects->resolve_depth(rb->get_depth_msaa(v), rb->get_depth_texture(v), rb->get_internal_size(), texture_multisamples[msaa]);
 			}
+			opaque_depth_resolved = true;
 		}
 	}
 
@@ -2447,10 +2474,11 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 				}
 			}
 
-			if (ce_pre_transparent_resolved_depth) {
+			if (ce_pre_transparent_resolved_depth && !opaque_depth_resolved) {
 				for (uint32_t v = 0; v < rb->get_view_count(); v++) {
 					resolve_effects->resolve_depth(rb->get_depth_msaa(v), rb->get_depth_texture(v), rb->get_internal_size(), texture_multisamples[msaa]);
 				}
+				opaque_depth_resolved = use_msaa;
 			}
 		}
 
@@ -2481,7 +2509,8 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 
 		RID alpha_framebuffer = rb_data.is_valid() ? rb_data->get_color_pass_fb(transparent_color_pass_flags) : color_only_framebuffer;
 		RenderListParameters render_list_params(render_list[RENDER_LIST_ALPHA].elements.ptr(), render_list[RENDER_LIST_ALPHA].element_info.ptr(), render_list[RENDER_LIST_ALPHA].elements.size(), reverse_cull, PASS_MODE_COLOR, transparent_color_pass_flags, rb_data.is_null(), p_render_data->directional_light_soft_shadows, rp_uniform_set, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_WIREFRAME, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count, 0, base_specialization);
-		_render_list_with_draw_list(&render_list_params, alpha_framebuffer, separate_transparency ? RD::DRAW_CLEAR_COLOR_0 | RD::DRAW_CLEAR_COLOR_1 : RD::DRAW_DEFAULT_ALL, separate_transparency ? Vector<Color>({Color(0, 0, 0, 0), Color(1, 1, 1, 1)}) : Vector<Color>(), 0.0f, 0u, p_render_data->render_region);
+		// The layer starts with no light of its own and the whole background showing through.
+		_render_list_with_draw_list(&render_list_params, alpha_framebuffer, separate_transparency ? RD::DRAW_CLEAR_COLOR_0 : RD::DRAW_DEFAULT_ALL, separate_transparency ? Vector<Color>({ Color(0, 0, 0, 1) }) : Vector<Color>(), 0.0f, 0u, p_render_data->render_region);
 	}
 
 	RD::get_singleton()->draw_command_end_label();
@@ -2494,10 +2523,11 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		bool resolve_velocity_buffer = (using_taa || using_upscaling || ce_needs_motion_vectors) && rb->has_velocity_buffer(true);
 		for (uint32_t v = 0; v < rb->get_view_count(); v++) {
 			RD::get_singleton()->texture_resolve_multisample(rb->get_color_msaa(v), rb->get_internal_texture(v));
-			resolve_effects->resolve_depth(rb->get_depth_msaa(v), rb->get_depth_texture(v), rb->get_internal_size(), texture_multisamples[msaa]);
+			if (!(separate_transparency && opaque_depth_resolved)) {
+				resolve_effects->resolve_depth(rb->get_depth_msaa(v), rb->get_depth_texture(v), rb->get_internal_size(), texture_multisamples[msaa]);
+			}
 			if (separate_transparency) {
 				RD::get_singleton()->texture_resolve_multisample(rb->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSPARENCY_MSAA, v, 0), rb->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSPARENCY, v, 0));
-				RD::get_singleton()->texture_resolve_multisample(rb->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSMISSION_MSAA, v, 0), rb->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSMISSION, v, 0));
 			}
 
 			if (resolve_velocity_buffer) {
@@ -2612,7 +2642,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	if (separate_transparency) {
 		RENDER_TIMESTAMP("Composite Transparent Layer");
 		for (uint32_t v = 0; v < rb->get_view_count(); v++) {
-			copy_effects->merge_transparency(rb->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSPARENCY, v, 0), rb->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSMISSION, v, 0), rb->get_output_texture(v), rb->get_output_size(), p_render_data->scene_data->taa_jitter * 0.5);
+			copy_effects->merge_transparency(rb->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_TRANSPARENCY, v, 0), rb->get_output_texture(v), rb->get_output_size(), p_render_data->scene_data->taa_jitter * 0.5);
 		}
 	}
 
@@ -4750,7 +4780,89 @@ void RenderForwardClustered::_mesh_compile_pipeline_for_surface(SceneShaderForwa
 	}
 }
 
+void RenderForwardClustered::_note_drawn_pass(uint64_t p_key) {
+	MutexLock lock(drawn_passes_mutex);
+	if (drawn_pass_keys.has(p_key)) {
+		return;
+	}
+	drawn_pass_keys.insert(p_key);
+	DrawnPass pass;
+	pass.version = uint32_t(p_key >> 56);
+	pass.color_pass_flags = uint32_t((p_key >> 48) & 0xFF);
+	pass.framebuffer_format_id = RD::FramebufferFormatID(p_key & 0xFFFFFFFFFFFFull);
+	drawn_passes.push_back(pass);
+}
+
+void RenderForwardClustered::_drawn_passes_copy(LocalVector<DrawnPass> &r_passes) {
+	MutexLock lock(drawn_passes_mutex);
+	r_passes = drawn_passes;
+}
+
+void RenderForwardClustered::_mesh_compile_drawn_passes_for_surface(const SurfacePipelineData &p_surface, const GlobalPipelineData &p_global, const LocalVector<DrawnPass> &p_passes, uint32_t p_from, RSE::PipelineSource p_source, bool p_high_priority, Vector<ShaderPipelinePair> *r_pipeline_pairs) {
+	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
+
+	const bool multiview_enabled = scene_shader.is_multiview_shader_group_enabled();
+	SceneShaderForwardClustered::ShaderData::PipelineKey pipeline_key;
+	pipeline_key.cull_mode = RD::POLYGON_CULL_DISABLED;
+	pipeline_key.primitive_type = mesh_storage->mesh_surface_get_primitive(p_surface.mesh_surface);
+	pipeline_key.wireframe = false;
+	pipeline_key.ubershader = true;
+	// p_high_priority: a few surfaces spawned in play may draw within frames, and a draw waits for a queued task (a
+	// low-priority one can sit behind the whole backlog). Loading bursts, mesh loads and sweeps of existing surfaces for
+	// a newly drawn layout stay low priority so they cannot saturate every core.
+	auto compile = [&](SceneShaderForwardClustered::ShaderData *p_shader, void *p_mesh_surface) {
+		const uint64_t input_mask = p_shader->get_vertex_input_mask(pipeline_key.version, pipeline_key.color_pass_flags, true);
+		const bool motion_vectors = pipeline_key.color_pass_flags & SceneShaderForwardClustered::PIPELINE_COLOR_PASS_FLAG_MOTION_VECTORS;
+		const bool emulate_point_size = p_shader->uses_point_size && scene_shader.emulate_point_size;
+		pipeline_key.vertex_format_id = mesh_storage->mesh_surface_get_vertex_format(p_mesh_surface, input_mask, p_surface.instanced, motion_vectors, emulate_point_size);
+		p_shader->pipeline_hash_map.compile_pipeline(pipeline_key, pipeline_key.hash(), p_source, p_high_priority);
+		if (r_pipeline_pairs != nullptr) {
+			r_pipeline_pairs->push_back({ p_shader, pipeline_key });
+		}
+	};
+	for (uint32_t i = p_from; i < p_passes.size(); i++) {
+		const DrawnPass &pass = p_passes[i];
+		const bool multiview = (pass.color_pass_flags & SceneShaderForwardClustered::PIPELINE_COLOR_PASS_FLAG_MULTIVIEW) || pass.version == SceneShaderForwardClustered::PIPELINE_VERSION_DEPTH_PASS_MULTIVIEW ||
+				pass.version == SceneShaderForwardClustered::PIPELINE_VERSION_DEPTH_PASS_WITH_NORMAL_AND_ROUGHNESS_MULTIVIEW || pass.version == SceneShaderForwardClustered::PIPELINE_VERSION_DEPTH_PASS_WITH_NORMAL_AND_ROUGHNESS_AND_VOXEL_GI_MULTIVIEW;
+		if (multiview && !multiview_enabled) {
+			continue;
+		}
+		pipeline_key.version = SceneShaderForwardClustered::PipelineVersion(pass.version);
+		pipeline_key.framebuffer_format_id = pass.framebuffer_format_id;
+		pipeline_key.color_pass_flags = pass.color_pass_flags;
+		if (pass.version == SceneShaderForwardClustered::PIPELINE_VERSION_COLOR_PASS) {
+			const bool transparent = pass.color_pass_flags & SceneShaderForwardClustered::PIPELINE_COLOR_PASS_FLAG_TRANSPARENT;
+			if (transparent ? !p_surface.uses_transparent : !p_surface.uses_opaque) {
+				continue;
+			}
+			compile(p_surface.shader, p_surface.mesh_surface);
+			if (p_global.use_lightmaps && p_surface.can_use_lightmap) {
+				pipeline_key.color_pass_flags = pass.color_pass_flags | SceneShaderForwardClustered::PIPELINE_COLOR_PASS_FLAG_LIGHTMAP;
+				compile(p_surface.shader, p_surface.mesh_surface);
+			}
+		} else {
+			if (!p_surface.uses_depth) {
+				continue;
+			}
+			// Plain depth and shadow passes draw the shadow shader (render list: shadow_pass || PASS_MODE_DEPTH).
+			const bool shadow_shader = pass.version == SceneShaderForwardClustered::PIPELINE_VERSION_DEPTH_PASS || pass.version == SceneShaderForwardClustered::PIPELINE_VERSION_DEPTH_PASS_DP || pass.version == SceneShaderForwardClustered::PIPELINE_VERSION_DEPTH_PASS_MULTIVIEW;
+			if (shadow_shader) {
+				compile(p_surface.shader_shadow, p_surface.mesh_surface_shadow);
+			} else {
+				compile(p_surface.shader, p_surface.mesh_surface);
+			}
+		}
+	}
+}
+
 void RenderForwardClustered::_mesh_compile_pipelines_for_surface(const SurfacePipelineData &p_surface, const GlobalPipelineData &p_global, RSE::PipelineSource p_source, Vector<ShaderPipelinePair> *r_pipeline_pairs) {
+	_mesh_compile_stock_pipelines_for_surface(p_surface, p_global, p_source, r_pipeline_pairs);
+	thread_local LocalVector<DrawnPass> passes;
+	_drawn_passes_copy(passes);
+	_mesh_compile_drawn_passes_for_surface(p_surface, p_global, passes, 0, p_source, p_source == RSE::PIPELINE_SOURCE_SURFACE && drawn_passes_high_priority, r_pipeline_pairs);
+}
+
+void RenderForwardClustered::_mesh_compile_stock_pipelines_for_surface(const SurfacePipelineData &p_surface, const GlobalPipelineData &p_global, RSE::PipelineSource p_source, Vector<ShaderPipelinePair> *r_pipeline_pairs) {
 	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
 	bool octmap_use_storage = !copy_effects->get_raster_effects().has_flag(RendererRD::CopyEffects::RASTER_EFFECT_OCTMAP);
 
@@ -4897,20 +5009,24 @@ void RenderForwardClustered::_mesh_compile_pipelines_for_surface(const SurfacePi
 	}
 }
 
-void RenderForwardClustered::_mesh_generate_all_pipelines_for_surface_cache(GeometryInstanceSurfaceDataCache *p_surface_cache, const GlobalPipelineData &p_global) {
+void RenderForwardClustered::_surface_pipeline_data_from_cache(GeometryInstanceSurfaceDataCache *p_surface_cache, SurfacePipelineData &r_surface) {
 	bool uses_alpha_pass = (p_surface_cache->flags & GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA) != 0;
 	float multiplied_fade_alpha = p_surface_cache->owner->force_alpha * p_surface_cache->owner->parent_fade_alpha;
 	bool uses_fade = (multiplied_fade_alpha < FADE_ALPHA_PASS_THRESHOLD) || p_surface_cache->owner->fade_near || p_surface_cache->owner->fade_far;
+	r_surface.mesh_surface = p_surface_cache->surface;
+	r_surface.mesh_surface_shadow = p_surface_cache->surface_shadow;
+	r_surface.shader = p_surface_cache->shader;
+	r_surface.shader_shadow = p_surface_cache->shader_shadow;
+	r_surface.instanced = p_surface_cache->owner->mesh_instance.is_valid();
+	r_surface.uses_opaque = !uses_alpha_pass;
+	r_surface.uses_transparent = uses_alpha_pass || uses_fade;
+	r_surface.uses_depth = (p_surface_cache->flags & (GeometryInstanceSurfaceDataCache::FLAG_PASS_DEPTH | GeometryInstanceSurfaceDataCache::FLAG_PASS_OPAQUE | GeometryInstanceSurfaceDataCache::FLAG_PASS_SHADOW)) != 0;
+	r_surface.can_use_lightmap = p_surface_cache->owner->lightmap_instance.is_valid() || p_surface_cache->owner->lightmap_sh;
+}
+
+void RenderForwardClustered::_mesh_generate_all_pipelines_for_surface_cache(GeometryInstanceSurfaceDataCache *p_surface_cache, const GlobalPipelineData &p_global) {
 	SurfacePipelineData surface;
-	surface.mesh_surface = p_surface_cache->surface;
-	surface.mesh_surface_shadow = p_surface_cache->surface_shadow;
-	surface.shader = p_surface_cache->shader;
-	surface.shader_shadow = p_surface_cache->shader_shadow;
-	surface.instanced = p_surface_cache->owner->mesh_instance.is_valid();
-	surface.uses_opaque = !uses_alpha_pass;
-	surface.uses_transparent = uses_alpha_pass || uses_fade;
-	surface.uses_depth = (p_surface_cache->flags & (GeometryInstanceSurfaceDataCache::FLAG_PASS_DEPTH | GeometryInstanceSurfaceDataCache::FLAG_PASS_OPAQUE | GeometryInstanceSurfaceDataCache::FLAG_PASS_SHADOW)) != 0;
-	surface.can_use_lightmap = p_surface_cache->owner->lightmap_instance.is_valid() || p_surface_cache->owner->lightmap_sh;
+	_surface_pipeline_data_from_cache(p_surface_cache, surface);
 	_mesh_compile_pipelines_for_surface(surface, p_global, RSE::PIPELINE_SOURCE_SURFACE);
 }
 
@@ -4923,6 +5039,22 @@ void RenderForwardClustered::_update_dirty_geometry_instances() {
 }
 
 void RenderForwardClustered::_update_dirty_geometry_pipelines() {
+	thread_local LocalVector<DrawnPass> passes;
+	_drawn_passes_copy(passes);
+	if (global_pipeline_data_required.key == global_pipeline_data_compiled.key && drawn_passes_compiled < passes.size()) {
+		// A pass layout drew for the first time: give every existing surface its ubershader for it, in the background.
+		SelfList<GeometryInstanceSurfaceDataCache> *list = geometry_surface_compilation_all_list.first();
+		while (list != nullptr) {
+			GeometryInstanceSurfaceDataCache *surface_cache = list->self();
+			if (!surface_cache->compilation_dirty_element.in_list()) {
+				SurfacePipelineData surface;
+				_surface_pipeline_data_from_cache(surface_cache, surface);
+				_mesh_compile_drawn_passes_for_surface(surface, global_pipeline_data_compiled, passes, drawn_passes_compiled, RSE::PIPELINE_SOURCE_SURFACE, false, nullptr);
+			}
+			list = list->next();
+		}
+		drawn_passes_compiled = passes.size();
+	}
 	if (global_pipeline_data_required.key != global_pipeline_data_compiled.key) {
 		// Go through the entire list of surfaces and compile pipelines for everything again.
 		SelfList<GeometryInstanceSurfaceDataCache> *list = geometry_surface_compilation_all_list.first();
@@ -4939,17 +5071,27 @@ void RenderForwardClustered::_update_dirty_geometry_pipelines() {
 		}
 
 		global_pipeline_data_compiled.key = global_pipeline_data_required.key;
+		drawn_passes_compiled = passes.size();
 	} else {
 		// Compile pipelines only for the dirty list.
 		if (!geometry_surface_compilation_dirty_list.first()) {
 			return;
 		}
 
+		// A handful of new surfaces is something spawned in play that may draw within frames: queue its drawn layouts
+		// like the stock prediction. A loading burst stays at low priority so it cannot saturate every core.
+		uint32_t dirty_count = 0;
+		for (SelfList<GeometryInstanceSurfaceDataCache> *e = geometry_surface_compilation_dirty_list.first(); e != nullptr && dirty_count <= 64; e = e->next()) {
+			dirty_count++;
+		}
+		drawn_passes_high_priority = dirty_count <= 64;
+
 		while (geometry_surface_compilation_dirty_list.first() != nullptr) {
 			GeometryInstanceSurfaceDataCache *surface_cache = geometry_surface_compilation_dirty_list.first()->self();
 			_mesh_generate_all_pipelines_for_surface_cache(surface_cache, global_pipeline_data_compiled);
 			surface_cache->compilation_dirty_element.remove_from_list();
 		}
+		drawn_passes_high_priority = false;
 	}
 }
 

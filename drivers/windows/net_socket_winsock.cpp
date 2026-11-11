@@ -514,6 +514,28 @@ Error NetSocketWinSock::set_broadcasting_enabled(bool p_enabled) {
 	return OK;
 }
 
+Error NetSocketWinSock::set_buffer_size(BufferType p_type, int p_bytes) {
+	ERR_FAIL_COND_V(!is_open(), ERR_UNCONFIGURED);
+	ERR_FAIL_COND_V(p_bytes <= 0, ERR_INVALID_PARAMETER);
+	const int option = p_type == BUFFER_RECEIVE ? SO_RCVBUF : SO_SNDBUF;
+	if (setsockopt(_sock, SOL_SOCKET, option, (const char *)&p_bytes, sizeof(int)) != 0) {
+		print_verbose("Unable to change socket buffer size.");
+		return FAILED;
+	}
+	return OK;
+}
+
+int NetSocketWinSock::get_buffer_size(BufferType p_type) const {
+	ERR_FAIL_COND_V(!is_open(), -1);
+	const int option = p_type == BUFFER_RECEIVE ? SO_RCVBUF : SO_SNDBUF;
+	int value = 0;
+	int length = sizeof(int);
+	if (getsockopt(_sock, SOL_SOCKET, option, (char *)&value, &length) != 0) {
+		return -1;
+	}
+	return value;
+}
+
 void NetSocketWinSock::set_blocking_enabled(bool p_enabled) {
 	ERR_FAIL_COND(!is_open());
 

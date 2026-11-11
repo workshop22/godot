@@ -118,5 +118,15 @@ public:
 	virtual Error join_multicast_group(const IPAddress &p_multi_address, const String &p_if_name) = 0;
 	virtual Error leave_multicast_group(const IPAddress &p_multi_address, const String &p_if_name) = 0;
 
+	enum BufferType {
+		BUFFER_RECEIVE,
+		BUFFER_SEND,
+	};
+	// Requests the OS socket buffer size in bytes. The OS may clamp the request
+	// (Linux: net.core.rmem_max/wmem_max), so read the effective size back.
+	virtual Error set_buffer_size(BufferType p_type, int p_bytes) { return ERR_UNAVAILABLE; }
+	// The OS-reported size (Linux reports twice the usable payload), or -1.
+	virtual int get_buffer_size(BufferType p_type) const { return -1; }
+
 	virtual ~NetSocket() {}
 };

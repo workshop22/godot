@@ -1444,7 +1444,7 @@ void CopyEffects::octmap_roughness_raster(RID p_source_rd_texture, RID p_dest_fr
 	RD::get_singleton()->draw_list_end();
 }
 
-void CopyEffects::merge_transparency(RID p_color, RID p_transmission, RID p_destination, const Size2i &p_size, const Vector2 &p_jitter) {
+void CopyEffects::merge_transparency(RID p_layer, RID p_destination, const Size2i &p_size, const Vector2 &p_jitter) {
 	UniformSetCacheRD *cache = UniformSetCacheRD::get_singleton();
 	ERR_FAIL_NULL(cache);
 	MaterialStorage *materials = MaterialStorage::get_singleton();
@@ -1457,14 +1457,12 @@ void CopyEffects::merge_transparency(RID p_color, RID p_transmission, RID p_dest
 	RID sampler = materials->sampler_rd_get_default(RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
 	RID shader = copy.shader.version_get_shader(copy.shader_version, COPY_MODE_MERGE_TRANSPARENCY);
 	ERR_FAIL_COND(shader.is_null());
-	RD::Uniform color(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({sampler, p_color}));
-	RD::Uniform transmission(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({sampler, p_transmission}));
+	RD::Uniform layer(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ sampler, p_layer }));
 	RD::Uniform destination(RD::UNIFORM_TYPE_IMAGE, 0, p_destination);
 	RD *rd = RD::get_singleton();
 	RD::ComputeListID list = rd->compute_list_begin();
 	rd->compute_list_bind_compute_pipeline(list, copy.pipelines[COPY_MODE_MERGE_TRANSPARENCY].get_rid());
-	rd->compute_list_bind_uniform_set(list, cache->get_cache(shader, 0, color), 0);
-	rd->compute_list_bind_uniform_set(list, cache->get_cache(shader, 1, transmission), 1);
+	rd->compute_list_bind_uniform_set(list, cache->get_cache(shader, 0, layer), 0);
 	rd->compute_list_bind_uniform_set(list, cache->get_cache(shader, 3, destination), 3);
 	rd->compute_list_set_push_constant(list, &copy.push_constant, sizeof(CopyPushConstant));
 	rd->compute_list_dispatch_threads(list, p_size.x, p_size.y, 1);

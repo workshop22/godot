@@ -107,23 +107,34 @@ void TAA::process(Ref<RenderSceneBuffersRD> p_render_buffers, RD::DataFormat p_f
 
 	RD::get_singleton()->draw_command_begin_label("TAA");
 
+	// The two history textures alternate: the resolve writes this frame into the one that does not
+	// hold the last frame, and that one is the next frame's history as it stands (it used to be
+	// copied back out of the frame it had just been copied into).
+	const StringName histories[2] = { SNAME("history"), SNAME("temp") };
+	if (just_allocated) {
+		p_render_buffers->taa_history_index = 0;
+	}
+	uint32_t last = p_render_buffers->taa_history_index & 1;
+
 	for (uint32_t v = 0; v < view_count; v++) {
 		// Get our (cached) slices
 		RID internal_texture = p_render_buffers->get_internal_texture(v);
 		RID velocity_buffer = p_render_buffers->get_velocity_buffer(false, v);
-		RID taa_history = p_render_buffers->get_texture_slice(SNAME("taa"), SNAME("history"), v, 0);
+		RID taa_history = p_render_buffers->get_texture_slice(SNAME("taa"), histories[last], v, 0);
+		RID taa_next = p_render_buffers->get_texture_slice(SNAME("taa"), histories[1 - last], v, 0);
 		RID taa_prev_velocity = p_render_buffers->get_texture_slice(SNAME("taa"), SNAME("prev_velocity"), v, 0);
 
 		if (!just_allocated) {
 			RID depth_texture = p_render_buffers->get_depth_texture(v);
-			RID taa_temp = p_render_buffers->get_texture_slice(SNAME("taa"), SNAME("temp"), v, 0);
-			resolve(internal_texture, taa_temp, depth_texture, velocity_buffer, taa_prev_velocity, taa_history, Size2(internal_size.x, internal_size.y), p_z_near, p_z_far);
-			copy_effects->copy_to_rect(taa_temp, internal_texture, Rect2(0, 0, internal_size.x, internal_size.y));
+			resolve(internal_texture, taa_next, depth_texture, velocity_buffer, taa_prev_velocity, taa_history, Size2(internal_size.x, internal_size.y), p_z_near, p_z_far);
+			copy_effects->copy_to_rect(taa_next, internal_texture, Rect2(0, 0, internal_size.x, internal_size.y));
+		} else {
+			copy_effects->copy_to_rect(internal_texture, taa_next, Rect2(0, 0, internal_size.x, internal_size.y));
 		}
 
-		copy_effects->copy_to_rect(internal_texture, taa_history, Rect2(0, 0, internal_size.x, internal_size.y));
 		copy_effects->copy_to_rect(velocity_buffer, taa_prev_velocity, Rect2(0, 0, internal_size.x, internal_size.y));
 	}
+	p_render_buffers->taa_history_index = 1 - last;
 
 	RD::get_singleton()->draw_command_end_label();
 }
