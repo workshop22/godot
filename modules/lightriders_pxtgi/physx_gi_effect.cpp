@@ -1800,12 +1800,16 @@ void main() {
 			break;
 		}
 	}
+	// Whether this ray has already been walked through the world's opaque shapes: what it found (or the
+	// whole reach, clear) bounds the items below without walking it again.
+	bool world_walked = false;
 	if (!found && int(f.reflect.x) >= 2 && f.counts.x > 0) {
 		vec3 world_origin = (f.view_to_world * vec4(origin, 1.0)).xyz;
 		vec3 world_dir = mat3(f.view_to_world) * dir;
 		float far = f.trace_settings.x;
 		vec3 wn;
 		int hit = trace_world(world_origin, world_dir, far, wn);
+		world_walked = true;
 		if (hit >= 0) {
 			reflect_path = length(p) + far;
 			light = world_light(world_origin + world_dir * far, wn, hit, depth_tex, color_tex, true, true, true);
@@ -1827,8 +1831,10 @@ void main() {
 		float limit = found ? min(hit_t, f.trace_settings.x) : f.trace_settings.x;
 		// Screen hits may overlook an off-screen occluder; items only contribute
 		// in front of the nearest opaque shape on this same scene ray.
-		vec3 opaque_normal;
-		trace_world(wo, wd, limit, opaque_normal);
+		if (!world_walked) {
+			vec3 opaque_normal;
+			trace_world(wo, wd, limit, opaque_normal);
+		}
 		vec3 glow = vec3(0.0);
 		float transmission = 1.0;
 		float first_item = 0.0;
@@ -4168,18 +4174,16 @@ void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_rende
 	rd->buffer_update(data_buffer, 0, sizeof(data), &data);
 
 	// The shapes, grown as needed (an empty buffer can't be bound: at least one); sent only when they changed.
+	const uint64_t held = primitives_uploaded; // the publication the GPU buffers hold
 	const bool send_primitives = s.primitives_version != primitives_uploaded;
-	primitives_uploaded = s.primitives_version;
+	bool recreated = held == UINT64_MAX;
 	if (s.primitive_count > primitive_capacity || primitive_buffer.is_null()) {
 		if (primitive_buffer.is_valid()) {
 			rd->free_rid(primitive_buffer);
 		}
 		primitive_capacity = Math::next_power_of_2(uint32_t(MAX(s.primitive_count, 64)));
 		primitive_buffer = rd->storage_buffer_create(primitive_capacity * PRIMITIVE_FLOATS * sizeof(float));
-		primitives_uploaded = UINT64_MAX;
-	}
-	if ((send_primitives || primitives_uploaded == UINT64_MAX) && s.primitive_count > 0) {
-		rd->buffer_update(primitive_buffer, 0, s.primitive_count * PRIMITIVE_FLOATS * sizeof(float), s.primitives.ptr());
+		recreated = true;
 	}
 	if (s.node_count > node_capacity || node_buffer.is_null()) {
 		if (node_buffer.is_valid()) {
@@ -4187,14 +4191,48 @@ void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_rende
 		}
 		node_capacity = Math::next_power_of_2(uint32_t(MAX(s.node_count, 128)));
 		node_buffer = rd->storage_buffer_create(node_capacity * NODE_FLOATS * sizeof(float));
-		primitives_uploaded = UINT64_MAX;
+		recreated = true;
 	}
-	if ((send_primitives || primitives_uploaded == UINT64_MAX) && s.node_count > 0) {
-		rd->buffer_update(node_buffer, 0, s.node_count * NODE_FLOATS * sizeof(float), s.nodes.ptr());
+	if (send_primitives || recreated) {
+		const uint32_t record_bytes = PRIMITIVE_FLOATS * sizeof(float);
+		const uint32_t node_bytes = NODE_FLOATS * sizeof(float);
+		// A city is tens of thousands of static shapes and a few hundred moving ones (riders, ribbons), and something
+		// moves every frame. The publication directly after the one these buffers hold, on the same static layout,
+		// differs only after the static part, at the shared root and at the static records it names: send those.
+		// Anything else (a skipped publication, a new static layout, new buffers) sends everything.
+		const bool partial = !recreated && s.primitives_version == held + 1 && s.static_version == primitives_static_uploaded &&
+				s.static_count >= 0 && s.static_count <= s.primitive_count && s.static_node_count >= 0 && s.static_node_count <= s.node_count;
+		if (partial) {
+			if (s.primitive_count > s.static_count) {
+				rd->buffer_update(primitive_buffer, s.static_count * record_bytes, (s.primitive_count - s.static_count) * record_bytes, s.primitives.ptr() + s.static_count * PRIMITIVE_FLOATS);
+			}
+			for (int i = 0; i < s.touched_count; i++) {
+				const uint32_t first = s.touched_first[i];
+				const uint32_t last = MIN(s.touched_last[i], uint32_t(s.static_count) - 1);
+				if (first <= last && int(first) < s.static_count) {
+					rd->buffer_update(primitive_buffer, first * record_bytes, (last - first + 1) * record_bytes, s.primitives.ptr() + first * PRIMITIVE_FLOATS);
+				}
+			}
+			if (s.nodes_version != nodes_uploaded && s.node_count > 0) {
+				if (s.static_node_count > 0) {
+					rd->buffer_update(node_buffer, 0, node_bytes, s.nodes.ptr());
+				}
+				if (s.node_count > s.static_node_count) {
+					rd->buffer_update(node_buffer, s.static_node_count * node_bytes, (s.node_count - s.static_node_count) * node_bytes, s.nodes.ptr() + s.static_node_count * NODE_FLOATS);
+				}
+			}
+		} else {
+			if (s.primitive_count > 0) {
+				rd->buffer_update(primitive_buffer, 0, s.primitive_count * record_bytes, s.primitives.ptr());
+			}
+			if (s.node_count > 0) {
+				rd->buffer_update(node_buffer, 0, s.node_count * node_bytes, s.nodes.ptr());
+			}
+		}
+		primitives_static_uploaded = s.static_version;
+		nodes_uploaded = s.nodes_version;
 	}
-	if (primitives_uploaded == UINT64_MAX) {
-		primitives_uploaded = s.primitives_version;
-	}
+	primitives_uploaded = s.primitives_version;
 	const uint64_t geometry_since = OS::get_singleton()->get_ticks_usec();
 	if (s.geometry_version != geometry_uploaded || geometry_buffer.is_null()) {
 		// A wall revision changes kilobytes, not the hundreds of megabytes of city

@@ -248,6 +248,10 @@ class PXTGI3D : public Node3D {
 	// (effects add and drop plain meshes all the time).
 	LocalVector<ObjectID> pending_meshes;
 	int frames_since_rescan = 0;
+	// How many frames shapes that come and go are gathered before the scene is scanned and its static tree rebuilt
+	// (a few milliseconds on the main thread in a city). A streamed world's cells arrive in slices at its far edge:
+	// it asks for seconds, and takes one rebuild for many slices.
+	int membership_batch_frames = 10;
 	// Each tracked shape's and mesh's look (albedo, emission), with a bounded slice checked
 	// each frame for unnotified authoring edits. Explicit notifications apply at the next publication.
 	HashMap<ObjectID, Pair<Color, Color>> looks; // observation fallback; admitted nodes use ShapeEntry appearance
@@ -281,11 +285,17 @@ class PXTGI3D : public Node3D {
 	LocalVector<int> emissive_entries; // shapes that give off light: sampled directly
 	HashSet<int> chosen_emissives; // the emissives sampled directly last frame (shape indices): a head start this one
 	uint32_t chosen_emissives_for = 0; // the shape count those indices belong to
+	LocalVector<Pair<int, float>> chosen_list; // the same choice in order, each with its share of the picks
+	uint32_t publish_serial = 0; // publications so far: the slow-changing reads take turns on it
 	LocalVector<int> moving_entries; // the shapes in the moving part of the tree
 	bool moving_entries_dirty = true; // membership/index order changed, independent of pose/tree dirtiness
 	// The tree's records in leaf order and its nodes: the static part first, then the moving part, joined under one
 	// root node when both have shapes. Rebuilding the moving part rewrites only what follows the static part.
 	LocalVector<float> ordered_floats;
+	// The published leaf slots whose record was edited in place since the last publication (a look, a glow), and
+	// the tree's version: the render side sends only these and the moving part when it can (Snapshot::touched_*).
+	LocalVector<uint32_t> touched_slots;
+	uint64_t nodes_version = 0;
 	LocalVector<float> tree_nodes;
 	LocalVector<int> leaf_order; // leaf slot -> shape
 	LocalVector<int> entry_slot; // shape -> leaf slot (-1: not in the tree)
@@ -316,6 +326,23 @@ class PXTGI3D : public Node3D {
 	Vector<float> node_spares[2];
 	Vector<uint64_t> key_spares[2];
 	uint32_t publication_spare = 0;
+	// What each publication buffer was last written for (it travels with its buffer): the static layout, and for the
+	// records the publication. A buffer on the current static layout keeps its static part and takes only the changes.
+	struct BufferStamp {
+		uint64_t static_version = UINT64_MAX;
+		uint64_t version = UINT64_MAX;
+	};
+	BufferStamp published_primitives_stamp, primitive_spare_stamps[2];
+	BufferStamp published_ids_stamp, id_spare_stamps[2];
+	BufferStamp published_nodes_stamp, node_spare_stamps[2];
+	BufferStamp published_keys_stamp, key_spare_stamps[2];
+	// The static records each of the last publications edited in place, for bringing an older buffer up to date.
+	static constexpr uint32_t TOUCH_HISTORY = 8;
+	struct TouchRecord {
+		uint64_t version = UINT64_MAX;
+		LocalVector<uint32_t> slots;
+	};
+	TouchRecord touch_history[TOUCH_HISTORY];
 	LocalVector<ObjectID> block_publication_ids;
 	Vector<uint64_t> block_key_publications[3];
 	Vector<Vector<float>> block_triangle_publications[3];
@@ -454,10 +481,12 @@ public:
 	bool get_filtered_reflections() const { return filtered_reflections; }
 	void set_reflection_softness(float p_value) { reflection_softness = CLAMP(p_value, 1.0f, 8.0f); }
 	float get_reflection_softness() const { return reflection_softness; }
-	void set_reflection_resolution_scale(float p_value) { reflection_resolution_scale = CLAMP(p_value, 0.5f, 1.0f); }
+	void set_reflection_resolution_scale(float p_value) { reflection_resolution_scale = CLAMP(p_value, 0.25f, 1.0f); }
 	float get_reflection_resolution_scale() const { return reflection_resolution_scale; }
 	void set_rays_per_texel(int p_value) { rays_per_texel = CLAMP(p_value, 1, 4); }
 	int get_rays_per_texel() const { return rays_per_texel; }
+	void set_membership_batch_frames(int p_value) { membership_batch_frames = CLAMP(p_value, 1, 600); }
+	int get_membership_batch_frames() const { return membership_batch_frames; }
 	void set_emissive_candidates(int p_value) { emissive_candidates = CLAMP(p_value, 1, 16); }
 	int get_emissive_candidates() const { return emissive_candidates; }
 	void set_blue_noise(bool p_value) { blue_noise = p_value; }

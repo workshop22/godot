@@ -1765,6 +1765,7 @@ bool PXTGI3D::_sync_member(ObjectID p_id) {
 			record[18] = look.first.b;
 			if (entry_slot[index] >= 0) {
 				memcpy(&ordered_floats[entry_slot[index] * PF + 16], &record[16], 3 * sizeof(float));
+				touched_slots.push_back(entry_slot[index]);
 			}
 			radiance_dirty = true;
 		}
@@ -2519,6 +2520,7 @@ void PXTGI3D::_set_glow(int p_index, const Color &p_glow) {
 		record[22] = p_glow.b;
 		if (uint32_t(p_index) < entry_slot.size() && entry_slot[p_index] >= 0) {
 			memcpy(&ordered_floats[entry_slot[p_index] * PF + 20], &record[20], 3 * sizeof(float));
+			touched_slots.push_back(entry_slot[p_index]);
 		}
 		radiance_dirty = true;
 	}
@@ -2529,6 +2531,7 @@ void PXTGI3D::_set_glow(int p_index, const Color &p_glow) {
 // rebuilds its part of the tree (a static shape that moves joins the moving part); a look alone is rewritten in place.
 void PXTGI3D::_update_primitives(PhysXGIEffect::Snapshot &r_snapshot) {
 	constexpr int PF = PhysXGIEffect::PRIMITIVE_FLOATS;
+	constexpr int NF = PhysXGIEffect::NODE_FLOATS;
 	// Once the shared effect reports terminal fallback, publish a spatial SAH tree
 	// before software tracing resumes, without changing the user's
 	// requested mode. The returned Ref keeps the effect alive during the atomic read.
@@ -2550,9 +2553,9 @@ void PXTGI3D::_update_primitives(PhysXGIEffect::Snapshot &r_snapshot) {
 		}
 	}
 	pending_meshes.clear();
-	// Batch lifecycle changes over at most ten frames. An explicit notification
-	// applies its affected membership before this publication.
-	if (tracked_root.is_null() || (!pending_membership.is_empty() && (membership_immediate || ++frames_since_rescan >= 10))) {
+	// Batch lifecycle changes over at most membership_batch_frames (ten unless the scene asks for longer). An explicit
+	// notification applies its affected membership before this publication.
+	if (tracked_root.is_null() || (!pending_membership.is_empty() && (membership_immediate || ++frames_since_rescan >= membership_batch_frames))) {
 		const uint64_t since = OS::get_singleton()->get_ticks_usec();
 		// Refresh shared geometry before membership edits consume its current revision.
 		_refresh_geometry();
@@ -2654,6 +2657,7 @@ void PXTGI3D::_update_primitives(PhysXGIEffect::Snapshot &r_snapshot) {
 				moving_dirty = true;
 			} else if (uint32_t(i) < entry_slot.size() && entry_slot[i] >= 0) {
 				memcpy(&ordered_floats[entry_slot[i] * PF], record, sizeof(scratch));
+				touched_slots.push_back(entry_slot[i]);
 				radiance_dirty = true;
 			}
 		}
@@ -2672,35 +2676,123 @@ void PXTGI3D::_update_primitives(PhysXGIEffect::Snapshot &r_snapshot) {
 		const uint64_t copy_since = OS::get_singleton()->get_ticks_usec();
 		// Reuse an older publication, not the current snapshot. If rendering still
 		// holds it, resize/ptrw detaches through COW before any write takes place.
+		// The older publication still holds the static part as it was published then: when the static layout is the
+		// same, only what changed since is written -- the static records edited in place by the publications after it
+		// (touch_history) and everything after the static part. A city's static part is megabytes; something moves
+		// every frame.
+		primitives_version++;
+		TouchRecord &touched_now = touch_history[primitives_version % TOUCH_HISTORY];
+		touched_now.version = primitives_version;
+		touched_now.slots = touched_slots;
 		Vector<float> &next_primitives = primitive_spares[publication_spare];
+		BufferStamp &next_primitives_stamp = primitive_spare_stamps[publication_spare];
+		bool patch_primitives = next_primitives_stamp.static_version == static_version && next_primitives_stamp.version < primitives_version &&
+				primitives_version - next_primitives_stamp.version < TOUCH_HISTORY && uint32_t(next_primitives.size()) >= static_record_floats;
+		for (uint64_t v = next_primitives_stamp.version + 1; patch_primitives && v <= primitives_version; v++) {
+			patch_primitives = touch_history[v % TOUCH_HISTORY].version == v;
+		}
 		next_primitives.resize(ordered_floats.size());
 		if (ordered_floats.size()) {
-			memcpy(next_primitives.ptrw(), ordered_floats.ptr(), ordered_floats.size() * sizeof(float));
+			float *out = next_primitives.ptrw();
+			if (patch_primitives) {
+				for (uint64_t v = next_primitives_stamp.version + 1; v <= primitives_version; v++) {
+					for (uint32_t slot : touch_history[v % TOUCH_HISTORY].slots) {
+						if (slot < static_leaves) {
+							memcpy(out + slot * PF, &ordered_floats[slot * PF], PF * sizeof(float));
+						}
+					}
+				}
+				if (ordered_floats.size() > static_record_floats) {
+					memcpy(out + static_record_floats, ordered_floats.ptr() + static_record_floats, (ordered_floats.size() - static_record_floats) * sizeof(float));
+				}
+			} else {
+				memcpy(out, ordered_floats.ptr(), ordered_floats.size() * sizeof(float));
+			}
 		}
+		next_primitives_stamp.static_version = static_version;
+		next_primitives_stamp.version = primitives_version;
 		SWAP(published_primitives, next_primitives);
+		SWAP(published_primitives_stamp, next_primitives_stamp);
 		if (rebuilt) {
 			Vector<Pair<uint64_t, uint64_t>> &next_ids = id_spares[publication_spare];
+			BufferStamp &next_ids_stamp = id_spare_stamps[publication_spare];
+			// The older publication's own static identities, when it was laid out as this one is.
+			const bool ids_in_place = next_ids_stamp.static_version == static_version && uint32_t(next_ids.size()) >= static_leaves;
 			next_ids.resize_uninitialized(leaf_order.size());
 			Pair<uint64_t, uint64_t> *ids = next_ids.ptrw();
-			const uint32_t kept = keep_static_prefix && published_ids.size() >= int(static_leaves) ? static_leaves : 0;
-			if (kept) {
-				memcpy(ids, published_ids.ptr(), kept * sizeof(Pair<uint64_t, uint64_t>));
+			uint32_t kept = ids_in_place ? static_leaves : 0;
+			if (!ids_in_place && keep_static_prefix && published_ids.size() >= int(static_leaves)) {
+				kept = static_leaves;
+				if (kept) {
+					memcpy(ids, published_ids.ptr(), kept * sizeof(Pair<uint64_t, uint64_t>));
+				}
 			}
 			for (uint32_t k = kept; k < leaf_order.size(); k++) {
 				const ShapeEntry &entry = shapes[leaf_order[k]];
 				ids[k] = { uint64_t(entry.shape_node), entry.motion_generation };
 			}
+			next_ids_stamp.static_version = static_version;
 			SWAP(published_ids, next_ids);
+			SWAP(published_ids_stamp, next_ids_stamp);
 			Vector<float> &next_nodes = node_spares[publication_spare];
+			BufferStamp &next_nodes_stamp = node_spare_stamps[publication_spare];
+			// The static nodes follow the shared root and are never edited in place: an older publication on this
+			// static layout only needs the root and the moving nodes after them.
+			const bool patch_nodes = next_nodes_stamp.static_version == static_version && uint32_t(next_nodes.size()) >= static_node_floats && static_node_floats >= uint32_t(NF);
 			next_nodes.resize(tree_nodes.size());
 			if (tree_nodes.size()) {
-				memcpy(next_nodes.ptrw(), tree_nodes.ptr(), tree_nodes.size() * sizeof(float));
+				float *out = next_nodes.ptrw();
+				if (patch_nodes) {
+					memcpy(out, tree_nodes.ptr(), NF * sizeof(float));
+					if (tree_nodes.size() > static_node_floats) {
+						memcpy(out + static_node_floats, tree_nodes.ptr() + static_node_floats, (tree_nodes.size() - static_node_floats) * sizeof(float));
+					}
+				} else {
+					memcpy(out, tree_nodes.ptr(), tree_nodes.size() * sizeof(float));
+				}
 			}
+			next_nodes_stamp.static_version = static_version;
 			SWAP(published_nodes, next_nodes);
+			SWAP(published_nodes_stamp, next_nodes_stamp);
 		}
 		published_count = leaf_order.size();
-		primitives_version++;
+		if (rebuilt) {
+			nodes_version++;
+		}
 		radiance_dirty = false;
+		// The static records edited in place since the last publication, as a few runs (near ones joined: a run is
+		// one upload). They only describe this one publication; a rebuilt static part is sent whole.
+		r_snapshot.touched_count = 0;
+		if (!touched_slots.is_empty() && keep_static_prefix) {
+			touched_slots.sort();
+			uint32_t gap = 64;
+			while (true) {
+				int runs = 0;
+				bool fits = true;
+				for (uint32_t k = 0; k < touched_slots.size(); k++) {
+					const uint32_t slot = touched_slots[k];
+					if (slot >= static_leaves) {
+						break; // the moving records follow and are sent anyway
+					}
+					if (runs > 0 && slot <= r_snapshot.touched_last[runs - 1] + gap) {
+						r_snapshot.touched_last[runs - 1] = MAX(r_snapshot.touched_last[runs - 1], slot);
+					} else if (runs < PhysXGIEffect::Snapshot::MAX_TOUCHED) {
+						r_snapshot.touched_first[runs] = slot;
+						r_snapshot.touched_last[runs] = slot;
+						runs++;
+					} else {
+						fits = false;
+						break;
+					}
+				}
+				if (fits) {
+					r_snapshot.touched_count = runs;
+					break;
+				}
+				gap *= 4;
+			}
+		}
+		touched_slots.clear();
 		_stage(STAGE_COPY, copy_since);
 	}
 	if (trace_mode >= 2) {
@@ -2708,17 +2800,24 @@ void PXTGI3D::_update_primitives(PhysXGIEffect::Snapshot &r_snapshot) {
 		// Which mesh each leaf is, and the meshes' triangles (only when the geometry was laid out again).
 		if (copy_keys) {
 			Vector<uint64_t> &next_keys = key_spares[publication_spare];
+			BufferStamp &next_keys_stamp = key_spare_stamps[publication_spare];
+			const bool keys_in_place = next_keys_stamp.static_version == static_version && uint32_t(next_keys.size()) >= static_leaves;
 			next_keys.resize(leaf_order.size());
 			uint64_t *keys = next_keys.ptrw();
-			const uint32_t kept = keep_static_prefix && published_keys.size() >= int(static_leaves) ? static_leaves : 0;
-			if (kept) {
-				memcpy(keys, published_keys.ptr(), kept * sizeof(uint64_t));
+			uint32_t kept = keys_in_place ? static_leaves : 0;
+			if (!keys_in_place && keep_static_prefix && published_keys.size() >= int(static_leaves)) {
+				kept = static_leaves;
+				if (kept) {
+					memcpy(keys, published_keys.ptr(), kept * sizeof(uint64_t));
+				}
 			}
 			for (uint32_t k = kept; k < leaf_order.size(); k++) {
 				const ShapeEntry &entry = shapes[leaf_order[k]];
 				keys[k] = entry.geometry_type == 5 ? entry.geometry_key : 0;
 			}
+			next_keys_stamp.static_version = static_version;
 			SWAP(published_keys, next_keys);
+			SWAP(published_keys_stamp, next_keys_stamp);
 		}
 		r_snapshot.primitive_keys = published_keys;
 		r_snapshot.primitive_groups = published_groups;
@@ -2737,6 +2836,8 @@ void PXTGI3D::_update_primitives(PhysXGIEffect::Snapshot &r_snapshot) {
 	r_snapshot.hardware_layout = hardware_layout;
 	r_snapshot.static_count = static_leaves;
 	r_snapshot.static_version = static_version;
+	r_snapshot.static_node_count = static_node_floats / PhysXGIEffect::NODE_FLOATS;
+	r_snapshot.nodes_version = nodes_version;
 	r_snapshot.moving_root = moving_root_node;
 	r_snapshot.opaque_world_bounds = opaque_world_bounds;
 	r_snapshot.have_opaque_world_bounds = have_opaque_world_bounds;
@@ -3022,7 +3123,9 @@ void PXTGI3D::notify_subtree_retired(Node *p_root) {
 	while (!pending.is_empty()) {
 		Node *node = pending[pending.size() - 1];
 		pending.resize(pending.size() - 1);
-		if (entry_of.has(node->get_instance_id())) {
+		// A world that streams asks for a longer batch: a retired subtree then waits for it like any other change (its
+		// shapes stay traced until the batch; their nodes are already forgotten below).
+		if (entry_of.has(node->get_instance_id()) && membership_batch_frames <= 10) {
 			membership_immediate = true;
 		}
 		_node_removed(node);
@@ -3087,6 +3190,7 @@ void PXTGI3D::_apply_body_look(const LocalVector<int> &p_entries, const Pair<Col
 			record[18] = albedo.b;
 			if (entry_slot[i] >= 0) {
 				memcpy(&ordered_floats[entry_slot[i] * PF + 16], &record[16], 3 * sizeof(float));
+				touched_slots.push_back(entry_slot[i]);
 			}
 			radiance_dirty = true;
 		}
@@ -3648,6 +3752,7 @@ void PXTGI3D::_publish() {
 		return;
 	}
 	const uint64_t publish_since = OS::get_singleton()->get_ticks_usec();
+	publish_serial++;
 	PhysXGIEffect::Snapshot s;
 	s.intensity = intensity;
 	s.max_distance = max_distance;
@@ -3687,41 +3792,57 @@ void PXTGI3D::_publish() {
 		// feet. Those chosen last frame get a head start, so the set changes gradually as the camera moves. Scored from
 		// the records' world bounds: no node is read.
 		const Vector3 view_end = eye + eye_forward * 3.0f;
+		// Scoring every emissive of a city is this stage's cost, and the chosen set changes slowly: score on every
+		// fourth publication (and at once when the shapes' indices moved); the others fill their samples from the
+		// kept choice, at this frame's poses and colours.
+		bool rescore = (publish_serial & 3) == 0;
 		if (chosen_emissives_for != shapes.size()) {
 			// Shape indices moved: the head start would go to other shapes.
 			chosen_emissives.clear();
 			chosen_emissives_for = shapes.size();
+			rescore = true;
 		}
-		LocalVector<Pair<float, int>> scored;
-		scored.reserve(emissive_entries.size());
-		for (int i : emissive_entries) {
-			if (!shapes[i].sample_emission || !entry_valid[i]) {
-				continue;
+		if (rescore) {
+			LocalVector<Pair<float, int>> scored;
+			scored.reserve(emissive_entries.size());
+			for (int i : emissive_entries) {
+				if (!shapes[i].sample_emission || !entry_valid[i]) {
+					continue;
+				}
+				const AABB &bounds = entry_bounds[i];
+				const Vector3 center = bounds.get_center();
+				const float face = MAX(MAX(bounds.size.x * bounds.size.y, bounds.size.y * bounds.size.z), bounds.size.x * bounds.size.z);
+				const Vector3 nearest = Geometry3D::get_closest_point_to_segment(center, eye, view_end);
+				float score = shapes[i].emission.get_luminance() * face / MAX(center.distance_squared_to(nearest), 1.0f);
+				if (chosen_emissives.has(i)) {
+					score *= 2.0f;
+				}
+				if (score > 0.0f) {
+					scored.push_back(Pair<float, int>(-score, i));
+				}
 			}
-			const AABB &bounds = entry_bounds[i];
-			const Vector3 center = bounds.get_center();
-			const float face = MAX(MAX(bounds.size.x * bounds.size.y, bounds.size.y * bounds.size.z), bounds.size.x * bounds.size.z);
-			const Vector3 nearest = Geometry3D::get_closest_point_to_segment(center, eye, view_end);
-			float score = shapes[i].emission.get_luminance() * face / MAX(center.distance_squared_to(nearest), 1.0f);
-			if (chosen_emissives.has(i)) {
-				score *= 2.0f;
+			const uint32_t chosen = MIN(scored.size(), uint32_t(PhysXGIEffect::Snapshot::MAX_EMISSIVES));
+			std::partial_sort(scored.ptr(), scored.ptr() + chosen, scored.ptr() + scored.size(), [](const Pair<float, int> &a, const Pair<float, int> &b) {
+				return a.first < b.first || (a.first == b.first && a.second < b.second);
+			});
+			float total = 0.0f;
+			for (uint32_t c = 0; c < chosen; c++) {
+				total += -scored[c].first;
 			}
-			if (score > 0.0f) {
-				scored.push_back(Pair<float, int>(-score, i));
+			chosen_emissives.clear();
+			chosen_list.clear();
+			for (uint32_t c = 0; c < chosen; c++) {
+				// Three quarters by the light it gives, a quarter evenly: none goes unpicked for long.
+				chosen_list.push_back(Pair<int, float>(scored[c].second, 0.75f * (-scored[c].first) / MAX(total, 1e-12f) + 0.25f / float(chosen)));
+				chosen_emissives.insert(scored[c].second);
 			}
 		}
-		const uint32_t chosen = MIN(scored.size(), uint32_t(PhysXGIEffect::Snapshot::MAX_EMISSIVES));
-		std::partial_sort(scored.ptr(), scored.ptr() + chosen, scored.ptr() + scored.size(), [](const Pair<float, int> &a, const Pair<float, int> &b) {
-			return a.first < b.first || (a.first == b.first && a.second < b.second);
-		});
-		float total = 0.0f;
-		for (uint32_t c = 0; c < chosen; c++) {
-			total += -scored[c].first;
-		}
-		chosen_emissives.clear();
 		s.emissive_count = 0;
-		for (uint32_t c = 0; c < chosen; c++) {
-			const int e = scored[c].second;
+		for (const Pair<int, float> &choice : chosen_list) {
+			const int e = choice.first;
+			if (uint32_t(e) >= shapes.size() || !shapes[e].sample_emission || !entry_valid[e]) {
+				continue; // gone since it was scored
+			}
 			Transform3D frame;
 			AABB local;
 			_record_frame(e, frame, local);
@@ -3739,9 +3860,7 @@ void PXTGI3D::_publish() {
 			// reads this from a glowing mesh's normals; our emitters are authored boxes with no mesh of their own.
 			const Vector3 &facing = shapes[e].emission_facing;
 			s.emissive_facing[k] = facing.length_squared() > 0.0f ? frame.basis.xform(facing).normalized() : Vector3();
-			// Three quarters by the light it gives, a quarter evenly: none goes unpicked for long.
-			s.emissive_pick[k] = 0.75f * (-scored[c].first) / MAX(total, 1e-12f) + 0.25f / float(chosen);
-			chosen_emissives.insert(e);
+			s.emissive_pick[k] = choice.second;
 		}
 		_stage(STAGE_SELECT, select_since);
 	}
@@ -3869,6 +3988,15 @@ void PXTGI3D::_publish() {
 	// Every light and sampled emissive of the scene, not the ones chosen for the camera: riding about changes which are
 	// chosen, not the light. Glowing shapes that are only ever hit by rays (ribbon walls, merged city meshes) come and
 	// go all match long and are left out: the cache follows them at its ordinary pace.
+	// Read on every fourth publication: every light and emitter of a city is a few thousand reads, and a source
+	// that changed three frames ago is soon enough for a sixty-frame refresh.
+	if ((publish_serial & 3) != 2) {
+		if (fresh_frames > 0) {
+			fresh_frames--;
+		}
+		_stage(STAGE_PUBLISH, publish_since);
+		return;
+	}
 	uint32_t sampled_emitters = 0;
 	uint32_t sources = hash_murmur3_one_32(omnis.size() | (spots.size() << 10));
 	sources = hash_murmur3_one_float(s.sun_color.r + s.sun_color.g * 3.1f + s.sun_color.b * 7.3f, sources);
@@ -3983,6 +4111,8 @@ void PXTGI3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_reflection_resolution_scale"), &PXTGI3D::get_reflection_resolution_scale);
 	ClassDB::bind_method(D_METHOD("set_rays_per_texel", "rays"), &PXTGI3D::set_rays_per_texel);
 	ClassDB::bind_method(D_METHOD("get_rays_per_texel"), &PXTGI3D::get_rays_per_texel);
+	ClassDB::bind_method(D_METHOD("set_membership_batch_frames", "frames"), &PXTGI3D::set_membership_batch_frames);
+	ClassDB::bind_method(D_METHOD("get_membership_batch_frames"), &PXTGI3D::get_membership_batch_frames);
 	ClassDB::bind_method(D_METHOD("set_emissive_candidates", "candidates"), &PXTGI3D::set_emissive_candidates);
 	ClassDB::bind_method(D_METHOD("get_emissive_candidates"), &PXTGI3D::get_emissive_candidates);
 	ClassDB::bind_method(D_METHOD("set_blue_noise", "enabled"), &PXTGI3D::set_blue_noise);
@@ -4007,9 +4137,10 @@ void PXTGI3D::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "reflection_distance", PROPERTY_HINT_RANGE, "1,300,0.5,or_greater,suffix:m"), "set_reflection_distance", "get_reflection_distance");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "filtered_reflections"), "set_filtered_reflections", "get_filtered_reflections");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "reflection_softness", PROPERTY_HINT_RANGE, "1,8,0.1"), "set_reflection_softness", "get_reflection_softness");
-	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "reflection_resolution_scale", PROPERTY_HINT_RANGE, "0.5,1,0.5"), "set_reflection_resolution_scale", "get_reflection_resolution_scale");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "reflection_resolution_scale", PROPERTY_HINT_RANGE, "0.25,1,0.25"), "set_reflection_resolution_scale", "get_reflection_resolution_scale");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "rays_per_texel", PROPERTY_HINT_RANGE, "1,4,1"), "set_rays_per_texel", "get_rays_per_texel");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "emissive_candidates", PROPERTY_HINT_RANGE, "1,16,1"), "set_emissive_candidates", "get_emissive_candidates");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "membership_batch_frames", PROPERTY_HINT_RANGE, "1,600,1"), "set_membership_batch_frames", "get_membership_batch_frames");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "multi_bounce"), "set_multi_bounce", "get_multi_bounce");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "blue_noise"), "set_blue_noise", "get_blue_noise");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "gi_history_clamp"), "set_gi_history_clamp", "get_gi_history_clamp");

@@ -185,6 +185,15 @@ public:
 		bool hardware_layout = false; // defer software tracing until a spatial SAH snapshot replaces this one
 		int static_count = 0; // the static primitives, first in leaf order
 		uint64_t static_version = 0;
+		// For sending only what changed, when this publication directly follows the one the GPU buffers hold and the
+		// static part kept its layout: the moving primitives and nodes (after the static ones) and the shared root
+		// are sent again; touched_* are the runs of static primitives whose look was edited in place.
+		int static_node_count = 0; // the shared root and the static nodes, first in the node buffer
+		uint64_t nodes_version = 0; // the tree: bumped when it is rebuilt
+		static constexpr int MAX_TOUCHED = 24;
+		int touched_count = 0;
+		uint32_t touched_first[MAX_TOUCHED] = {};
+		uint32_t touched_last[MAX_TOUCHED] = {};
 		int moving_root = -1; // the software walk's moving part (unused by hardware tracing)
 		// Hardware tracing (trace_mode 2, 3): each leaf's mesh id (0: a box), the meshes' triangles by id.
 		Vector<uint64_t> primitive_keys;
@@ -301,6 +310,8 @@ private:
 	RID primitive_buffer;
 	int primitive_capacity = 0;
 	uint64_t primitives_uploaded = UINT64_MAX;
+	uint64_t primitives_static_uploaded = UINT64_MAX; // the static layout the GPU buffers hold
+	uint64_t nodes_uploaded = UINT64_MAX;
 	RID node_buffer;
 	int node_capacity = 0;
 	RID geometry_buffer;
