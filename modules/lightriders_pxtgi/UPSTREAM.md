@@ -31,6 +31,19 @@ replaces border-sampler reads. Lens extraction bounds non-finite HDR inputs. A l
 without feeding blurred output back into temporal history. These effects remain
 opt-in through the game experiment.
 
+Local changes of 2026-11-13, for the game's ray traced Lighting:
+
+- `reflection_jitter`: a reflection ray starts at a point drawn in its texel (blue noise, anew each frame or
+  fixed) instead of the texel's middle, on the pixel's own surface: a reflected line thinner than a texel is
+  met as often as it covers it instead of as rows of beads.
+- `PXTGI3D.hardware_fallback()` (static): hardware ray queries were asked for and the renderer fell back to the
+  software walk for good. The game reads it to leave tracing rather than run the walk unannounced.
+- Main-thread cost in a streamed city: `update_terrain_visibility` decides every record each frame from a copy
+  whose inputs it reads again an eighth a frame; the nearest lamps are chosen from a shortlist between looks at
+  every lamp (each eighth publication); emissives are scored every eighth and the light sources hashed every
+  sixteenth publication; the verification slices are 24 records. `get_stats` adds the `items`, `lights`,
+  `settings` and `sources` clocks and the render thread's time in the frame callback (`render_thread`).
+
 ## Upstream audit
 
 Port basis `e2b3875` (2026-10-28). Audited through `7d46568e4e` (2026-11-09): the PXTGI

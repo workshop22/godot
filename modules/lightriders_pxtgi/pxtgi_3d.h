@@ -98,6 +98,7 @@ class PXTGI3D : public Node3D {
 	float world_ray_distance = 30.0f;
 	float reflection_distance = 60.0f;
 	bool filtered_reflections = false;
+	int reflection_jitter = 0;
 	float reflection_softness = 1.0f;
 	float reflection_resolution_scale = 1.0f;
 	int debug = 0;
@@ -235,6 +236,10 @@ class PXTGI3D : public Node3D {
 	int fresh_frames = 0;
 	LocalVector<ObjectID> omnis;
 	LocalVector<ObjectID> spots;
+	// The lamps weighed between two looks at every one of them (_publish): the nearest then, twice what a frame takes.
+	LocalVector<ObjectID> near_omnis;
+	LocalVector<ObjectID> near_spots;
+	uint32_t near_lights_for = UINT32_MAX; // omnis + spots when the shortlists were made
 	LocalVector<ObjectID> probes; // ReflectionProbes: where they override the GI, it isn't traced
 
 	// The nodes the GI keeps track of (lights, reflection probes, the collision shapes of bodies, meshes outside any
@@ -403,6 +408,10 @@ class PXTGI3D : public Node3D {
 		STAGE_TERRAIN_LOOP,
 		STAGE_TERRAIN_NOTIFY,
 		STAGE_GEOMETRY_BAKED,
+		STAGE_ITEMS, // set_reflection_items, before the publication it starts
+		STAGE_LIGHTS, // the sun, the nearest lamps and the probes read
+		STAGE_SETTINGS, // the snapshot handed to the render thread
+		STAGE_SOURCES, // every sixteenth publication's hash of the light sources
 		STAGE_MAX,
 	};
 	struct StageTime {
@@ -418,6 +427,27 @@ class PXTGI3D : public Node3D {
 	uint64_t terrain_changed = 0;
 	uint64_t terrain_removed = 0;
 	uint64_t terrain_parent_matches = 0;
+	// update_terrain_visibility's copy of what each of the caller's records was last read as: its nodes, whether its
+	// source is shown, and the distances its level is drawn between. Parallel to the caller's array.
+	struct TerrainRow {
+		ObjectID body;
+		ObjectID source;
+		bool terrain = false;
+		bool source_visible = false;
+		bool visible = false; // the body, as last read or written
+		Vector3 center; // a tile's own origin, a rock's body
+		bool near_on = false; // a tile gives way to its children nearer than near_limit
+		double near_limit = 0.0;
+		bool far_on = false; // a tile gives way to its parent at far_limit of the parent's centre
+		Vector3 parent_center;
+		double far_limit = 0.0;
+		bool has_lod = false; // a rock's fade range
+		Vector4 lod;
+		double pair = 1.0;
+	};
+	LocalVector<TerrainRow> terrain_rows;
+	uint32_t terrain_cursor = 0;
+	bool _read_terrain_row(const Array &p_record, TerrainRow &r_row);
 	String last_change; // what last made the shapes need finding again
 	PackedStringArray rescan_causes; // since the stats were last read
 	void _stage(Stage p_stage, uint64_t p_since);
@@ -453,6 +483,10 @@ public:
 	void clear_bodies_runtime_look(const Array &p_bodies, bool p_restore_authored = true);
 	void update_emitter_group(const PackedInt64Array &p_bodies, const PackedFloat32Array &p_stations, const Dictionary &p_values, double p_time);
 	Dictionary get_stats(bool p_reset = true);
+	// Hardware ray queries were asked for and the renderer fell back to the software walk for good (no ray queries, a
+	// program that would not compile, a failed first-use test, the Auto policy's vendor or crash guard). False until
+	// program preparation or a frame has tried; it stays set for the process.
+	static bool hardware_fallback();
 
 private:
 	bool active = false; // in the world and visible: delivering the GI
@@ -479,6 +513,8 @@ public:
 	float get_reflection_distance() const { return reflection_distance; }
 	void set_filtered_reflections(bool p_value) { filtered_reflections = p_value; }
 	bool get_filtered_reflections() const { return filtered_reflections; }
+	void set_reflection_jitter(int p_value) { reflection_jitter = CLAMP(p_value, 0, 2); }
+	int get_reflection_jitter() const { return reflection_jitter; }
 	void set_reflection_softness(float p_value) { reflection_softness = CLAMP(p_value, 1.0f, 8.0f); }
 	float get_reflection_softness() const { return reflection_softness; }
 	void set_reflection_resolution_scale(float p_value) { reflection_resolution_scale = CLAMP(p_value, 0.25f, 1.0f); }

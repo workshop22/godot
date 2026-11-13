@@ -239,6 +239,7 @@ public:
 		float world_distance = 30.0f; // how far a GI ray goes against the collision shapes
 		float reflection_distance = 60.0f;
 		bool filtered_reflections = false;
+		int reflection_jitter = 0; // 0: a reflection ray starts at the middle of its texel, 1: at a point drawn each frame, 2: at a fixed drawn point
 		float reflection_softness = 1.0f;
 		float reflection_resolution_scale = 1.0f;
 		int rays_per_texel = 4;
@@ -429,6 +430,9 @@ public:
 	static Ref<PhysXGIEffect> get_shared();
 	static void free_shared();
 	bool has_hardware_fallback() const { return hw_terminal_fallback.load(); }
+	// The render thread's time in this effect's frame callback since the last reset: microseconds in all, the worst
+	// frame and the frames (the main thread's clocks are PXTGI3D::get_stats).
+	static Dictionary render_stats(bool p_reset);
 
 	PhysXGIEffect();
 	~PhysXGIEffect();

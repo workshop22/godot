@@ -137,7 +137,7 @@ layout(set = 0, binding = 9, std140) uniform Frame {
 	vec4 opaque_low; // w: the scene has opaque geometry
 	vec4 opaque_high;
 	vec4 item_trace; // material count, hero emission, valid reflection source, source mip count
-	vec4 hw; // hardware trace spike: x: the moving part's root node (-1: none)
+	vec4 hw; // x: the moving part's root node (-1: none), y: reflection rays start at a drawn point of their texel (1: anew each frame, 2: the same each frame)
 }
 f;
 
@@ -1680,6 +1680,19 @@ void main() {
 		return;
 	}
 	ivec2 fp = frame_pixel(px, pc.size.xy);
+	// Where in this texel's footprint its ray starts: the middle, or (reflection_jitter) a point drawn anew each frame,
+	// so a reflected line thinner than the footprint is met as often as it covers it instead of by every texel along
+	// one stretch and none along the next. The softening and the short history average the draws.
+	vec2 at = vec2(fp);
+	if (f.hw.y > 0.5) {
+		float turn = f.hw.y > 1.5 ? 0.0 : f.misc.x;
+		// Blue noise whatever the tier: the softening averages neighbouring draws, and an even spread of them leaves
+		// a thin line whole where the gradient noise's rows left it beaded.
+		vec2 draw = vec2(fract(texelFetch(blue_noise, (px + ivec2(5, 59)) & 63, 0).r + turn * 0.7548776662), fract(texelFetch(blue_noise, (px + ivec2(37, 11)) & 63, 0).r + turn * 0.5698402910));
+		vec2 point = (vec2(px) + draw) * vec2(f.sizes.xy) / vec2(pc.size.xy);
+		fp = clamp(ivec2(point), ivec2(0), f.sizes.xy - 1);
+		at = point - 0.5;
+	}
 	float depth = texelFetch(depth_tex, fp, 0).r;
 	vec4 nr = texelFetch(normal_tex, fp, 0);
 	float rough = decode_roughness(nr.w);
@@ -1691,6 +1704,18 @@ void main() {
 	}
 	vec3 n = normalize(nr.xyz * 2.0 - 1.0);
 	vec3 p = view_from_pixel(vec2(fp), depth, f.proj_info, f.clip.x, f.clip.y);
+	// A normal map can turn a grazing reflection back into its own receiver. Keep
+	// the authored shading normal, but use the geometric surface for the origin
+	// bias and Godot SSR's below-surface bounce correction.
+	vec3 geometry_normal = reflection_geometry_normal(fp, depth, p, n);
+	if (f.hw.y > 0.5) {
+		// The drawn point lies on the pixel's own surface, not at its depth: on a floor seen at a grazing angle the two
+		// are far apart, and a start under the surface would meet it at once.
+		vec3 along = view_from_pixel(at, depth, f.proj_info, f.clip.x, f.clip.y);
+		float facing = dot(along, geometry_normal);
+		float scale = abs(facing) > 1e-6 ? dot(p, geometry_normal) / facing : 1.0;
+		p = along * clamp(scale, 0.9, 1.1);
+	}
 	if (probe_overrides((f.view_to_world * vec4(p, 1.0)).xyz, 2)) {
 		imageStore(dst, px, vec4(0.0));
 		imageStore(hit_dst, px, vec4(0.0));
@@ -1718,10 +1743,6 @@ void main() {
 		dir = reflect(v, n);
 	}
 
-	// A normal map can turn a grazing reflection back into its own receiver. Keep
-	// the authored shading normal, but use the geometric surface for the origin
-	// bias and Godot SSR's below-surface bounce correction.
-	vec3 geometry_normal = reflection_geometry_normal(fp, depth, p, n);
 	vec3 motion_normal = n;
 	if (dot(dir, geometry_normal) < 0.0) {
 		dir = normalize(reflect(dir, geometry_normal));
@@ -2694,6 +2715,29 @@ void PhysXGIEffect::detach_world(const ObjectID &p_world) {
 	PhysXCompositorEffects::uninstall(p_world, PhysXGISourceEffect::get_shared());
 }
 
+static std::atomic<uint64_t> render_total_us{ 0 };
+static std::atomic<uint64_t> render_worst_us{ 0 };
+static std::atomic<uint64_t> render_frames{ 0 };
+static std::atomic<uint64_t> render_hardware_us{ 0 };
+static std::atomic<uint64_t> render_geometry_us{ 0 };
+
+Dictionary PhysXGIEffect::render_stats(bool p_reset) {
+	Dictionary stats;
+	stats["total_us"] = int64_t(render_total_us.load());
+	stats["worst_us"] = int64_t(render_worst_us.load());
+	stats["calls"] = int64_t(render_frames.load());
+	stats["hardware_us"] = int64_t(render_hardware_us.load());
+	stats["geometry_us"] = int64_t(render_geometry_us.load());
+	if (p_reset) {
+		render_total_us.store(0);
+		render_worst_us.store(0);
+		render_frames.store(0);
+		render_hardware_us.store(0);
+		render_geometry_us.store(0);
+	}
+	return stats;
+}
+
 void PhysXGIEffect::install(World3D *p_world, Camera3D *p_camera) {
 	ERR_FAIL_NULL(p_world);
 	ERR_FAIL_COND(!worlds.has(p_world->get_instance_id()));
@@ -3637,6 +3681,13 @@ void PhysXGIEffect::_render(int p_callback_type, const RenderData *p_render_data
 	_render_frame(p_callback_type, p_render_data);
 	const uint64_t now = OS::get_singleton()->get_ticks_usec();
 	rt_last_us = now;
+	render_total_us.fetch_add(now - since);
+	render_frames.fetch_add(1);
+	render_hardware_us.fetch_add(hw_update_us);
+	render_geometry_us.fetch_add(geometry_update_us);
+	uint64_t worst = render_worst_us.load();
+	while (now - since > worst && !render_worst_us.compare_exchange_weak(worst, now - since)) {
+	}
 	if (rt_timing() && (now - since > 8000 || gap > 40000)) {
 		print_line(vformat("PXTGI_RT frame %d: since last frame %.1f ms, GI recording %.1f ms (hardware update %.1f: static %.1f, moving %.1f), motion %.1f ms, geometry %.1f ms (%d KiB); moving detail %d shapes: instances %.2f ms, TLAS create %.2f ms, submit %.2f ms, TLAS instances %d", int64_t(Engine::get_singleton()->get_frames_drawn()), gap / 1000.0, (now - since) / 1000.0, hw_update_us / 1000.0, hw_static_us / 1000.0, hw_moving_us / 1000.0, motion_update_us / 1000.0, geometry_update_us / 1000.0, int64_t(geometry_update_bytes / 1024), hw_moving_count, hw_moving_instances_us / 1000.0, hw_moving_create_us / 1000.0, hw_moving_submit_us / 1000.0, hw_moving_instance_count));
 	}
@@ -4044,6 +4095,7 @@ void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_rende
 	data.counts[0] = s.primitive_count;
 	data.counts[1] = s.trace_mode == 1 ? 0 : s.node_count; // trace mode 1: world rays find nothing (their share)
 	data.hw[0] = float(s.moving_root);
+	data.hw[1] = float(s.reflection_jitter);
 	// Hardware tracing for this frame's world rays (trace, reflect, cache) when it is asked for and everything is up
 	// to date; the software walk otherwise.
 	const uint64_t hw_since = OS::get_singleton()->get_ticks_usec();

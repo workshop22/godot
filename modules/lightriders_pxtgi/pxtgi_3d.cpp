@@ -683,6 +683,14 @@ LocalVector<Pair<Light3D *, float>> nearest_lights(const LocalVector<ObjectID> &
 	return chosen;
 }
 
+// The ids of up to p_max of them: the lamps the publications between two looks at every lamp weigh.
+void nearest_light_ids(const LocalVector<ObjectID> &p_lights, const Vector3 &p_eye, int p_max, LocalVector<ObjectID> &r_ids) {
+	r_ids.clear();
+	for (const Pair<Light3D *, float> &l : nearest_lights(p_lights, p_eye, p_max)) {
+		r_ids.push_back(l.first->get_instance_id());
+	}
+}
+
 struct BuildItem {
 	AABB bounds;
 	Vector3 center;
@@ -1453,7 +1461,7 @@ Pair<Color, Color> PXTGI3D::_look_of(Node *p_node) const {
 // whenever a streamed cell arrives. Ignored existing nodes stay observed for restoration.
 void PXTGI3D::_restyle_slice(LocalVector<int> &r_changed) {
 	const uint32_t count = look_order.size();
-	for (uint32_t k = 0; k < MIN(count / 60 + 1, 48u) && count > 0; k++) {
+	for (uint32_t k = 0; k < MIN(count / 60 + 1, 24u) && count > 0; k++) {
 		const ObjectID id = look_order[look_cursor++ % count];
 		Node *node = ObjectDB::get_instance<Node>(id);
 		if (node == nullptr || !node->is_inside_tree()) {
@@ -2615,7 +2623,7 @@ void PXTGI3D::_update_primitives(PhysXGIEffect::Snapshot &r_snapshot) {
 			}
 		}
 	}
-	for (int k = 0; k < MIN(n / 60 + 1, 48) && n > 0; k++) {
+	for (int k = 0; k < MIN(n / 60 + 1, 24) && n > 0; k++) {
 		candidates.push_back({ int(verify_cursor++ % n), nullptr });
 	}
 	float scratch[PF];
@@ -2965,95 +2973,143 @@ void PXTGI3D::notify_bodies_changed(const Array &p_bodies) {
 	}
 }
 
-void PXTGI3D::update_terrain_visibility(Array p_records, const Vector3 &p_eye) {
-	const uint64_t since = OS::get_singleton()->get_ticks_usec();
+// One record's nodes and LOD values, read from the scene. False when either node is gone.
+bool PXTGI3D::_read_terrain_row(const Array &p_record, TerrainRow &r_row) {
 	// Internal rows are [source, body, is_terrain], shared with Trial admission.
-	// Indexed reads avoid per-record dictionary hashes and copied string keys.
 	constexpr int SOURCE = 0, BODY = 1, TERRAIN = 2;
 	static const Variant terrain_lod_key = StringName("terrain_lod"), terrain_parent_key = StringName("terrain_parent");
 	static const StringName uniforms_key("rt_instance_uniforms"), lod_range_key("lod_range"), lod_pair_key("lod_pair");
-	const Variant empty_uniforms = Dictionary();
-	const int count = p_records.size();
-	uint64_t removed = 0, parent_matches = 0;
-	Array changed;
-	// A source's MultiMesh instances are appended together. Share only its reads
-	// within this call; each rock still uses its own body's current world position.
-	// Any visibility write may invoke arbitrary callbacks, so it ends this reuse.
-	ObjectID cached_source;
-	bool source_visible = false;
-	bool terrain_ready = false, terrain_shown = false;
-	bool rock_ready = false, rock_has_lod = false;
-	Vector4 rock_lod;
-	double rock_pair = 1.0;
-	for (int i = count - 1; i >= 0; i--) {
-		const Array record = p_records[i];
-		const Variant &body_value = record[BODY];
-		Node3D *body = Object::cast_to<Node3D>(body_value.get_validated_object());
-		const Variant &source_value = record[SOURCE];
-		Node *source_parent = body ? body->get_parent() : nullptr;
-		GeometryInstance3D *source;
-		// Proxies are direct children of their source. A validated live body's
-		// matching parent needs no second ObjectDB lookup; preserve the fallback
-		// for detached/reparented records without dereferencing stored pointers.
-		if (source_parent && source_value.get_type() == Variant::OBJECT && ObjectID(source_value) == source_parent->get_instance_id()) {
-			source = Object::cast_to<GeometryInstance3D>(source_parent);
-			parent_matches += source != nullptr;
-		} else {
-			source = Object::cast_to<GeometryInstance3D>(source_value.get_validated_object());
+	Node3D *body = Object::cast_to<Node3D>(p_record[BODY].get_validated_object());
+	const Variant &source_value = p_record[SOURCE];
+	Node *source_parent = body ? body->get_parent() : nullptr;
+	GeometryInstance3D *source;
+	// Proxies are direct children of their source. A validated live body's
+	// matching parent needs no second ObjectDB lookup; preserve the fallback
+	// for detached/reparented records without dereferencing stored pointers.
+	if (source_parent && source_value.get_type() == Variant::OBJECT && ObjectID(source_value) == source_parent->get_instance_id()) {
+		source = Object::cast_to<GeometryInstance3D>(source_parent);
+		terrain_parent_matches += source != nullptr;
+	} else {
+		source = Object::cast_to<GeometryInstance3D>(source_value.get_validated_object());
+	}
+	if (source == nullptr || body == nullptr) {
+		return false;
+	}
+	r_row = TerrainRow();
+	r_row.body = body->get_instance_id();
+	r_row.source = source->get_instance_id();
+	r_row.terrain = bool(p_record[TERRAIN]);
+	r_row.source_visible = source->is_visible_in_tree();
+	r_row.visible = body->is_visible();
+	if (r_row.terrain) {
+		const Dictionary uniforms = source->get_meta(uniforms_key, Dictionary());
+		const Variant *lod_value = uniforms.getptr(terrain_lod_key);
+		const Variant *parent_value = uniforms.getptr(terrain_parent_key);
+		// InstanceUniforms.read also falls back for an explicitly null value.
+		const Vector4 lod = lod_value == nullptr || lod_value->get_type() == Variant::NIL ? Vector4(0, 0, 0.16, 0) : Vector4(*lod_value);
+		const Vector4 parent = parent_value == nullptr || parent_value->get_type() == Variant::NIL ? Vector4() : Vector4(*parent_value);
+		// Match GDScript's double scalar arithmetic after real_t vector reads.
+		const double midpoint = 1.0 - double(lod.z) * 0.5;
+		r_row.center = source->get_global_position();
+		r_row.near_on = lod.x > 0.0;
+		r_row.near_limit = double(lod.x) * midpoint;
+		r_row.far_on = parent.w > 0.5;
+		r_row.parent_center = source->get_global_transform().xform(Vector3(parent.x, parent.y, parent.z));
+		r_row.far_limit = double(lod.y) * midpoint;
+	} else {
+		r_row.center = body->get_global_position();
+		r_row.has_lod = source->has_meta(lod_range_key);
+		if (r_row.has_lod) {
+			r_row.lod = source->get_meta(lod_range_key);
+			r_row.pair = source->get_meta(lod_pair_key, 1.0);
 		}
-		if (source == nullptr || body == nullptr) {
-			cached_source = ObjectID();
-			p_records.remove_at(i);
-			removed++;
+	}
+	return true;
+}
+
+// Which terrain level and which rocks the rays meet, as the camera moves: Trial's terrain_visible for every record.
+// Every record is decided each frame, so a tile and the level that replaces it still change in the same frame; what
+// the decision reads from the scene (the nodes, the source's visibility, its LOD values and where it stands) is read
+// again an eighth of the records a frame. A city ride holds about 500 records: reading every node every frame was
+// 0.36 ms of each one (four players online, Aurora Circuit, 2026-11-13).
+void PXTGI3D::update_terrain_visibility(Array p_records, const Vector3 &p_eye) {
+	const uint64_t since = OS::get_singleton()->get_ticks_usec();
+	constexpr int BODY = 1;
+	LocalVector<int> gone;
+	// The caller appends records; only this method removes them. Anything else starts the copy again.
+	if (terrain_rows.size() > uint32_t(p_records.size())) {
+		terrain_rows.clear();
+	}
+	for (int i = terrain_rows.size(); i < p_records.size(); i++) {
+		TerrainRow row;
+		if (!_read_terrain_row(p_records[i], row)) {
+			row = TerrainRow();
+			gone.push_back(i);
+		}
+		terrain_rows.push_back(row);
+	}
+	const int count = terrain_rows.size();
+	for (int k = 0, slice = count / 8 + 1; k < slice && count > 0; k++) {
+		const int i = terrain_cursor++ % count;
+		TerrainRow &row = terrain_rows[i];
+		if (row.body.is_null()) {
+			continue; // already on its way out
+		}
+		const ObjectID was = row.body;
+		if (!_read_terrain_row(p_records[i], row)) {
+			row = TerrainRow();
+			gone.push_back(i);
+		} else if (row.body != was) {
+			// Not the record this row was read from: the array was edited elsewhere. Read it all again next frame.
+			terrain_rows.clear();
+			break;
+		}
+	}
+	Array changed;
+	for (uint32_t i = 0; i < terrain_rows.size(); i++) {
+		TerrainRow &row = terrain_rows[i];
+		if (row.body.is_null()) {
 			continue;
 		}
-		if (cached_source != source->get_instance_id()) {
-			cached_source = source->get_instance_id();
-			source_visible = source->is_visible_in_tree();
-			terrain_ready = false;
-			rock_ready = false;
+		bool shown = row.source_visible;
+		if (shown && row.terrain) {
+			// Raster dithers complementary levels. Rays need one solid surface, selected at
+			// the same transition midpoint, so parent and child never occlude one another.
+			if (row.near_on && row.center.distance_to(p_eye) < row.near_limit) {
+				shown = false;
+			} else if (row.far_on && row.parent_center.distance_to(p_eye) >= row.far_limit) {
+				shown = false;
+			}
+		} else if (shown && row.has_lod) {
+			const double distance = row.center.distance_to(p_eye);
+			const double margin = MAX(double(row.lod.z), 0.001);
+			const double fade_in = row.lod.x > 0.0 ? Math::smoothstep(double(row.lod.x) - margin, double(row.lod.x), distance) : 1.0;
+			const double fade_out = row.lod.y > 0.0 ? 1.0 - Math::smoothstep(double(row.lod.y) - margin, double(row.lod.y), distance) : 1.0;
+			shown = CLAMP(double(row.lod.w) * fade_out - row.pair * (1.0 - fade_in), 0.0, 1.0) >= 0.5;
 		}
-		bool shown = source_visible;
-		if (shown && bool(record[TERRAIN])) {
-			if (!terrain_ready) {
-				const Dictionary uniforms = source->get_meta(uniforms_key, empty_uniforms);
-				const Variant *lod_value = uniforms.getptr(terrain_lod_key);
-				const Variant *parent_value = uniforms.getptr(terrain_parent_key);
-				// InstanceUniforms.read also falls back for an explicitly null value.
-				const Vector4 lod = lod_value == nullptr || lod_value->get_type() == Variant::NIL ? Vector4(0, 0, 0.16, 0) : Vector4(*lod_value);
-				const Vector4 parent = parent_value == nullptr || parent_value->get_type() == Variant::NIL ? Vector4() : Vector4(*parent_value);
-				// Match GDScript's double scalar arithmetic after real_t vector reads.
-				const double midpoint = 1.0 - double(lod.z) * 0.5;
-				terrain_shown = true;
-				if (lod.x > 0.0 && source->get_global_position().distance_to(p_eye) < double(lod.x) * midpoint) {
-					terrain_shown = false;
-				} else if (parent.w > 0.5 && source->get_global_transform().xform(Vector3(parent.x, parent.y, parent.z)).distance_to(p_eye) >= double(lod.y) * midpoint) {
-					terrain_shown = false;
-				}
-				terrain_ready = true;
+		if (row.visible != shown) {
+			Node3D *body = ObjectDB::get_instance<Node3D>(row.body);
+			if (body == nullptr) {
+				row = TerrainRow();
+				gone.push_back(i);
+				continue;
 			}
-			shown = terrain_shown;
-		} else if (shown) {
-			if (!rock_ready) {
-				rock_has_lod = source->has_meta(lod_range_key);
-				if (rock_has_lod) {
-					rock_lod = source->get_meta(lod_range_key);
-					rock_pair = source->get_meta(lod_pair_key, 1.0);
-				}
-				rock_ready = true;
-			}
-			if (rock_has_lod) {
-				const double distance = body->get_global_position().distance_to(p_eye);
-				const double margin = MAX(double(rock_lod.z), 0.001);
-				const double fade_in = rock_lod.x > 0.0 ? Math::smoothstep(double(rock_lod.x) - margin, double(rock_lod.x), distance) : 1.0;
-				const double fade_out = rock_lod.y > 0.0 ? 1.0 - Math::smoothstep(double(rock_lod.y) - margin, double(rock_lod.y), distance) : 1.0;
-				shown = CLAMP(double(rock_lod.w) * fade_out - rock_pair * (1.0 - fade_in), 0.0, 1.0) >= 0.5;
+			row.visible = shown;
+			if (body->is_visible() != shown) {
+				body->set_visible(shown);
+				changed.append(body);
 			}
 		}
-		if (body->is_visible() != shown) {
-			cached_source = ObjectID();
-			body->set_visible(shown);
-			changed.append(record[BODY]);
+	}
+	if (!gone.is_empty() && terrain_rows.size() == uint32_t(p_records.size())) {
+		// Highest first, so the indices below stay where they were.
+		gone.sort();
+		for (int k = gone.size() - 1; k >= 0; k--) {
+			if (k + 1 < int(gone.size()) && gone[k] == gone[k + 1]) {
+				continue;
+			}
+			p_records.remove_at(gone[k]);
+			terrain_rows.remove_at(gone[k]);
 		}
 	}
 	const uint64_t notify_since = OS::get_singleton()->get_ticks_usec();
@@ -3061,7 +3117,7 @@ void PXTGI3D::update_terrain_visibility(Array p_records, const Vector3 &p_eye) {
 		notify_bodies_changed(changed);
 	}
 	const uint64_t until = OS::get_singleton()->get_ticks_usec();
-	// Exactly three batch clocks; no per-record timing or retained visibility data.
+	// Exactly three batch clocks; no per-record timing.
 	auto record_time = [&](Stage p_stage, uint64_t p_spent) {
 		StageTime &time = stage_times[p_stage];
 		time.total += p_spent;
@@ -3072,8 +3128,7 @@ void PXTGI3D::update_terrain_visibility(Array p_records, const Vector3 &p_eye) {
 	record_time(STAGE_TERRAIN_NOTIFY, until - notify_since);
 	terrain_records += count;
 	terrain_changed += changed.size();
-	terrain_removed += removed;
-	terrain_parent_matches += parent_matches;
+	terrain_removed += gone.size();
 }
 
 void PXTGI3D::disable_bodies(const Array &p_bodies, bool p_check_membership) {
@@ -3405,8 +3460,12 @@ void PXTGI3D::_stage(Stage p_stage, uint64_t p_since) {
 
 // Each stage's time since the last reset: total and worst microseconds, and calls (frames for the whole update); the
 // shapes, emitters and moving records it keeps.
+bool PXTGI3D::hardware_fallback() {
+	return PhysXGIEffect::get_shared()->has_hardware_fallback();
+}
+
 Dictionary PXTGI3D::get_stats(bool p_reset) {
-	static const char *names[STAGE_MAX] = { "publish", "emitters", "rescan", "records", "static_tree", "moving_tree", "select", "copy", "scan_members", "scan_layout", "scan_keep", "scan_prepare", "scan_walk", "scan_prune", "scan_check", "scan_look", "scan_geometry", "scan_register", "geometry_first", "geometry_retired", "geometry_edited", "hardware_publish", "geometry_publish", "terrain_loop", "terrain_notify", "geometry_baked" };
+	static const char *names[STAGE_MAX] = { "publish", "emitters", "rescan", "records", "static_tree", "moving_tree", "select", "copy", "scan_members", "scan_layout", "scan_keep", "scan_prepare", "scan_walk", "scan_prune", "scan_check", "scan_look", "scan_geometry", "scan_register", "geometry_first", "geometry_retired", "geometry_edited", "hardware_publish", "geometry_publish", "terrain_loop", "terrain_notify", "geometry_baked", "items", "lights", "settings", "sources" };
 	Dictionary stats;
 	for (int i = 0; i < STAGE_MAX; i++) {
 		Dictionary stage;
@@ -3439,6 +3498,9 @@ Dictionary PXTGI3D::get_stats(bool p_reset) {
 	stats["item_geometry_inactive_keys"] = int64_t(reflection_item_inactive_keys);
 	stats["item_geometry_inactive_bytes"] = int64_t(reflection_item_inactive_bytes);
 	stats["item_geometry_evictions"] = int64_t(reflection_item_evictions);
+	stats["trace_mode"] = trace_mode;
+	stats["hardware_fallback"] = hardware_fallback();
+	stats["render_thread"] = PhysXGIEffect::render_stats(p_reset);
 	if (p_reset) {
 		for (StageTime &t : stage_times) {
 			t = StageTime();
@@ -3600,6 +3662,7 @@ int PXTGI3D::find_next_visible_reflection_item(const Array &p_candidates, int p_
 void PXTGI3D::set_reflection_items(const Array &p_records, const PackedFloat32Array &p_materials, const TypedArray<Texture2D> &p_masks, const String &p_shader_source, float p_hero, int64_t p_source_policy) {
 	ERR_FAIL_COND(p_materials.size() % 16 != 0 || p_masks.size() > 4);
 	ERR_FAIL_COND(!p_records.is_empty() && p_shader_source.is_empty());
+	const uint64_t items_since = OS::get_singleton()->get_ticks_usec();
 	HashMap<ObjectID, HashSet<int>> admitted;
 	for (int i = 0; i < p_records.size(); i++) {
 		ERR_FAIL_COND(p_records[i].get_type() != Variant::ARRAY);
@@ -3741,6 +3804,7 @@ void PXTGI3D::set_reflection_items(const Array &p_records, const PackedFloat32Ar
 	reflection_item_shader = p_shader_source;
 	reflection_item_hero = p_hero;
 	reflection_source_policy = uint64_t(p_source_policy);
+	_stage(STAGE_ITEMS, items_since);
 	if (reflection_items_driven && attached_world.is_valid()) {
 		_publish();
 	}
@@ -3759,6 +3823,7 @@ void PXTGI3D::_publish() {
 	s.world_distance = world_ray_distance;
 	s.reflection_distance = reflection_distance;
 	s.filtered_reflections = filtered_reflections;
+	s.reflection_jitter = reflection_jitter;
 	s.reflection_softness = reflection_softness;
 	s.reflection_resolution_scale = reflection_resolution_scale;
 	s.debug = debug;
@@ -3793,9 +3858,9 @@ void PXTGI3D::_publish() {
 		// the records' world bounds: no node is read.
 		const Vector3 view_end = eye + eye_forward * 3.0f;
 		// Scoring every emissive of a city is this stage's cost, and the chosen set changes slowly: score on every
-		// fourth publication (and at once when the shapes' indices moved); the others fill their samples from the
-		// kept choice, at this frame's poses and colours.
-		bool rescore = (publish_serial & 3) == 0;
+		// eighth publication (and at once when the shapes' indices moved); the others fill their samples from the
+		// kept choice, at this frame's poses and colours. (Every fourth was 0.23 ms on each of those frames.)
+		bool rescore = (publish_serial & 7) == 0;
 		if (chosen_emissives_for != shapes.size()) {
 			// Shape indices moved: the head start would go to other shapes.
 			chosen_emissives.clear();
@@ -3866,6 +3931,7 @@ void PXTGI3D::_publish() {
 	}
 	_publish_geometry(s);
 
+	const uint64_t lights_since = OS::get_singleton()->get_ticks_usec();
 	// The sun: the brightest directional light Godot draws on surfaces (a hidden one, or a sky-only moon, isn't).
 	s.sun_color = Color(0, 0, 0);
 	s.gi_sun_color = Color(0, 0, 0);
@@ -3885,8 +3951,16 @@ void PXTGI3D::_publish() {
 			s.gi_sun_color = gi_color;
 		}
 	}
+	// A city holds hundreds of lamps and the nearest change slowly: every lamp is weighed on every eighth publication
+	// (and at once when one joins or leaves), twice a frame's worth of the nearest in between. Weighing all of them
+	// each frame was 0.2 ms of it on Aurora Circuit.
+	if ((publish_serial & 7) == 1 || near_lights_for != omnis.size() + spots.size()) {
+		near_lights_for = omnis.size() + spots.size();
+		nearest_light_ids(omnis, eye, 2 * PhysXGIEffect::Snapshot::MAX_OMNIS, near_omnis);
+		nearest_light_ids(spots, eye, 2 * PhysXGIEffect::Snapshot::MAX_SPOTS, near_spots);
+	}
 	s.omni_count = 0;
-	for (const Pair<Light3D *, float> &l : nearest_lights(omnis, eye, PhysXGIEffect::Snapshot::MAX_OMNIS)) {
+	for (const Pair<Light3D *, float> &l : nearest_lights(near_omnis, eye, PhysXGIEffect::Snapshot::MAX_OMNIS)) {
 		const OmniLight3D *omni = static_cast<OmniLight3D *>(l.first);
 		const int i = s.omni_count++;
 		s.omni_position[i] = omni->get_global_position();
@@ -3896,7 +3970,7 @@ void PXTGI3D::_publish() {
 		s.omni_indirect[i] = indirect_strength(omni);
 	}
 	s.spot_count = 0;
-	for (const Pair<Light3D *, float> &l : nearest_lights(spots, eye, PhysXGIEffect::Snapshot::MAX_SPOTS)) {
+	for (const Pair<Light3D *, float> &l : nearest_lights(near_spots, eye, PhysXGIEffect::Snapshot::MAX_SPOTS)) {
 		const SpotLight3D *spot = static_cast<SpotLight3D *>(l.first);
 		const int i = s.spot_count++;
 		const Transform3D xf = spot->get_global_transform();
@@ -3932,6 +4006,8 @@ void PXTGI3D::_publish() {
 		s.probe_overrides[i] = overrides;
 	}
 	s.light_changed = fresh_frames > 0;
+	_stage(STAGE_LIGHTS, lights_since);
+	const uint64_t settings_since = OS::get_singleton()->get_ticks_usec();
 	const Ref<Compositor> compositor = camera && camera->get_compositor().is_valid() ? camera->get_compositor() : get_world_3d()->get_compositor();
 	s.compositor = compositor.is_valid() ? compositor->get_rid() : RID();
 	// Keep authored SDFGI for native fog and forward transparent lighting. The hook
@@ -3959,13 +4035,14 @@ void PXTGI3D::_publish() {
 		RenderingServer::get_singleton()->call_on_render_thread(Callable(memnew(PXTGIQueuedCall<decltype(publish_helper)>(publish_helper))));
 	}
 
+	_stage(STAGE_SETTINGS, settings_since);
 	// Anything that changes the light (shapes moved, lights, settings) means converging again.
 	uint32_t h = hash_murmur3_one_64(s.primitives_version);
 	h = hash_murmur3_one_float(s.intensity, h);
 	h = hash_murmur3_one_float(s.max_distance, h);
 	h = hash_murmur3_one_float(s.world_distance, h);
 	h = hash_murmur3_one_float(s.reflection_distance, h);
-	h = hash_murmur3_one_32(s.filtered_reflections, h);
+	h = hash_murmur3_one_32(s.filtered_reflections | (s.reflection_jitter << 1), h);
 	h = hash_murmur3_one_float(s.reflection_softness, h);
 	h = hash_murmur3_one_float(s.reflection_resolution_scale, h);
 	h = hash_murmur3_one_32(s.debug | (s.reflection_mode << 4) | (s.multi_bounce ? 256 : 0) | (s.rays_per_texel << 10) | (s.blue_noise ? 1 << 14 : 0) | (s.gi_history_clamp ? 1 << 15 : 0) | (s.filtered_hits ? 1 << 16 : 0), h);
@@ -3988,15 +4065,16 @@ void PXTGI3D::_publish() {
 	// Every light and sampled emissive of the scene, not the ones chosen for the camera: riding about changes which are
 	// chosen, not the light. Glowing shapes that are only ever hit by rays (ribbon walls, merged city meshes) come and
 	// go all match long and are left out: the cache follows them at its ordinary pace.
-	// Read on every fourth publication: every light and emitter of a city is a few thousand reads, and a source
-	// that changed three frames ago is soon enough for a sixty-frame refresh.
-	if ((publish_serial & 3) != 2) {
+	// Read on every sixteenth publication: every light and emitter of a city is sixteen thousand reads (0.34 ms of
+	// that frame), and a source that changed a quarter of a second ago is soon enough for a sixty-frame refresh.
+	if ((publish_serial & 15) != 2) {
 		if (fresh_frames > 0) {
 			fresh_frames--;
 		}
 		_stage(STAGE_PUBLISH, publish_since);
 		return;
 	}
+	const uint64_t sources_since = OS::get_singleton()->get_ticks_usec();
 	uint32_t sampled_emitters = 0;
 	uint32_t sources = hash_murmur3_one_32(omnis.size() | (spots.size() << 10));
 	sources = hash_murmur3_one_float(s.sun_color.r + s.sun_color.g * 3.1f + s.sun_color.b * 7.3f, sources);
@@ -4025,6 +4103,7 @@ void PXTGI3D::_publish() {
 	} else if (fresh_frames > 0) {
 		fresh_frames--;
 	}
+	_stage(STAGE_SOURCES, sources_since);
 	_stage(STAGE_PUBLISH, publish_since);
 }
 
@@ -4095,6 +4174,7 @@ void PXTGI3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("clear_bodies_runtime_look", "bodies", "restore_authored"), &PXTGI3D::clear_bodies_runtime_look, DEFVAL(true));
 	ClassDB::bind_method(D_METHOD("update_emitter_group", "bodies", "stations", "values", "time"), &PXTGI3D::update_emitter_group);
 	ClassDB::bind_method(D_METHOD("get_stats", "reset"), &PXTGI3D::get_stats, DEFVAL(true));
+	ClassDB::bind_static_method("PXTGI3D", D_METHOD("hardware_fallback"), &PXTGI3D::hardware_fallback);
 	ClassDB::bind_method(D_METHOD("set_intensity", "intensity"), &PXTGI3D::set_intensity);
 	ClassDB::bind_method(D_METHOD("get_intensity"), &PXTGI3D::get_intensity);
 	ClassDB::bind_method(D_METHOD("set_max_distance", "distance"), &PXTGI3D::set_max_distance);
@@ -4105,6 +4185,8 @@ void PXTGI3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_reflection_distance"), &PXTGI3D::get_reflection_distance);
 	ClassDB::bind_method(D_METHOD("set_filtered_reflections", "enabled"), &PXTGI3D::set_filtered_reflections);
 	ClassDB::bind_method(D_METHOD("get_filtered_reflections"), &PXTGI3D::get_filtered_reflections);
+	ClassDB::bind_method(D_METHOD("set_reflection_jitter", "mode"), &PXTGI3D::set_reflection_jitter);
+	ClassDB::bind_method(D_METHOD("get_reflection_jitter"), &PXTGI3D::get_reflection_jitter);
 	ClassDB::bind_method(D_METHOD("set_reflection_softness", "softness"), &PXTGI3D::set_reflection_softness);
 	ClassDB::bind_method(D_METHOD("get_reflection_softness"), &PXTGI3D::get_reflection_softness);
 	ClassDB::bind_method(D_METHOD("set_reflection_resolution_scale", "scale"), &PXTGI3D::set_reflection_resolution_scale);
@@ -4136,6 +4218,7 @@ void PXTGI3D::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "world_ray_distance", PROPERTY_HINT_RANGE, "1,100,0.5,or_greater,suffix:m"), "set_world_ray_distance", "get_world_ray_distance");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "reflection_distance", PROPERTY_HINT_RANGE, "1,300,0.5,or_greater,suffix:m"), "set_reflection_distance", "get_reflection_distance");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "filtered_reflections"), "set_filtered_reflections", "get_filtered_reflections");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "reflection_jitter", PROPERTY_HINT_ENUM, "Off,Each frame,Fixed"), "set_reflection_jitter", "get_reflection_jitter");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "reflection_softness", PROPERTY_HINT_RANGE, "1,8,0.1"), "set_reflection_softness", "get_reflection_softness");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "reflection_resolution_scale", PROPERTY_HINT_RANGE, "0.25,1,0.25"), "set_reflection_resolution_scale", "get_reflection_resolution_scale");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "rays_per_texel", PROPERTY_HINT_RANGE, "1,4,1"), "set_rays_per_texel", "get_rays_per_texel");
