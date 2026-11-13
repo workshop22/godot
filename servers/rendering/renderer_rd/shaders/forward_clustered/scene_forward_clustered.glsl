@@ -2033,6 +2033,13 @@ void fragment_shader(in SceneData scene_data) {
 		if (bool(implementation_data.ss_effects_flags & SCREEN_SPACE_EFFECTS_FLAGS_TRACED_REFLECTIONS)) {
 			traced_indirect_specular = buffer_reflection.rgb * buffer_reflection.a;
 		}
+#if defined(CUSTOM_RADIANCE_USED)
+		// A material's own RADIANCE stands for whatever reflects in it. The GI buffers' reflection arrives after the
+		// first mix above, so give way to it again here: a surface that draws its own reflection (a planar mirror's
+		// floor) is not reflected in twice once reflections are traced.
+		indirect_specular_light = mix(indirect_specular_light, custom_radiance.rgb, custom_radiance.a);
+		traced_indirect_specular *= 1.0 - custom_radiance.a;
+#endif
 	}
 #endif // !USE_LIGHTMAP
 
