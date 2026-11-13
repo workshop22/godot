@@ -3716,10 +3716,16 @@ void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_rende
 	const bool from_source = v.source.is_valid() && v.source_frame + 1 == RSG::rasterizer->get_frame_number();
 	const RID color = from_source ? v.source : buffers->get_internal_texture();
 	// The renderer keeps the previous filtered source until this frame's transparent
-	// replay. A zero visible-item count still requires matching source membership.
+	// replay. A zero visible-item count still requires a source made for traced items.
+	// The membership (which items are traced, and so left out of the source) changes whenever an item appears or
+	// goes. Last frame's source left out last frame's items, which is still right for this frame: an item joins
+	// the membership as it first shows and leaves as it goes. Requiring the same membership dropped the source for
+	// that frame: every reflection was lit again from the records, unfiltered, with no history -- one frame of
+	// white, sharp reflections across the road at each pickup. Only a source made with items in it (membership 0)
+	// can't stand in for one without, or the reverse.
 	const uint64_t source_policy = s.reflection_source_policy;
 	const bool reflection_source_valid = !s.reflection_items_configured ||
-			(from_source && v.source_policy == source_policy && buffers->get_reflection_source_frame() == v.source_frame && buffers->get_reflection_source_policy() == source_policy);
+			(from_source && (v.source_policy != 0) == (source_policy != 0) && buffers->get_reflection_source_frame() == v.source_frame && buffers->get_reflection_source_policy() == v.source_policy);
 	const bool filtered_source = reflection_source_valid && from_source && buffers->has_filtered_reflection_source() && buffers->has_texture(clustered_scope, "reflection_source");
 	const RID reflection_color = filtered_source ? buffers->get_texture(clustered_scope, "reflection_source") : color;
 	v.requested_source_policy = source_policy;
