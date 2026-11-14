@@ -147,6 +147,8 @@ class RenderingDeviceDriverVulkan : public RenderingDeviceDriver {
 	bool process_exiting = false;
 	RenderingContextDriver::Device context_device = {};
 	uint32_t frame_count = 1;
+	uint32_t resource_queue_families[2] = { UINT32_MAX, UINT32_MAX };
+	bool concurrent_upload_resources = false;
 	VkPhysicalDevice physical_device = VK_NULL_HANDLE;
 	VkPhysicalDeviceProperties physical_device_properties = {};
 	VkPhysicalDeviceFeatures physical_device_features = {};
@@ -400,6 +402,7 @@ private:
 
 	struct CommandPool {
 		VkCommandPool vk_command_pool = VK_NULL_HANDLE;
+		uint32_t queue_family = UINT32_MAX;
 		CommandBufferType buffer_type = COMMAND_BUFFER_TYPE_PRIMARY;
 		LocalVector<CommandBufferInfo *> command_buffers_created;
 	};
@@ -414,6 +417,7 @@ private:
 
 	struct CommandBufferInfo {
 		VkCommandBuffer vk_command_buffer = VK_NULL_HANDLE;
+		uint32_t queue_family = UINT32_MAX;
 		Framebuffer *active_framebuffer = nullptr;
 		RenderPassInfo *active_render_pass = nullptr;
 	};
@@ -712,6 +716,45 @@ public:
 	/********************/
 
 	// ----- ACCELERATION STRUCTURE -----
+
+	// Opt-in CPU-only audit. Independent of RD's weak links and retained until Vulkan destruction.
+	struct ASAuditReference {
+		uint64_t id = 0;
+		uint64_t generation = 0;
+		uint64_t address = 0;
+	};
+	struct ASAuditBuffer {
+		uint64_t generation = 0;
+		uint64_t size = 0;
+		uint64_t mapped = 0;
+		uint64_t last_build_read = UINT64_MAX;
+		uint64_t last_reader = 0;
+		uint32_t upload_family = UINT32_MAX;
+		bool concurrent = false;
+		bool ownership_reported = false;
+	};
+	struct ASAuditStructure {
+		uint64_t generation = 0;
+		uint64_t address = 0;
+		uint64_t created_frame = 0;
+		uint64_t built_frame = UINT64_MAX;
+		bool top = false;
+		LocalVector<ASAuditReference> inputs;
+		HashMap<uint64_t, ASAuditReference> references;
+	};
+	bool as_audit_enabled = false;
+	Mutex as_audit_mutex;
+	uint64_t as_audit_frame = 0;
+	uint64_t as_audit_generation = 0;
+	uint64_t as_audit_blas_builds = 0;
+	uint64_t as_audit_tlas_builds = 0;
+	uint64_t as_audit_instances = 0;
+	uint64_t as_audit_errors = 0;
+	uint64_t as_audit_ownership = 0;
+	HashMap<uint64_t, ASAuditBuffer> as_audit_buffers;
+	HashMap<uint64_t, ASAuditStructure> as_audit_structures;
+	HashMap<uint64_t, ASAuditReference> as_audit_instance_writes;
+	void _as_audit_error(const String &p_message);
 
 	struct AccelerationStructureInfo {
 		VkAccelerationStructureKHR vk_acceleration_structure = VK_NULL_HANDLE;

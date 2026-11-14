@@ -406,6 +406,14 @@ void RenderingDeviceGraph::_add_command_to_graph(ResourceTracker **p_resource_tr
 		ResourceTracker *resource_tracker = p_resource_trackers[i];
 		DEV_ASSERT(resource_tracker != nullptr);
 
+		if (audit_graph_enabled) {
+			// Texture slices/partial coverage need a separate range-aware oracle.
+			if (resource_tracker->buffer_driver_id.id != 0) {
+				audit_graph_accesses.push_back({ resource_tracker->buffer_driver_id.id, uint32_t(p_command_index), false, _is_write_usage(p_resource_usages[i]) });
+			} else if (resource_tracker->acceleration_structure_driver_id.id != 0) {
+				audit_graph_accesses.push_back({ resource_tracker->acceleration_structure_driver_id.id, uint32_t(p_command_index), true, _is_write_usage(p_resource_usages[i]) });
+			}
+		}
 		resource_tracker->reset_if_outdated(tracking_frame);
 
 		// An already-readable BLAS with no writer this frame only adds a read.
@@ -1826,6 +1834,7 @@ void RenderingDeviceGraph::_print_compute_list(const uint8_t *p_instruction_data
 }
 
 void RenderingDeviceGraph::initialize(RDD *p_driver, RenderPassCreationFunction p_render_pass_creation_function, uint32_t p_frame_count, RDD::CommandQueueFamilyID p_secondary_command_queue_family, uint32_t p_secondary_command_buffers_per_frame) {
+	audit_graph_enabled = OS::get_singleton()->has_environment("LIGHTCYCLE_GRAPH_AUDIT");
 	DEV_ASSERT(p_driver != nullptr);
 	DEV_ASSERT(p_render_pass_creation_function != nullptr);
 	DEV_ASSERT(p_frame_count > 0);
@@ -1868,6 +1877,7 @@ void RenderingDeviceGraph::finalize() {
 }
 
 void RenderingDeviceGraph::begin() {
+	audit_graph_accesses.clear();
 	command_data.clear();
 	command_data_offsets.clear();
 	command_normalization_barriers.clear();
@@ -2693,6 +2703,50 @@ void RenderingDeviceGraph::end_label() {
 	command_label_index = -1;
 }
 
+void RenderingDeviceGraph::_audit_dependencies(VectorView<RecordedCommandSort> p_commands, bool p_reorder) {
+	struct History {
+		int32_t writer = -1;
+		LocalVector<uint32_t> readers;
+	};
+	HashMap<uint64_t, History> histories[2];
+	LocalVector<uint32_t> levels;
+	levels.resize(command_count);
+	for (uint32_t i = 0; i < p_commands.size(); i++) {
+		levels[p_commands[i].index] = p_reorder ? p_commands[i].level : p_commands[i].index;
+	}
+	audit_graph_accesses.sort();
+	for (const AuditAccess &access : audit_graph_accesses) {
+		History &history = histories[access.acceleration ? 1 : 0][access.resource];
+		auto check = [&](uint32_t p_previous) {
+			if (p_previous == access.command || levels[p_previous] < levels[access.command]) {
+				return;
+			}
+			audit_graph_errors++;
+			if (audit_graph_errors <= 32) {
+				const RecordedCommand *previous = reinterpret_cast<const RecordedCommand *>(&command_data[command_data_offsets[p_previous]]);
+				const RecordedCommand *current = reinterpret_cast<const RecordedCommand *>(&command_data[command_data_offsets[access.command]]);
+				print_line(vformat("GRAPH_AUDIT HAZARD frame=%d kind=%s resource=%d before=%d type=%d level=%d after=%d type=%d level=%d", tracking_frame, access.acceleration ? "AS" : "buffer", access.resource, p_previous, previous->type, levels[p_previous], access.command, current->type, levels[access.command]));
+			}
+		};
+		if (history.writer >= 0) {
+			check(history.writer);
+		}
+		if (access.write) {
+			for (uint32_t reader : history.readers) {
+				check(reader);
+			}
+			history.readers.clear();
+			history.writer = access.command;
+		} else if (history.writer != int32_t(access.command) && (history.readers.is_empty() || history.readers[history.readers.size() - 1] != access.command)) {
+			history.readers.push_back(access.command);
+		}
+	}
+	audit_graph_access_count += audit_graph_accesses.size();
+	if (tracking_frame % 600 == 0) {
+		print_line(vformat("GRAPH_AUDIT frame=%d accesses=%d hazards=%d", tracking_frame, audit_graph_access_count, audit_graph_errors));
+	}
+}
+
 void RenderingDeviceGraph::end(bool p_reorder_commands, bool p_full_barriers, RDD::CommandBufferID &r_command_buffer, CommandBufferPool &r_command_buffer_pool) {
 	if (command_count == 0) {
 		// No commands have been logged, do nothing.
@@ -2807,6 +2861,10 @@ void RenderingDeviceGraph::end(bool p_reorder_commands, bool p_full_barriers, RD
 		for (uint32_t i = 0; i < command_count; i++) {
 			commands_sorted[i].index = i;
 		}
+	}
+
+	if (audit_graph_enabled) {
+		_audit_dependencies(commands_sorted, p_reorder_commands);
 	}
 
 	_wait_for_secondary_command_buffer_tasks();

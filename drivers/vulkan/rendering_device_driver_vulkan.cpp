@@ -1902,6 +1902,11 @@ Error RenderingDeviceDriverVulkan::initialize(uint32_t p_device_index, uint32_t 
 	context_device = context_driver->device_get(p_device_index);
 	physical_device = context_driver->physical_device_get(p_device_index);
 	frame_count = p_frame_count;
+	concurrent_upload_resources = OS::get_singleton()->has_environment("LIGHTCYCLE_CONCURRENT_UPLOADS");
+	as_audit_enabled = OS::get_singleton()->has_environment("LIGHTCYCLE_AS_AUDIT");
+	if (as_audit_enabled) {
+		print_line("AS_AUDIT enabled: CPU references, generations, build order, deferred destruction; no GPU commands.");
+	}
 
 	// Copy the queue family properties the context already retrieved.
 	uint32_t queue_family_count = context_driver->queue_family_get_count(p_device_index);
@@ -2036,6 +2041,15 @@ RDD::BufferID RenderingDeviceDriverVulkan::buffer_create(uint64_t p_size, BitFie
 	create_info.size = p_size;
 	create_info.usage = p_usage & ~BUFFER_USAGE_DYNAMIC_PERSISTENT_BIT;
 	create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	// Upload workers and the graph can use different queue families. A semaphore
+	// orders their accesses but does not transfer ownership of an exclusive buffer.
+	if (concurrent_upload_resources && resource_queue_families[0] != UINT32_MAX &&
+			resource_queue_families[0] != resource_queue_families[1] &&
+			(create_info.usage & (VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT))) {
+		create_info.sharingMode = VK_SHARING_MODE_CONCURRENT;
+		create_info.queueFamilyIndexCount = 2;
+		create_info.pQueueFamilyIndices = resource_queue_families;
+	}
 
 	VmaMemoryUsage vma_usage = VMA_MEMORY_USAGE_UNKNOWN;
 	uint32_t vma_flags_to_remove = 0;
@@ -2118,6 +2132,14 @@ RDD::BufferID RenderingDeviceDriverVulkan::buffer_create(uint64_t p_size, BitFie
 	buf_info->allocation.size = alloc_info.size;
 	buf_info->size = original_size;
 
+	if (as_audit_enabled && p_usage.has_flag(BUFFER_USAGE_DEVICE_ADDRESS_BIT)) {
+		MutexLock lock(as_audit_mutex);
+		ASAuditBuffer audit;
+		audit.generation = ++as_audit_generation;
+		audit.size = p_size;
+		audit.concurrent = create_info.sharingMode == VK_SHARING_MODE_CONCURRENT;
+		as_audit_buffers.insert(uint64_t(buf_info), audit);
+	}
 	return BufferID(buf_info);
 }
 
@@ -2140,6 +2162,20 @@ bool RenderingDeviceDriverVulkan::buffer_set_texel_format(BufferID p_buffer, Dat
 
 void RenderingDeviceDriverVulkan::buffer_free(BufferID p_buffer) {
 	BufferInfo *buf_info = (BufferInfo *)p_buffer.id;
+	if (as_audit_enabled) {
+		MutexLock lock(as_audit_mutex);
+		if (const ASAuditBuffer *audit = as_audit_buffers.getptr(p_buffer.id)) {
+			if (audit->last_build_read != UINT64_MAX && as_audit_frame - audit->last_build_read < frame_count) {
+				_as_audit_error(vformat("buffer_destroy id=%d generation=%d read_frame=%d reader=%d", p_buffer.id, audit->generation, audit->last_build_read, audit->last_reader));
+			}
+			if (audit->mapped) {
+				for (uint64_t offset = 0; offset < audit->size; offset += sizeof(VkAccelerationStructureInstanceKHR)) {
+					as_audit_instance_writes.erase(audit->mapped + offset);
+				}
+			}
+			as_audit_buffers.erase(p_buffer.id);
+		}
+	}
 	if (buf_info->vk_view) {
 		vkDestroyBufferView(vk_device, buf_info->vk_view, VKC::get_allocation_callbacks(VK_OBJECT_TYPE_BUFFER_VIEW));
 	}
@@ -2173,6 +2209,12 @@ uint8_t *RenderingDeviceDriverVulkan::buffer_map(BufferID p_buffer) {
 	void *data_ptr = nullptr;
 	VkResult err = vmaMapMemory(allocator, buf_info->allocation.handle, &data_ptr);
 	ERR_FAIL_COND_V_MSG(err, nullptr, vformat("Couldn't map buffer memory (VkResult error %d).", err));
+	if (as_audit_enabled) {
+		MutexLock lock(as_audit_mutex);
+		if (ASAuditBuffer *audit = as_audit_buffers.getptr(p_buffer.id)) {
+			audit->mapped = uint64_t(data_ptr);
+		}
+	}
 	return (uint8_t *)data_ptr;
 }
 
@@ -2391,6 +2433,13 @@ RDD::TextureID RenderingDeviceDriverVulkan::texture_create(const TextureFormat &
 	}
 
 	create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	if (concurrent_upload_resources && resource_queue_families[0] != UINT32_MAX &&
+			resource_queue_families[0] != resource_queue_families[1] &&
+			(create_info.usage & (VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT))) {
+		create_info.sharingMode = VK_SHARING_MODE_CONCURRENT;
+		create_info.queueFamilyIndexCount = 2;
+		create_info.pQueueFamilyIndices = resource_queue_families;
+	}
 	create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
 	// Allocate memory.
@@ -2979,12 +3028,24 @@ void RenderingDeviceDriverVulkan::command_pipeline_barrier(
 		VectorView<BufferBarrier> p_buffer_barriers,
 		VectorView<TextureBarrier> p_texture_barriers,
 		VectorView<AccelerationStructureBarrier> p_acceleration_structure_barriers) {
+	static const bool global_as_reads = OS::get_singleton()->has_environment("LIGHTCYCLE_GLOBAL_AS_READS");
+	// A TLAS buffer barrier does not cover the BLAS storage traversed by its queries.
+	const VkAccessFlags ignored_global_access = global_as_reads && ray_query_support ? 0 : VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
 	VkMemoryBarrier *vk_memory_barriers = ALLOCA_ARRAY(VkMemoryBarrier, p_memory_barriers.size());
 	for (uint32_t i = 0; i < p_memory_barriers.size(); i++) {
 		vk_memory_barriers[i] = {};
 		vk_memory_barriers[i].sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-		vk_memory_barriers[i].srcAccessMask = _rd_to_vk_access_flags(p_memory_barriers[i].src_access) & ~VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
-		vk_memory_barriers[i].dstAccessMask = _rd_to_vk_access_flags(p_memory_barriers[i].dst_access) & ~VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+		vk_memory_barriers[i].srcAccessMask = _rd_to_vk_access_flags(p_memory_barriers[i].src_access) & ~ignored_global_access;
+		vk_memory_barriers[i].dstAccessMask = _rd_to_vk_access_flags(p_memory_barriers[i].dst_access) & ~ignored_global_access;
+		static const bool audit_as_barriers = OS::get_singleton()->has_environment("LIGHTCYCLE_AS_BARRIER_AUDIT");
+		if (audit_as_barriers && p_dst_stages.has_flag(PIPELINE_STAGE_COMPUTE_SHADER_BIT) &&
+				p_memory_barriers[i].dst_access.has_flag(BARRIER_ACCESS_ACCELERATION_STRUCTURE_READ_BIT)) {
+			static const bool reported = [&]() {
+				print_line(vformat("AS_BARRIER_AUDIT ray_query=%d global_reads=%d requested_dst=%d actual_dst=%d src_stages=%d dst_stages=%d individual_as_barriers=%d", int(ray_query_support), int(global_as_reads), uint64_t(_rd_to_vk_access_flags(p_memory_barriers[i].dst_access)), uint64_t(vk_memory_barriers[i].dstAccessMask), uint64_t(p_src_stages), uint64_t(p_dst_stages), p_acceleration_structure_barriers.size()));
+				return true;
+			}();
+			(void)reported;
+		}
 	}
 
 	VkBufferMemoryBarrier *vk_buffer_barriers = ALLOCA_ARRAY(VkBufferMemoryBarrier, p_buffer_barriers.size());
@@ -3219,6 +3280,14 @@ RDD::CommandQueueID RenderingDeviceDriverVulkan::command_queue_create(CommandQue
 
 	// Make a virtual queue on top of a real queue. Use the queue from the family with the least amount of virtual queues created.
 	uint32_t family_index = p_cmd_queue_family.id - 1;
+	if (p_identify_as_main_queue) {
+		resource_queue_families[0] = family_index;
+		const CommandQueueFamilyID transfer = command_queue_family_get(COMMAND_QUEUE_FAMILY_TRANSFER_BIT);
+		resource_queue_families[1] = transfer ? uint32_t(transfer.id - 1) : family_index;
+		if (as_audit_enabled || concurrent_upload_resources) {
+			print_line(vformat("UPLOAD_QUEUES main=%d transfer=%d concurrent=%d", resource_queue_families[0], resource_queue_families[1], int(concurrent_upload_resources)));
+		}
+	}
 	TightLocalVector<Queue> &queue_family = queue_families[family_index];
 	uint32_t picked_queue_index = UINT_MAX;
 	uint32_t picked_virtual_count = UINT_MAX;
@@ -3475,6 +3544,7 @@ RDD::CommandPoolID RenderingDeviceDriverVulkan::command_pool_create(CommandQueue
 
 	CommandPool *command_pool = memnew(CommandPool);
 	command_pool->vk_command_pool = vk_command_pool;
+	command_pool->queue_family = family_index;
 	command_pool->buffer_type = p_cmd_buffer_type;
 	return CommandPoolID(command_pool);
 }
@@ -3524,6 +3594,7 @@ RDD::CommandBufferID RenderingDeviceDriverVulkan::command_buffer_create(CommandP
 
 	CommandBufferInfo *command_buffer = VersatileResource::allocate<CommandBufferInfo>(resources_allocator);
 	command_buffer->vk_command_buffer = vk_command_buffer;
+	command_buffer->queue_family = command_pool->queue_family;
 	command_pool->command_buffers_created.push_back(command_buffer);
 	return CommandBufferID(command_buffer);
 }
@@ -5180,6 +5251,12 @@ void RenderingDeviceDriverVulkan::command_copy_buffer(CommandBufferID p_cmd_buff
 	const CommandBufferInfo *command_buffer = (const CommandBufferInfo *)p_cmd_buffer.id;
 	const BufferInfo *src_buf_info = (const BufferInfo *)p_src_buffer.id;
 	const BufferInfo *dst_buf_info = (const BufferInfo *)p_dst_buffer.id;
+	if (as_audit_enabled) {
+		MutexLock lock(as_audit_mutex);
+		if (ASAuditBuffer *audit = as_audit_buffers.getptr(p_dst_buffer.id)) {
+			audit->upload_family = command_buffer->queue_family;
+		}
+	}
 	vkCmdCopyBuffer(command_buffer->vk_command_buffer, src_buf_info->vk_buffer, dst_buf_info->vk_buffer, p_regions.size(), (const VkBufferCopy *)p_regions.ptr());
 }
 
@@ -6426,6 +6503,24 @@ RDD::AccelerationStructureID RenderingDeviceDriverVulkan::blas_create(VectorView
 
 	device_functions.GetAccelerationStructureBuildSizesKHR(vk_device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &accel_info->build_info, max_primitive_counts.ptr(), &size_info);
 	_acceleration_structure_create(VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR, size_info, accel_info);
+	if (as_audit_enabled) {
+		MutexLock lock(as_audit_mutex);
+		ASAuditStructure &audit = as_audit_structures[uint64_t(accel_info)];
+		for (uint32_t i = 0; i < p_geometries.size(); i++) {
+			const AccelerationStructureGeometry &geometry = p_geometries[i];
+			for (BufferID input : { geometry.vertex_buffer, geometry.index_buffer }) {
+				if (!input) {
+					continue;
+				}
+				const ASAuditBuffer *buffer = as_audit_buffers.getptr(input.id);
+				if (!buffer) {
+					_as_audit_error(vformat("blas_create unregistered_input=%d blas=%d", input.id, uint64_t(accel_info)));
+				} else {
+					audit.inputs.push_back({ input.id, buffer->generation, buffer_get_device_address(input) });
+				}
+			}
+		}
+	}
 
 	return AccelerationStructureID(accel_info);
 #else
@@ -6499,6 +6594,21 @@ void RenderingDeviceDriverVulkan::acceleration_structure_instance_write(uint8_t 
 	// Due to VkAccelerationStructureInstanceKHR containing bit fields, the compiler may generate
 	// reads from a potentially write-combined memory pointer, which is prohibitively slow.
 	// To solve this, we fill the instance data on the stack, and copy it all at once.
+	if (as_audit_enabled) {
+		MutexLock lock(as_audit_mutex);
+		ASAuditReference reference;
+		reference.id = p_instance.blas.id;
+		reference.address = vk_instance.accelerationStructureReference;
+		if (p_instance.blas) {
+			const ASAuditStructure *audit = as_audit_structures.getptr(p_instance.blas.id);
+			if (!audit || audit->top || audit->address != reference.address || !reference.address) {
+				_as_audit_error(vformat("instance_write invalid_blas=%d address=%d", reference.id, reference.address));
+			} else {
+				reference.generation = audit->generation;
+			}
+		}
+		as_audit_instance_writes.insert(uint64_t(r_driver_instance), reference);
+	}
 	memcpy(r_driver_instance, &vk_instance, sizeof(VkAccelerationStructureInstanceKHR));
 #endif
 }
@@ -6532,6 +6642,15 @@ void RenderingDeviceDriverVulkan::_acceleration_structure_create(VkAccelerationS
 	address_info.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR;
 	address_info.accelerationStructure = r_accel_info->vk_acceleration_structure;
 	r_accel_info->device_address = device_functions.GetAccelerationStructureDeviceAddressKHR(vk_device, &address_info);
+	if (as_audit_enabled) {
+		MutexLock lock(as_audit_mutex);
+		ASAuditStructure audit;
+		audit.generation = ++as_audit_generation;
+		audit.address = r_accel_info->device_address;
+		audit.created_frame = as_audit_frame;
+		audit.top = p_type == VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
+		as_audit_structures.insert(uint64_t(r_accel_info), audit);
+	}
 #endif
 }
 
@@ -6539,6 +6658,21 @@ void RenderingDeviceDriverVulkan::acceleration_structure_free(AccelerationStruct
 #if VULKAN_RAYTRACING_ENABLED
 	AccelerationStructureInfo *accel_info = (AccelerationStructureInfo *)p_acceleration_structure.id;
 	ERR_FAIL_NULL_MSG(accel_info, "Vulkan raytracing acceleration structure input parameter is not valid.");
+	if (as_audit_enabled) {
+		MutexLock lock(as_audit_mutex);
+		const ASAuditStructure *dead = as_audit_structures.getptr(p_acceleration_structure.id);
+		if (!dead) {
+			_as_audit_error(vformat("destroy unknown_as=%d", p_acceleration_structure.id));
+		} else {
+			for (const KeyValue<uint64_t, ASAuditStructure> &entry : as_audit_structures) {
+				const ASAuditReference *ref = entry.value.references.getptr(p_acceleration_structure.id);
+				if (ref && ref->generation == dead->generation) {
+					_as_audit_error(vformat("destroy referenced_blas=%d generation=%d tlas=%d tlas_build_frame=%d", p_acceleration_structure.id, dead->generation, entry.key, entry.value.built_frame));
+				}
+			}
+		}
+		as_audit_structures.erase(p_acceleration_structure.id);
+	}
 	if (accel_info->buffer) {
 		buffer_free(accel_info->buffer);
 	}
@@ -6570,11 +6704,40 @@ VkStridedDeviceAddressRegionKHR RenderingDeviceDriverVulkan::_sbt_to_vk_strided_
 
 // ----- COMMANDS -----
 
+void RenderingDeviceDriverVulkan::_as_audit_error(const String &p_message) {
+	as_audit_errors++;
+	if (as_audit_errors <= 32) {
+		print_line(vformat("AS_AUDIT VIOLATION frame=%d %s", as_audit_frame, p_message));
+	}
+}
+
 void RenderingDeviceDriverVulkan::command_build_blas(CommandBufferID p_cmd_buffer, AccelerationStructureID p_acceleration_structure, BufferID p_scratch_buffer) {
 #if VULKAN_RAYTRACING_ENABLED
 	const CommandBufferInfo *command_buffer = (const CommandBufferInfo *)p_cmd_buffer.id;
 	AccelerationStructureInfo *accel_info = (AccelerationStructureInfo *)p_acceleration_structure.id;
 
+	if (as_audit_enabled) {
+		MutexLock lock(as_audit_mutex);
+		ASAuditStructure &audit = as_audit_structures[p_acceleration_structure.id];
+		for (const ASAuditReference &input : audit.inputs) {
+			ASAuditBuffer *buffer = as_audit_buffers.getptr(input.id);
+			if (!buffer || buffer->generation != input.generation || buffer_get_device_address(BufferID(input.id)) != input.address) {
+				_as_audit_error(vformat("blas_build stale_buffer=%d generation=%d blas=%d", input.id, input.generation, p_acceleration_structure.id));
+			} else {
+				buffer->last_build_read = as_audit_frame;
+				buffer->last_reader = p_acceleration_structure.id;
+				if (!buffer->concurrent && buffer->upload_family != UINT32_MAX && buffer->upload_family != command_buffer->queue_family && !buffer->ownership_reported) {
+					buffer->ownership_reported = true;
+					as_audit_ownership++;
+					if (as_audit_ownership <= 8) {
+						print_line(vformat("AS_AUDIT OWNERSHIP frame=%d input=%d generation=%d size=%d upload_family=%d build_family=%d exclusive=1", as_audit_frame, input.id, input.generation, buffer->size, buffer->upload_family, command_buffer->queue_family));
+					}
+				}
+			}
+		}
+		audit.built_frame = as_audit_frame;
+		as_audit_blas_builds++;
+	}
 	VkAccelerationStructureBuildGeometryInfoKHR *build_info = &accel_info->build_info;
 	VkDeviceAddress scratch_address = buffer_get_device_address(p_scratch_buffer);
 	build_info->scratchData.deviceAddress = _align_up_address(scratch_address, accel_info->scratch_alignment);
@@ -6590,6 +6753,36 @@ void RenderingDeviceDriverVulkan::command_build_tlas(CommandBufferID p_cmd_buffe
 	const CommandBufferInfo *command_buffer = (const CommandBufferInfo *)p_cmd_buffer.id;
 	AccelerationStructureInfo *accel_info = (AccelerationStructureInfo *)p_acceleration_structure.id;
 
+	if (as_audit_enabled) {
+		MutexLock lock(as_audit_mutex);
+		ASAuditStructure &audit = as_audit_structures[p_acceleration_structure.id];
+		audit.references.clear();
+		ASAuditBuffer *buffer = as_audit_buffers.getptr(p_instance_buffer.id);
+		if (!buffer || !buffer->mapped || uint64_t(p_instance_offset) + uint64_t(p_instance_count) * sizeof(VkAccelerationStructureInstanceKHR) > buffer->size) {
+			_as_audit_error(vformat("tlas_build invalid_instance_buffer=%d offset=%d count=%d", p_instance_buffer.id, p_instance_offset, p_instance_count));
+		} else {
+			buffer->last_build_read = as_audit_frame;
+			buffer->last_reader = p_acceleration_structure.id;
+			for (uint32_t i = 0; i < p_instance_count; i++) {
+				const ASAuditReference *reference = as_audit_instance_writes.getptr(buffer->mapped + p_instance_offset + i * sizeof(VkAccelerationStructureInstanceKHR));
+				if (!reference) {
+					_as_audit_error(vformat("tlas_build unwritten_instance=%d tlas=%d", i, p_acceleration_structure.id));
+					continue;
+				}
+				if (!reference->id) {
+					continue;
+				}
+				const ASAuditStructure *blas = as_audit_structures.getptr(reference->id);
+				if (!blas || blas->top || blas->generation != reference->generation || blas->address != reference->address || blas->built_frame == UINT64_MAX) {
+					_as_audit_error(vformat("tlas_build stale_or_unbuilt_blas=%d generation=%d instance=%d tlas=%d", reference->id, reference->generation, i, p_acceleration_structure.id));
+				}
+				audit.references.insert(reference->id, *reference);
+			}
+		}
+		audit.built_frame = as_audit_frame;
+		as_audit_tlas_builds++;
+		as_audit_instances += p_instance_count;
+	}
 	accel_info->geometries[0].geometry.instances.data.deviceAddress = buffer_get_device_address(p_instance_buffer) + p_instance_offset;
 	accel_info->range_infos[0].primitiveCount = p_instance_count;
 
@@ -7294,7 +7487,13 @@ inline String RenderingDeviceDriverVulkan::get_vulkan_result(VkResult err) {
 /********************/
 
 void RenderingDeviceDriverVulkan::begin_segment(uint32_t p_frame_index, uint32_t p_frames_drawn) {
-	// Per-frame segments are not required in Vulkan.
+	if (as_audit_enabled) {
+		MutexLock lock(as_audit_mutex);
+		as_audit_frame = p_frames_drawn;
+		if (p_frames_drawn % 600 == 0) {
+			print_line(vformat("AS_AUDIT frame=%d live_as=%d blas_builds=%d tlas_builds=%d instances=%d violations=%d ownership=%d", as_audit_frame, as_audit_structures.size(), as_audit_blas_builds, as_audit_tlas_builds, as_audit_instances, as_audit_errors, as_audit_ownership));
+		}
+	}
 }
 
 void RenderingDeviceDriverVulkan::end_segment() {

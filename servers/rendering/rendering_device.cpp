@@ -1045,6 +1045,10 @@ Error RenderingDevice::_staging_buffer_allocate(StagingBuffers &p_staging_buffer
 }
 
 void RenderingDevice::_staging_buffer_execute_required_action(StagingBuffers &p_staging_buffers, StagingRequiredAction p_required_action) {
+	static const bool audit = OS::get_singleton()->has_environment("LIGHTCYCLE_AS_AUDIT");
+	if (audit && p_required_action != STAGING_REQUIRED_ACTION_NONE) {
+		print_line(vformat("AS_AUDIT staging_action=%d frame=%d blocks=%d block_size=%d max_size=%d", int(p_required_action), frames_drawn, p_staging_buffers.blocks.size(), p_staging_buffers.block_size, p_staging_buffers.max_size));
+	}
 	switch (p_required_action) {
 		case STAGING_REQUIRED_ACTION_NONE: {
 			// Do nothing.
@@ -2274,6 +2278,11 @@ Error RenderingDevice::_texture_initialize(RID p_texture, uint32_t p_layer, cons
 				tb.src_access = RDD::BARRIER_ACCESS_COPY_WRITE_BIT;
 				tb.prev_layout = p_dst_layout;
 				tb.next_layout = RDD::TEXTURE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+				// Immutable textures have no graph tracker to make this transition visible to sampling.
+				static const bool upload_read_barrier = OS::get_singleton()->has_environment("LIGHTCYCLE_UPLOAD_READ_BARRIER");
+				if (upload_read_barrier) {
+					tb.dst_access = RDD::BARRIER_ACCESS_SHADER_READ_BIT;
+				}
 				tb.subresources.aspect = texture->barrier_aspect_flags;
 				tb.subresources.mipmap_count = texture->mipmaps;
 				tb.subresources.base_layer = p_layer;

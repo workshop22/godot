@@ -814,6 +814,19 @@ private:
 	RDD::DriverWorkarounds driver_workarounds;
 	RenderPassCreationFunction render_pass_creation_function = nullptr;
 	int64_t tracking_frame = 0;
+	// CPU oracle for buffer/AS hazard ordering, independent of graph adjacency lists.
+	struct AuditAccess {
+		uint64_t resource = 0;
+		uint32_t command = 0;
+		bool acceleration = false;
+		bool write = false;
+		bool operator<(const AuditAccess &p_other) const { return command < p_other.command; }
+	};
+	bool audit_graph_enabled = false;
+	uint64_t audit_graph_errors = 0;
+	uint64_t audit_graph_access_count = 0;
+	LocalVector<AuditAccess> audit_graph_accesses;
+	void _audit_dependencies(VectorView<RecordedCommandSort> p_commands, bool p_reorder);
 	LocalVector<uint8_t> command_data;
 	LocalVector<uint32_t> command_data_offsets;
 	LocalVector<RDD::TextureBarrier> command_normalization_barriers;
