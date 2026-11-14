@@ -652,6 +652,33 @@ int walk_tree(int start, vec3 o, vec3 d, inout float t, out vec3 normal, bool an
 layout(set = 0, binding = 15) uniform accelerationStructureEXT static_scene;
 layout(set = 0, binding = 16) uniform accelerationStructureEXT moving_scene;
 
+#ifdef PXTGI_HW_RAY_AUDIT
+layout(std430, set = 0, binding = 24) buffer RayAudit { uint words[]; } ray_audit;
+void audit_ray(vec3 o, vec3 d, float reach, uint bad, bool any_hit, bool items) {
+	atomicAdd(ray_audit.words[0], 1u);
+	for (uint bit = 0u; bit < 5u; bit++) {
+		if ((bad & (1u << bit)) != 0u) atomicAdd(ray_audit.words[1u + bit], 1u);
+	}
+	if (atomicCompSwap(ray_audit.words[8], 0u, 1u) == 0u) {
+		ray_audit.words[9] = PXTGI_RAY_PASS;
+		ray_audit.words[10] = f.cache.x;
+		ray_audit.words[11] = floatBitsToUint(f.misc.x);
+		ray_audit.words[12] = gl_GlobalInvocationID.x;
+		ray_audit.words[13] = gl_GlobalInvocationID.y;
+		ray_audit.words[14] = bad;
+		ray_audit.words[15] = floatBitsToUint(reach);
+		ray_audit.words[16] = floatBitsToUint(o.x);
+		ray_audit.words[17] = floatBitsToUint(o.y);
+		ray_audit.words[18] = floatBitsToUint(o.z);
+		ray_audit.words[19] = floatBitsToUint(d.x);
+		ray_audit.words[20] = floatBitsToUint(d.y);
+		ray_audit.words[21] = floatBitsToUint(d.z);
+		ray_audit.words[22] = uint(f.counts.y);
+		ray_audit.words[23] = (any_hit ? 1u : 0u) | (items ? 2u : 0u);
+	}
+}
+#endif
+
 vec3 hw_normal(int slot, int tri, vec3 p, vec3 d) {
 	Primitive q = prims.p[slot];
 	vec3 n;
@@ -691,6 +718,17 @@ int walk_world(vec3 o, vec3 d, inout float t, out vec3 normal, bool any_hit, boo
 	if (f.counts.y == 0) {
 		return hit;
 	}
+#ifdef PXTGI_HW_RAY_AUDIT
+	uint bad = (t < 0.0 ? 1u : 0u) | ((isnan(t) || isinf(t)) ? 2u : 0u) |
+		((any(isnan(o)) || any(isinf(o))) ? 4u : 0u) |
+		((any(isnan(d)) || any(isinf(d))) ? 8u : 0u) | (all(equal(d, vec3(0.0))) ? 16u : 0u);
+	if (bad != 0u) {
+		audit_ray(o, d, t, bad, any_hit, items);
+#ifdef PXTGI_HW_RAY_GUARD
+		return hit;
+#endif
+	}
+#endif
 	uint flags = gl_RayFlagsOpaqueEXT | (any_hit ? gl_RayFlagsTerminateOnFirstHitEXT : 0u);
 	HW_QUERY(static_scene)
 	if (!any_hit || hit < 0) {
@@ -713,6 +751,12 @@ int trace_world(vec3 o, vec3 d, inout float t, out vec3 normal) {
 
 // Whether anything lies along the ray before reach (shadow rays).
 bool blocked(vec3 o, vec3 d, float reach) {
+	// The end bias can consume a short light segment. It has no occluder, and a negative tMax is invalid for a ray query.
+#ifndef PXTGI_HW_LEGACY_SHADOW_RANGE
+	if (reach <= 0.0) {
+		return false;
+	}
+#endif
 	vec3 n;
 	return walk_world(o, d, reach, n, true, false) >= 0;
 }
@@ -2596,6 +2640,20 @@ String pass_source(const char *p_shader, bool p_reflection, bool p_hardware, con
 		source = source.replace("f.trace_settings.z", "f.item_trace.z").replace("f.polish.z", "f.item_trace.w");
 	}
 	String version = p_hardware ? "#version 460\n#extension GL_EXT_ray_query : require\n#define PXTGI_HW\n" : "#version 450\n";
+	if (p_hardware && OS::get_singleton()->has_environment("PXTGI_HW_LEGACY_SHADOW_RANGE")) {
+		version += "#define PXTGI_HW_LEGACY_SHADOW_RANGE\n";
+	}
+	if (p_hardware && OS::get_singleton()->has_environment("PXTGI_HW_RAY_AUDIT")) {
+		version += "#define PXTGI_HW_RAY_AUDIT\n";
+		if (OS::get_singleton()->get_environment("PXTGI_HW_RAY_AUDIT").to_int() >= 2) {
+			version += "#define PXTGI_HW_RAY_GUARD\n";
+		}
+		for (uint32_t pass = 0; pass < sizeof(SHADERS) / sizeof(SHADERS[0]); pass++) {
+			if (p_shader == SHADERS[pass]) {
+				version += vformat("#define PXTGI_RAY_PASS %du\n", pass);
+			}
+		}
+	}
 	if (!p_items.is_empty()) {
 		version += "#define PXTGI_ITEMS\n";
 		if (p_items.contains("lightriders_lattice")) {
@@ -2724,6 +2782,14 @@ static std::atomic<uint64_t> render_geometry_us{ 0 };
 
 Dictionary PhysXGIEffect::render_stats(bool p_reset) {
 	Dictionary stats;
+	if (OS::get_singleton()->has_environment("PXTGI_HW_RAY_AUDIT_READ")) {
+		Ref<PhysXGIEffect> effect = get_shared();
+		Dictionary audit;
+		pxtgi_run_on_render_thread([effect, &audit]() {
+			audit = effect->_hw_read_ray_audit(RenderingServer::get_singleton()->get_rendering_device());
+		});
+		stats["ray_audit"] = audit;
+	}
 	stats["total_us"] = int64_t(render_total_us.load());
 	stats["worst_us"] = int64_t(render_worst_us.load());
 	stats["calls"] = int64_t(render_frames.load());
@@ -2833,7 +2899,40 @@ static void hw_guard_write(const String &p_state) {
 	}
 }
 
+Dictionary PhysXGIEffect::_hw_read_ray_audit(RenderingDevice *p_rd) {
+	Dictionary result;
+	if (hw_ray_audit.is_valid()) {
+		// Only an explicit post-ride statistics request reads this buffer.
+		const Vector<uint8_t> audit = p_rd->buffer_get_data(hw_ray_audit);
+		if (audit.size() >= 128) {
+			uint32_t w[32];
+			memcpy(w, audit.ptr(), sizeof(w));
+			float ray[7];
+			memcpy(ray, &w[15], sizeof(ray));
+			result["invalid"] = int64_t(w[0]);
+			result["negative_range"] = int64_t(w[1]);
+			result["nonfinite_range"] = int64_t(w[2]);
+			result["nonfinite_origin"] = int64_t(w[3]);
+			result["nonfinite_direction"] = int64_t(w[4]);
+			result["zero_direction"] = int64_t(w[5]);
+			result["end_cache_frame"] = int64_t(frame);
+			result["first_cache_frame"] = int64_t(w[10]);
+			result["first_pass"] = int64_t(w[9]);
+			result["first_reach"] = ray[0];
+			print_line(vformat("PXTGI_RAY_AUDIT invalid=%d negative_range=%d nonfinite_range=%d nonfinite_origin=%d nonfinite_direction=%d zero_direction=%d end_cache_frame=%d", int64_t(w[0]), int64_t(w[1]), int64_t(w[2]), int64_t(w[3]), int64_t(w[4]), int64_t(w[5]), int64_t(frame)));
+			if (w[0] != 0) {
+				print_line(vformat("PXTGI_RAY_AUDIT first pass=%d cache_frame=%d pixel=(%d,%d) bad=%d flags=%d reach=%s origin=%s direction=%s", w[9], w[10], w[12], w[13], w[14], w[23], ray[0], Vector3(ray[1], ray[2], ray[3]), Vector3(ray[4], ray[5], ray[6])));
+			}
+		}
+	}
+	return result;
+}
+
 void PhysXGIEffect::_hw_free(RenderingDevice *p_rd) {
+	if (hw_ray_audit.is_valid()) {
+		p_rd->free_rid(hw_ray_audit);
+		hw_ray_audit = RID();
+	}
 	// Structures before the buffers they were built from (freeing a buffer frees what was built from it).
 	for (RID r : { hw_static_tlas, hw_moving_tlas, hw_static_spare, hw_moving_spare, hw_box_blas }) {
 		if (r.is_valid()) {
@@ -3722,6 +3821,16 @@ void PhysXGIEffect::_dispatch(RenderingDevice *p_rd, int p_pass, const Vector<RD
 	if (hw) {
 		uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_ACCELERATION_STRUCTURE, 15, hw_static_tlas));
 		uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_ACCELERATION_STRUCTURE, 16, hw_moving_tlas));
+		static const bool audit_rays = OS::get_singleton()->has_environment("PXTGI_HW_RAY_AUDIT");
+		if (audit_rays) {
+			if (hw_ray_audit.is_null()) {
+				Vector<uint8_t> zeros;
+				zeros.resize(128);
+				memset(zeros.ptrw(), 0, zeros.size());
+				hw_ray_audit = p_rd->storage_buffer_create(zeros.size(), zeros);
+			}
+			uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 24, hw_ray_audit));
+		}
 	}
 	const bool item_pass = p_pass == PASS_REFLECT && active_item_pipelines;
 	const RID shader = item_pass ? active_item_pipelines->shader[hw ? 1 : 0] : (hw ? hw_shaders[p_pass] : shaders[p_pass]);
@@ -3730,6 +3839,11 @@ void PhysXGIEffect::_dispatch(RenderingDevice *p_rd, int p_pass, const Vector<RD
 	ERR_FAIL_COND(!set.is_valid());
 	// GPU timestamps per pass (the visual profiler shows them).
 	p_rd->capture_timestamp(String("PXTGI ") + PASS_NAMES[p_pass]);
+	static const bool label_passes = OS::get_singleton()->has_environment("LIGHTCYCLE_CRUMBS");
+	if (label_passes) {
+		const CharString label = (String("PXTGI ") + PASS_NAMES[p_pass]).utf8();
+		p_rd->draw_command_begin_label(Span<char>(label.get_data(), label.length()));
+	}
 	const RD::ComputeListID list = p_rd->compute_list_begin();
 	p_rd->compute_list_bind_compute_pipeline(list, pipeline);
 	p_rd->compute_list_bind_uniform_set(list, set, 0);
@@ -3738,6 +3852,9 @@ void PhysXGIEffect::_dispatch(RenderingDevice *p_rd, int p_pass, const Vector<RD
 	}
 	p_rd->compute_list_dispatch(list, (p_size.x + 7) / 8, (p_size.y + 7) / 8, 1);
 	p_rd->compute_list_end();
+	if (label_passes) {
+		p_rd->draw_command_end_label();
+	}
 }
 
 // The frame's recording, timed: with PXTGI_RT_TIMING set, a slow one (or a long gap since the last frame, which is the

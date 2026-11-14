@@ -608,6 +608,12 @@ Error RenderingDeviceDriverVulkan::_initialize_device_extensions() {
 	}
 #endif
 	_register_requested_device_extension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME, false);
+	if (OS::get_singleton()->has_environment("LIGHTCYCLE_GPU_DIAGNOSTICS")) {
+		_register_requested_device_extension(VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME, false);
+	}
+	if (OS::get_singleton()->has_environment("LIGHTCYCLE_NV_CHECKPOINTS")) {
+		_register_requested_device_extension(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME, false);
+	}
 
 	{
 		// Debug marker extensions.
@@ -925,6 +931,7 @@ Error RenderingDeviceDriverVulkan::_check_device_capabilities() {
 		VkPhysicalDeviceRayTracingValidationFeaturesNV raytracing_validation_features = {};
 		VkPhysicalDeviceRayQueryFeaturesKHR ray_query_features = {};
 		VkPhysicalDeviceFaultFeaturesEXT device_fault_features = {};
+		VkPhysicalDeviceDiagnosticsConfigFeaturesNV diagnostics_config_features = {};
 
 		const bool use_1_2_features = physical_device_properties.apiVersion >= VK_API_VERSION_1_2;
 		if (use_1_2_features) {
@@ -1028,6 +1035,11 @@ Error RenderingDeviceDriverVulkan::_check_device_capabilities() {
 		}
 
 		VkPhysicalDeviceFeatures2 device_features_2 = {};
+		if (enabled_device_extension_names.has(VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME)) {
+			diagnostics_config_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DIAGNOSTICS_CONFIG_FEATURES_NV;
+			diagnostics_config_features.pNext = next_features;
+			next_features = &diagnostics_config_features;
+		}
 		device_features_2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
 		device_features_2.pNext = next_features;
 		functions.GetPhysicalDeviceFeatures2(physical_device, &device_features_2);
@@ -1099,6 +1111,7 @@ Error RenderingDeviceDriverVulkan::_check_device_capabilities() {
 		}
 
 		// vkGetDeviceFaultInfoEXT is only valid when the deviceFault feature is enabled at device creation.
+		diagnostics_config_support = diagnostics_config_features.diagnosticsConfig;
 		if (enabled_device_extension_names.has(VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
 			device_fault_support = device_fault_features.deviceFault;
 			device_fault_vendor_binary_support = device_fault_features.deviceFault && device_fault_features.deviceFaultVendorBinary && OS::get_singleton()->has_environment("LIGHTCYCLE_GPU_DUMP");
@@ -1424,6 +1437,20 @@ Error RenderingDeviceDriverVulkan::_initialize_device(const LocalVector<VkDevice
 		create_info_next = &pipeline_cache_control_features;
 	}
 
+	// Opt-in crash-dump enrichment. No automatic checkpoints: their call stack collection changes CPU timing.
+	VkPhysicalDeviceDiagnosticsConfigFeaturesNV diagnostics_config_features = {};
+	VkDeviceDiagnosticsConfigCreateInfoNV diagnostics_config_info = {};
+	if (diagnostics_config_support) {
+		diagnostics_config_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DIAGNOSTICS_CONFIG_FEATURES_NV;
+		diagnostics_config_features.diagnosticsConfig = VK_TRUE;
+		diagnostics_config_features.pNext = create_info_next;
+		create_info_next = &diagnostics_config_features;
+		diagnostics_config_info.sType = VK_STRUCTURE_TYPE_DEVICE_DIAGNOSTICS_CONFIG_CREATE_INFO_NV;
+		diagnostics_config_info.flags = OS::get_singleton()->get_environment("LIGHTCYCLE_GPU_DIAGNOSTICS").to_int();
+		diagnostics_config_info.pNext = create_info_next;
+		create_info_next = &diagnostics_config_info;
+		print_line(vformat("NVIDIA crash diagnostics enabled, flags %d.", diagnostics_config_info.flags));
+	}
 	VkPhysicalDeviceFaultFeaturesEXT device_fault_features = {};
 	if (device_fault_support) {
 		device_fault_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT;
@@ -1565,6 +1592,11 @@ Error RenderingDeviceDriverVulkan::_initialize_device(const LocalVector<VkDevice
 		}
 
 		// Debug device fault extension.
+		if (enabled_device_extension_names.has(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME)) {
+			device_functions.CmdSetCheckpointNV = (PFN_vkCmdSetCheckpointNV)functions.GetDeviceProcAddr(vk_device, "vkCmdSetCheckpointNV");
+			device_functions.GetQueueCheckpointDataNV = (PFN_vkGetQueueCheckpointDataNV)functions.GetDeviceProcAddr(vk_device, "vkGetQueueCheckpointDataNV");
+			print_line("NVIDIA diagnostic checkpoints enabled (replace buffer-fill breadcrumbs).");
+		}
 		if (device_fault_support) {
 			device_functions.GetDeviceFaultInfoEXT = (PFN_vkGetDeviceFaultInfoEXT)functions.GetDeviceProcAddr(vk_device, "vkGetDeviceFaultInfoEXT");
 		}
@@ -6936,6 +6968,10 @@ void RenderingDeviceDriverVulkan::command_insert_breadcrumb(CommandBufferID p_cm
 	}
 
 	const CommandBufferInfo *command_buffer = (const CommandBufferInfo *)p_cmd_buffer.id;
+	if (device_functions.CmdSetCheckpointNV != nullptr) {
+		device_functions.CmdSetCheckpointNV(command_buffer->vk_command_buffer, (const void *)(uintptr_t)p_data);
+		return;
+	}
 	if (Engine::get_singleton()->is_accurate_breadcrumbs_enabled()) {
 		// Force a full barrier so commands are not executed in parallel.
 		// This will mean that the last breadcrumb to see was actually the
@@ -6993,6 +7029,24 @@ void RenderingDeviceDriverVulkan::command_insert_breadcrumb(CommandBufferID p_cm
 }
 
 void RenderingDeviceDriverVulkan::on_device_lost() const {
+	if (device_functions.GetQueueCheckpointDataNV != nullptr) {
+		for (uint32_t family = 0; family < queue_families.size(); family++) {
+			for (uint32_t queue = 0; queue < queue_families[family].size(); queue++) {
+				uint32_t count = 0;
+				device_functions.GetQueueCheckpointDataNV(queue_families[family][queue].queue, &count, nullptr);
+				LocalVector<VkCheckpointDataNV> checkpoints;
+				checkpoints.resize_initialized(count);
+				for (VkCheckpointDataNV &checkpoint : checkpoints) {
+					checkpoint.sType = VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV;
+				}
+				device_functions.GetQueueCheckpointDataNV(queue_families[family][queue].queue, &count, checkpoints.ptr());
+				for (uint32_t i = 0; i < count; i++) {
+					const uint32_t marker = uint32_t((uintptr_t)checkpoints[i].pCheckpointMarker);
+					_err_print_error(FUNCTION_STR, __FILE__, __LINE__, vformat("NVIDIA checkpoint queue %d:%d stage %d marker %d (phase %d, user data %d).", family, queue, uint32_t(checkpoints[i].stage), marker, marker >> 16, marker & 0xFFFF));
+				}
+			}
+		}
+	}
 	if (device_functions.GetDeviceFaultInfoEXT == nullptr) {
 		_err_print_error(FUNCTION_STR, __FILE__, __LINE__, "VK_EXT_device_fault not available.");
 		return;

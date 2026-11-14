@@ -126,6 +126,8 @@ class RenderingDeviceDriverVulkan : public RenderingDeviceDriver {
 
 		// Debug device fault.
 		PFN_vkGetDeviceFaultInfoEXT GetDeviceFaultInfoEXT = nullptr;
+		PFN_vkCmdSetCheckpointNV CmdSetCheckpointNV = nullptr;
+		PFN_vkGetQueueCheckpointDataNV GetQueueCheckpointDataNV = nullptr;
 
 		// Raytracing extensions.
 		PFN_vkCreateAccelerationStructureKHR CreateAccelerationStructureKHR = nullptr;
@@ -172,6 +174,7 @@ class RenderingDeviceDriverVulkan : public RenderingDeviceDriver {
 	// Diagnostics (LIGHTCYCLE_GPU_DUMP=<folder>): the vendor's crash dump is asked for with the fault report and saved
 	// there. NVIDIA's is an Aftermath dump (.nv-gpudmp): what the GPU was executing and what the faulting address was.
 	bool device_fault_vendor_binary_support = false;
+	bool diagnostics_config_support = false;
 	bool framebuffer_depth_resolve = false;
 #if defined(VK_TRACK_DEVICE_MEMORY)
 	bool device_memory_report_support = false;

@@ -331,6 +331,8 @@ private:
 	RID hw_pipelines[PASS_MAX];
 	RID hw_box_vertices;
 	RID hw_box_blas;
+	RID hw_ray_audit;
+	Dictionary _hw_read_ray_audit(RenderingDevice *p_rd);
 	struct HardwareMesh {
 		RID vertices;
 		RID blas; // lazy: grouped-only parts need vertices, not an additional singleton BLAS
