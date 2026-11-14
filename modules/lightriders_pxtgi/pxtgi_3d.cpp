@@ -1919,6 +1919,9 @@ void PXTGI3D::_rescan(bool p_notified_only) {
 			remember_geometry(id);
 			pending_membership.erase(id);
 		}
+		if (pending_membership.is_empty()) {
+			frames_since_rescan = 0; // nothing waits: the next batch counts its own frames
+		}
 	} else {
 		for (const ObjectID &id : pending_membership) {
 			if (!fresh_root) {
@@ -2727,10 +2730,11 @@ void PXTGI3D::_update_primitives(PhysXGIEffect::Snapshot &r_snapshot) {
 		}
 		float *record = &entry_floats[i * PF];
 		if (valid != bool(entry_valid[i])) {
-			if (!entry.moving && pending_membership.has(entry.shape_node)) {
-				// A static shape whose node has left already goes with the batch that removes it (a retiring cell is
-				// freed over many frames). Found here first by the verification slice, each rebuilt the static part
-				// on its own frame: 30 of a 30 s city ride's 59 rebuilds with a batch of sixty frames.
+			if (!entry.moving && !tracked.has(entry.shape_node) && pending_membership.has(entry.shape_node)) {
+				// A static shape whose node has left already (no longer tracked, its removal pending) goes with the
+				// batch that removes it: a retiring cell is freed over many frames. Found here first by the
+				// verification slice, each rebuilt the static part on its own frame: 30 of a 30 s city ride's 59
+				// rebuilds with a batch of sixty frames. A shape pending for another reason is still decided here.
 				continue;
 			}
 			entry_valid[i] = valid;

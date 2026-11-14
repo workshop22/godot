@@ -3907,12 +3907,18 @@ void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_rende
 		// reordering, pruning and slot reuse otherwise fall back to the ID map.
 		const uint32_t history_slot = history_slots[i];
 		if (i < s.static_count && slot_ids[i] == identity.first && identity.second != UINT64_MAX) {
-			// A static shape in the slot it had when the static part was last laid out: it has not moved (one that
-			// does joins the moving part), so its world is the one worked out then and its motion is none. A rebuild
-			// for a streamed cell keeps nearly every slot, and working all 43,000 of a city out again was 5 to 7 ms
-			// of the render thread on that frame.
+			// A static shape in the slot it had when the static part was last laid out, with the pose it had: its
+			// world is the one worked out then and its motion is none. A rebuild for a streamed cell keeps nearly
+			// every slot, and working all 43,000 of a city out again was 5 to 7 ms of the render thread on that
+			// frame. The pose is compared, not assumed: a shape can come back at its slot somewhere else (its
+			// resource or body changed, or it was disabled and enabled again elsewhere).
 			PhysXGIView::ShapeHistory *kept = history_slot < v.previous_shapes.size() && v.previous_shapes[history_slot].id == identity.first ? &v.previous_shapes[history_slot] : v.get_shape_history(identity.first);
-			if (kept && kept->is_static && kept->generation == identity.second) {
+			const float *pose = &s.primitives[i * PRIMITIVE_FLOATS];
+			bool same_pose = kept != nullptr;
+			for (int r = 0; r < 3 && same_pose; r++) {
+				same_pose = kept->local.basis.rows[r] == Vector3(pose[r * 4], pose[r * 4 + 1], pose[r * 4 + 2]) && kept->local.origin[r] == pose[r * 4 + 3];
+			}
+			if (same_pose && kept->is_static && kept->generation == identity.second) {
 				if (!static_motion_resident) {
 					memcpy(motion_data + i * 16, unmoved, sizeof(unmoved));
 				}
