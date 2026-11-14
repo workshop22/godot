@@ -1847,7 +1847,7 @@ void main() {
 		vec3 wo = (f.view_to_world * vec4(origin, 1.0)).xyz;
 		vec3 wd = normalize(mat3(f.view_to_world) * dir);
 #ifdef PXTGI_LATTICE
-		prepare_item_differentials(p, dir, geometry_normal, fp, depth);
+		prepare_item_differentials(p, dir, geometry_normal, at, depth);
 #endif
 		float limit = found ? min(hit_t, f.trace_settings.x) : f.trace_settings.x;
 		// Screen hits may overlook an off-screen occluder; items only contribute
@@ -1903,7 +1903,8 @@ void main() {
 	vec3 mirrored_delta = reflect(mat3(f.world_to_view) * hit_delta, motion_normal);
 	float previous_depth;
 	vec2 previous = prev_pixel(virtual_point + mirrored_delta, previous_depth);
-	vec2 velocity = (previous - vec2(fp)) / vec2(f.sizes.xy);
+	// From where the ray started (a drawn point of the texel, reflection_jitter), not the pixel that holds it.
+	vec2 velocity = (previous - at) / vec2(f.sizes.xy);
 	bool usable = motion_valid && nr.w <= 0.5 && previous_depth > f.clip.z && !any(isnan(velocity)) && !any(isinf(velocity));
 	imageStore(motion_dst, px, vec4(usable ? velocity : vec2(0.0), min(-virtual_point.z, 65000.0), usable ? 1.0 : 0.0));
 	vec4 result = found ? vec4(light, 1.0) : vec4(0.0);
@@ -2458,11 +2459,11 @@ vec3 item_reflected_view_z;
 // Intersect adjacent camera rays with the receiver's tangent plane and keep the
 // current sample's reflection plane; neighbouring random GGX samples are not a
 // derivative. No extra scene rays or depth reads are needed.
-void prepare_item_differentials(vec3 receiver, vec3 direction, vec3 receiver_normal, ivec2 pixel, float depth) {
+void prepare_item_differentials(vec3 receiver, vec3 direction, vec3 receiver_normal, vec2 pixel, float depth) {
 	vec3 mirror_normal = normalize(receiver) - direction;
 	mirror_normal = dot(mirror_normal, mirror_normal) > 1e-12 ? normalize(mirror_normal) : receiver_normal;
-	vec3 px = view_from_pixel(vec2(pixel) + vec2(1.0, 0.0), depth, f.proj_info, f.clip.x, f.clip.y);
-	vec3 py = view_from_pixel(vec2(pixel) + vec2(0.0, 1.0), depth, f.proj_info, f.clip.x, f.clip.y);
+	vec3 px = view_from_pixel(pixel + vec2(1.0, 0.0), depth, f.proj_info, f.clip.x, f.clip.y);
+	vec3 py = view_from_pixel(pixel + vec2(0.0, 1.0), depth, f.proj_info, f.clip.x, f.clip.y);
 	vec3 dx = normalize(px);
 	vec3 dy = normalize(py);
 	float plane = dot(receiver_normal, receiver);
@@ -3007,6 +3008,13 @@ bool PhysXGIEffect::_hw_compile(RenderingDevice *p_rd) {
 // The exact ordered key selects either the part's lazy singleton or a composite.
 // GeometryIndex is its position here; PrimitiveIndex still addresses the original
 // SAH-ordered triangle stream, so all material/normal/motion/UV readers stay logical.
+static bool rt_timing();
+// Diagnostics (PXTGI_RT_TIMING), added hunting the device loss on Aurora Circuit (UPSTREAM.md): the mesh keys the
+// static structure was last built from, and those of them retired since without the structure being built again --
+// a structure naming a freed mesh structure, which RenderingDevice does not refuse to trace.
+static HashSet<uint64_t> rt_static_keys;
+static LocalVector<uint64_t> rt_dangling_keys;
+
 RID PhysXGIEffect::_hw_blas(RenderingDevice *p_rd, const HardwareGroupKey &p_key) {
 	ERR_FAIL_COND_V(p_key.count < 1 || p_key.count > 3, RID());
 	if (p_key.count == 1) {
@@ -3061,6 +3069,12 @@ bool PhysXGIEffect::_hw_instance(RenderingDevice *p_rd, const Snapshot &p_snapsh
 		}
 	} else {
 		return false;
+	}
+	if (rt_timing()) {
+		const float det = to_world.basis.determinant();
+		if (!to_world.is_finite() || !Math::is_finite(det) || Math::abs(det) < 1e-12f) {
+			print_line(vformat("PXTGI: instance %d (type %d, key %d) has a degenerate transform: det %f, origin %s, basis %s (frame %d).", p_slot, type, p_slot < p_snapshot.primitive_keys.size() ? int64_t(p_snapshot.primitive_keys[p_slot]) : int64_t(0), det, to_world.origin, to_world.basis, int64_t(Engine::get_singleton()->get_frames_drawn())));
+		}
 	}
 	r_instance.transform = to_world;
 	r_instance.id = uint32_t(p_slot);
@@ -3216,7 +3230,13 @@ bool PhysXGIEffect::_hw_update(RenderingDevice *p_rd, const Snapshot &p_snapshot
 				retired.push_back(entry.key);
 			}
 		}
+		if (!retired.is_empty() && rt_timing()) {
+			print_line(vformat("PXTGI: %d meshes retired, %d composites live (frame %d).", retired.size(), hw_groups.size(), int64_t(Engine::get_singleton()->get_frames_drawn())));
+		}
 		for (uint64_t key : retired) {
+			if (rt_timing() && rt_static_keys.has(key)) {
+				rt_dangling_keys.push_back(key);
+			}
 			// RenderingDevice defers destruction until the in-flight frame has completed.
 			const HardwareMesh mesh = hw_meshes[key];
 			if (mesh.blas.is_valid()) {
@@ -3235,6 +3255,15 @@ bool PhysXGIEffect::_hw_update(RenderingDevice *p_rd, const Snapshot &p_snapshot
 			const Vector<float> &tris = p_snapshot.block_triangles[i];
 			if (hw_meshes.has(key) || tris.size() < 12) {
 				continue;
+			}
+			if (rt_timing()) {
+				int bad = 0;
+				for (int k = 0; k < tris.size(); k++) {
+					bad += Math::is_finite(tris[k]) ? 0 : 1;
+				}
+				if (bad > 0 || tris.size() % 12 != 0) {
+					print_line(vformat("PXTGI: mesh %d has %d floats, %d of them not finite (frame %d).", int64_t(key), tris.size(), bad, int64_t(Engine::get_singleton()->get_frames_drawn())));
+				}
 			}
 			const Span<uint8_t> data((const uint8_t *)tris.ptr(), tris.size() * sizeof(float));
 			const RID vertices = p_rd->vertex_buffer_create(data.size(), data, RD::BUFFER_CREATION_DEVICE_ADDRESS_BIT | RD::BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT);
@@ -3281,6 +3310,9 @@ bool PhysXGIEffect::_hw_update(RenderingDevice *p_rd, const Snapshot &p_snapshot
 			}
 			// Built again in place: a new structure (and freeing the old one under frames in flight) only when it grows.
 			if (instances.size() > hw_static_capacity) {
+				if (rt_timing()) {
+					print_line(vformat("PXTGI: static structure outgrows %d: %d shapes (frame %d).", hw_static_capacity, instances.size(), int64_t(Engine::get_singleton()->get_frames_drawn())));
+				}
 				if (hw_static_tlas.is_valid()) {
 					p_rd->free_rid(hw_static_tlas);
 				}
@@ -3290,11 +3322,27 @@ bool PhysXGIEffect::_hw_update(RenderingDevice *p_rd, const Snapshot &p_snapshot
 			}
 			ERR_FAIL_COND_V(p_rd->tlas_build(hw_static_tlas, Span<RD::AccelerationStructureInstance>(instances.ptr(), instances.size())) != OK, false);
 			if (rt_timing()) {
+				rt_static_keys.clear();
+				rt_dangling_keys.clear();
+				for (int i = 0; i < count && i < p_snapshot.primitive_keys.size(); i++) {
+					if (p_snapshot.primitive_keys[i] != 0) {
+						rt_static_keys.insert(p_snapshot.primitive_keys[i]);
+					}
+				}
+			}
+			if (rt_timing()) {
 				print_line(vformat("PXTGI: static structure, %d shapes in %.2f ms (frame %d).", count, (OS::get_singleton()->get_ticks_usec() - since) / 1000.0, int64_t(Engine::get_singleton()->get_frames_drawn())));
 			}
 		}
 	}
 	hw_static_us = OS::get_singleton()->get_ticks_usec() - static_since;
+	if (rt_timing() && !rt_dangling_keys.is_empty()) {
+		print_line(vformat("PXTGI: DANGLING: %d meshes the static structure names were retired and it was not built again (first key %d, static version %d, frame %d).", rt_dangling_keys.size(), int64_t(rt_dangling_keys[0]), int64_t(p_snapshot.static_version), int64_t(Engine::get_singleton()->get_frames_drawn())));
+		for (uint64_t key : rt_dangling_keys) {
+			rt_static_keys.erase(key);
+		}
+		rt_dangling_keys.clear();
+	}
 	// The moving shapes, every frame (bikes, riders' walls).
 	const uint64_t moving_since = OS::get_singleton()->get_ticks_usec();
 	const int moving = hw_group_plan.size();
@@ -3357,6 +3405,9 @@ bool PhysXGIEffect::_hw_update(RenderingDevice *p_rd, const Snapshot &p_snapshot
 	const uint64_t instances_ready = timing ? OS::get_singleton()->get_ticks_usec() : 0;
 	hw_moving_instances_us = timing ? instances_ready - moving_since : 0;
 	if (instances.size() > hw_moving_capacity) {
+		if (rt_timing()) {
+			print_line(vformat("PXTGI: moving structure outgrows %d: %d instances (frame %d).", hw_moving_capacity, instances.size(), int64_t(Engine::get_singleton()->get_frames_drawn())));
+		}
 		if (hw_moving_tlas.is_valid()) {
 			p_rd->free_rid(hw_moving_tlas);
 		}
@@ -3568,6 +3619,7 @@ void PhysXGIView::free_data() {
 	previous_shapes.clear();
 	previous_shape_slots.clear();
 	primitive_history_slots.clear();
+	primitive_slot_ids.clear();
 	previous_moving_shapes.clear();
 	current_moving_shapes.clear();
 	primitive_motion_data.clear();
@@ -3825,6 +3877,15 @@ void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_rende
 	for (uint32_t i = previous_slot_count; i < v.primitive_history_slots.size(); i++) {
 		history_slots[i] = UINT32_MAX;
 	}
+	const uint32_t previous_slot_id_count = v.primitive_slot_ids.size();
+	v.primitive_slot_ids.resize(s.primitive_count);
+	uint64_t *slot_ids = v.primitive_slot_ids.ptr();
+	for (uint32_t i = previous_slot_id_count; i < v.primitive_slot_ids.size(); i++) {
+		slot_ids[i] = 0;
+	}
+	// The static slots' motion already reads "has not moved" (the frames between two rebuilds keep it so).
+	const bool static_motion_resident = v.primitive_motion_static_identity && v.primitive_motion_static_history == v.have_history;
+	const float unmoved[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, v.have_history ? 1.0f : 0.0f, 0, 0, 0 };
 	if (s.primitive_count == 0) {
 		memset(motion_data, 0, 16 * sizeof(float));
 	}
@@ -3840,17 +3901,33 @@ void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_rende
 	}
 	uint32_t next_history_slot = UINT32_MAX;
 	for (int i = static_changed ? 0 : s.static_count; i < s.primitive_count; i++) {
+		const Pair<uint64_t, uint64_t> &identity = s.primitive_ids[i];
+		// Most leaves keep their slot across streamed membership changes. Reuse
+		// their dense history index only while it still names this exact shape;
+		// reordering, pruning and slot reuse otherwise fall back to the ID map.
+		const uint32_t history_slot = history_slots[i];
+		if (i < s.static_count && slot_ids[i] == identity.first && identity.second != UINT64_MAX) {
+			// A static shape in the slot it had when the static part was last laid out: it has not moved (one that
+			// does joins the moving part), so its world is the one worked out then and its motion is none. A rebuild
+			// for a streamed cell keeps nearly every slot, and working all 43,000 of a city out again was 5 to 7 ms
+			// of the render thread on that frame.
+			PhysXGIView::ShapeHistory *kept = history_slot < v.previous_shapes.size() && v.previous_shapes[history_slot].id == identity.first ? &v.previous_shapes[history_slot] : v.get_shape_history(identity.first);
+			if (kept && kept->is_static && kept->generation == identity.second) {
+				if (!static_motion_resident) {
+					memcpy(motion_data + i * 16, unmoved, sizeof(unmoved));
+				}
+				history_slots[i] = uint32_t(kept - v.previous_shapes.ptr());
+				next_history_slot = history_slots[i] + 1;
+				kept->seen_frame = motion_frame;
+				continue;
+			}
+		}
 		const float *record = &s.primitives[i * PRIMITIVE_FLOATS];
 		Transform3D local;
 		for (int r = 0; r < 3; r++) {
 			local.basis.rows[r] = Vector3(record[r * 4], record[r * 4 + 1], record[r * 4 + 2]);
 			local.origin[r] = record[r * 4 + 3];
 		}
-		const Pair<uint64_t, uint64_t> &identity = s.primitive_ids[i];
-		// Most leaves keep their slot across streamed membership changes. Reuse
-		// their dense history index only while it still names this exact shape;
-		// reordering, pruning and slot reuse otherwise fall back to the ID map.
-		const uint32_t history_slot = history_slots[i];
 		PhysXGIView::ShapeHistory *cached = history_slot < v.previous_shapes.size() && v.previous_shapes[history_slot].id == identity.first ? &v.previous_shapes[history_slot] : nullptr;
 		// Removing a static leaf can shift the whole suffix's primitive slots.
 		// Its dense histories often remain neighbors; validate the exact ID
@@ -3886,6 +3963,7 @@ void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_rende
 		}
 		history_slots[i] = uint32_t(cached - v.previous_shapes.ptr());
 		next_history_slot = history_slots[i] + 1;
+		slot_ids[i] = identity.first;
 		cached->seen_frame = motion_frame;
 		cached->is_static = i < s.static_count;
 		if (!cached->is_static) {

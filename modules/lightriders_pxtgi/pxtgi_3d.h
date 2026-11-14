@@ -248,7 +248,11 @@ class PXTGI3D : public Node3D {
 	HashSet<ObjectID> tracked;
 	ObjectID tracked_root; // the node they were found under (the edited scene in the editor); none: walk again
 	HashSet<ObjectID> pending_membership; // only nodes whose classification or lifetime changed
-	bool membership_immediate = false; // explicit notifications are applied at the next publication
+	// Those of them the game notified (notify_body_changed): applied at the next publication, by themselves. The
+	// rest of the batch keeps waiting: a streamed cell's meshes are notified one by one as they are attached, and
+	// each used to bring the whole batch, the static part's rebuild with it, forward to that frame.
+	HashSet<ObjectID> notified_membership;
+	bool membership_immediate = false; // the whole batch is applied at the next publication (a subtree retired)
 	// Meshes outside any body that came since the last update: only one that glows means finding the shapes again
 	// (effects add and drop plain meshes all the time).
 	LocalVector<ObjectID> pending_meshes;
@@ -257,6 +261,7 @@ class PXTGI3D : public Node3D {
 	// (a few milliseconds on the main thread in a city). A streamed world's cells arrive in slices at its far edge:
 	// it asks for seconds, and takes one rebuild for many slices.
 	int membership_batch_frames = 10;
+	bool busy_frame = false; // set by the game each frame: a batch due waits for a frame that is not (up to three batches)
 	// Each tracked shape's and mesh's look (albedo, emission), with a bounded slice checked
 	// each frame for unnotified authoring edits. Explicit notifications apply at the next publication.
 	HashMap<ObjectID, Pair<Color, Color>> looks; // observation fallback; admitted nodes use ShapeEntry appearance
@@ -313,6 +318,29 @@ class PXTGI3D : public Node3D {
 	int trace_mode = 0; // 0 software, 1 world rays find nothing (their share of the cost), 2 hardware, 3 hardware where it is safe (NVIDIA, no earlier session lost with it)
 	bool hardware_layout = false; // hardware requested and the shared effect has not permanently fallen back
 	bool static_dirty = true;
+	// Why the static part is rebuilt: each cause's share of the rebuilds since the stats were last read
+	// (get_stats static_rebuilds). A streamed city rebuilt it 89 times in a 30 s ride with a batch of twenty frames.
+	enum StaticCause {
+		STATIC_REMOVED,
+		STATIC_REGROUPED,
+		STATIC_ADDED,
+		STATIC_ROOT,
+		STATIC_GEOMETRY,
+		STATIC_GENERATION,
+		STATIC_LAYOUT,
+		STATIC_VALIDITY,
+		STATIC_MOVED,
+		STATIC_TERRAIN,
+		STATIC_ROOTED,
+		STATIC_CAUSE_MAX,
+	};
+	uint64_t geometry_range_errors = 0; // PXTGI_RT_TIMING: leaves published naming a range their block is not at
+	uint32_t static_causes = 0;
+	uint32_t static_cause_counts[STATIC_CAUSE_MAX] = {};
+	void _static_dirty(StaticCause p_cause) {
+		static_dirty = true;
+		static_causes |= 1u << p_cause;
+	}
 	bool moving_dirty = true;
 	bool radiance_dirty = false; // only glow changed: the records in place, not the tree
 	AABB opaque_world_bounds;
@@ -356,7 +384,7 @@ class PXTGI3D : public Node3D {
 	uint64_t published_blocks_version = UINT64_MAX;
 	uint64_t primitives_version = 0;
 
-	void _rescan();
+	void _rescan(bool p_notified_only = false);
 	bool _sync_member(ObjectID p_id);
 	bool _membership_changed(Node *p_node, const ShapeEntry *p_entry) const;
 	void _observe(ObjectID p_id);
@@ -521,6 +549,8 @@ public:
 	float get_reflection_resolution_scale() const { return reflection_resolution_scale; }
 	void set_rays_per_texel(int p_value) { rays_per_texel = CLAMP(p_value, 1, 4); }
 	int get_rays_per_texel() const { return rays_per_texel; }
+	void set_busy_frame(bool p_busy) { busy_frame = p_busy; }
+	bool is_busy_frame() const { return busy_frame; }
 	void set_membership_batch_frames(int p_value) { membership_batch_frames = CLAMP(p_value, 1, 600); }
 	int get_membership_batch_frames() const { return membership_batch_frames; }
 	void set_emissive_candidates(int p_value) { emissive_candidates = CLAMP(p_value, 1, 16); }

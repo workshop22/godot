@@ -398,6 +398,7 @@ void PXTGI3D::_deactivate() {
 	look_order.clear();
 	look_slots.clear();
 	pending_membership.clear();
+	notified_membership.clear();
 	pending_meshes.clear();
 	tracked_root = ObjectID();
 	_detach();
@@ -683,11 +684,31 @@ LocalVector<Pair<Light3D *, float>> nearest_lights(const LocalVector<ObjectID> &
 	return chosen;
 }
 
-// The ids of up to p_max of them: the lamps the publications between two looks at every lamp weigh.
+// The lamps the publications between two looks at every lamp weigh: the ids of up to p_max of those Godot draws now
+// and of up to p_max of those it does not (hidden or dark: one may light up before the next look, a muzzle flash for a
+// few frames), the nearest reach of each kind first.
 void nearest_light_ids(const LocalVector<ObjectID> &p_lights, const Vector3 &p_eye, int p_max, LocalVector<ObjectID> &r_ids) {
+	struct NearerFirst {
+		bool operator()(const Pair<float, ObjectID> &p_a, const Pair<float, ObjectID> &p_b) const { return p_a.first < p_b.first; }
+	};
 	r_ids.clear();
-	for (const Pair<Light3D *, float> &l : nearest_lights(p_lights, p_eye, p_max)) {
-		r_ids.push_back(l.first->get_instance_id());
+	LocalVector<Pair<float, ObjectID>> kinds[2]; // drawn, not drawn
+	for (const ObjectID &id : p_lights) {
+		Light3D *light = ObjectDB::get_instance<Light3D>(id);
+		if (light == nullptr || !light->is_inside_tree()) {
+			continue;
+		}
+		const float gap = MAX(light->get_global_position().distance_to(p_eye) - float(light->get_param(Light3D::PARAM_RANGE)), 0.0f);
+		kinds[light_presence(light, p_eye) > 0.0f ? 0 : 1].push_back(Pair<float, ObjectID>(gap, id));
+	}
+	for (LocalVector<Pair<float, ObjectID>> &kind : kinds) {
+		if (kind.size() > uint32_t(p_max)) {
+			kind.sort_custom<NearerFirst>();
+			kind.resize(p_max);
+		}
+		for (const Pair<float, ObjectID> &l : kind) {
+			r_ids.push_back(l.second);
+		}
 	}
 }
 
@@ -1372,6 +1393,7 @@ void PXTGI3D::_track_all(Node *p_root) {
 	collect(p_root, tracked);
 	tracked_root = p_root->get_instance_id();
 	pending_membership.clear();
+	notified_membership.clear();
 	for (const ObjectID &id : tracked) {
 		pending_membership.insert(id);
 	}
@@ -1603,7 +1625,11 @@ void PXTGI3D::_remove_entry(int p_index) {
 	}
 	_unregister_entry(removed);
 	entry_of.erase(removed.shape_node);
-	(removed.moving ? moving_dirty : static_dirty) = true;
+	if (removed.moving) {
+		moving_dirty = true;
+	} else {
+		_static_dirty(STATIC_REMOVED);
+	}
 	const int last = shapes.size() - 1;
 	if (p_index != last) {
 		shapes[p_index] = shapes[last];
@@ -1742,7 +1768,11 @@ bool PXTGI3D::_sync_member(ObjectID p_id) {
 		if (current.wall_batch_scope != entry.wall_batch_scope ||
 				(current.wall_batch_scope.is_valid() && current.manual_updates != entry.manual_updates)) {
 			current.wall_batch_scope = entry.wall_batch_scope;
-			(current.moving ? moving_dirty : static_dirty) = true;
+			if (current.moving) {
+				moving_dirty = true;
+			} else {
+				_static_dirty(STATIC_REGROUPED);
+			}
 		}
 		current.sample_emission = entry.sample_emission;
 		current.emission_facing = entry.emission_facing;
@@ -1798,27 +1828,37 @@ bool PXTGI3D::_sync_member(ObjectID p_id) {
 	entry_slot.push_back(-1);
 	memset(&entry_floats[index * PF], 0, PF * sizeof(float));
 	entry_valid[index] = _refresh_entry(index, &entry_floats[index * PF], entry_bounds[index]);
-	(entry.moving ? moving_dirty : static_dirty) = true;
+	if (entry.moving) {
+		moving_dirty = true;
+	} else {
+		_static_dirty(STATIC_ADDED);
+	}
 	scan_fresh++;
 	_stage(STAGE_SCAN_REGISTER, register_since);
 	return geometry_changed;
 }
 
-void PXTGI3D::_rescan() {
+// The pending membership brought up to date, or (p_notified_only) just the part of it the game notified.
+void PXTGI3D::_rescan(bool p_notified_only) {
 	const uint64_t members_since = OS::get_singleton()->get_ticks_usec();
-	// Removal can be a temporary reparent or a new scan root. Only a dead full
-	// ObjectID loses its override implicitly; pooled owners clear theirs explicitly.
-	LocalVector<ObjectID> retired_looks;
-	for (const KeyValue<ObjectID, Pair<Color, Color>> &look : runtime_body_looks) {
-		if (ObjectDB::get_instance(look.key) == nullptr) {
-			retired_looks.push_back(look.key);
-		}
-	}
-	for (ObjectID id : retired_looks) {
-		runtime_body_looks.erase(id);
-	}
 	Node *root = _scan_root();
 	const bool fresh_root = root->get_instance_id() != tracked_root;
+	if (fresh_root) {
+		p_notified_only = false;
+	}
+	if (!p_notified_only) {
+		// Removal can be a temporary reparent or a new scan root. Only a dead full
+		// ObjectID loses its override implicitly; pooled owners clear theirs explicitly.
+		LocalVector<ObjectID> retired_looks;
+		for (const KeyValue<ObjectID, Pair<Color, Color>> &look : runtime_body_looks) {
+			if (ObjectDB::get_instance(look.key) == nullptr) {
+				retired_looks.push_back(look.key);
+			}
+		}
+		for (ObjectID id : retired_looks) {
+			runtime_body_looks.erase(id);
+		}
+	}
 	if (fresh_root) {
 		shapes.clear();
 		reflection_item_ids.clear();
@@ -1846,7 +1886,7 @@ void PXTGI3D::_rescan() {
 		omnis.clear();
 		spots.clear();
 		probes.clear();
-		static_dirty = true;
+		_static_dirty(STATIC_ROOT);
 		moving_dirty = true;
 		_track_all(root);
 		for (const ObjectID &id : tracked) {
@@ -1872,18 +1912,28 @@ void PXTGI3D::_rescan() {
 			affected_geometry.insert(shapes[*index].shape_resource);
 		}
 	};
-	for (const ObjectID &id : pending_membership) {
-		if (!fresh_root) {
+	if (p_notified_only) {
+		for (const ObjectID &id : notified_membership) {
 			remember_geometry(id);
-		}
-		geometry_changed |= _sync_member(id);
-		if (!fresh_root) {
+			geometry_changed |= _sync_member(id);
 			remember_geometry(id);
+			pending_membership.erase(id);
 		}
+	} else {
+		for (const ObjectID &id : pending_membership) {
+			if (!fresh_root) {
+				remember_geometry(id);
+			}
+			geometry_changed |= _sync_member(id);
+			if (!fresh_root) {
+				remember_geometry(id);
+			}
+		}
+		pending_membership.clear();
+		frames_since_rescan = 0;
+		membership_immediate = false;
 	}
-	pending_membership.clear();
-	frames_since_rescan = 0;
-	membership_immediate = false;
+	notified_membership.clear();
 	_stage(STAGE_SCAN_WALK, walk_since);
 	_stage(STAGE_SCAN_MEMBERS, members_since);
 	LocalVector<ObjectID> changed_geometry;
@@ -2162,7 +2212,11 @@ void PXTGI3D::_refresh_geometry() {
 	}
 	for (int i : changed) {
 		entry_valid[i] = _refresh_entry(i, &entry_floats[i * PhysXGIEffect::PRIMITIVE_FLOATS], entry_bounds[i]);
-		(shapes[i].moving ? moving_dirty : static_dirty) = true;
+		if (shapes[i].moving) {
+			moving_dirty = true;
+		} else {
+			_static_dirty(STATIC_GEOMETRY);
+		}
 		records_changed++;
 	}
 }
@@ -2291,7 +2345,11 @@ bool PXTGI3D::_refresh_entry(int p_index, float *r_out, AABB &r_bounds) {
 			const uint64_t generation = uint64_t(int64_t(body->get_meta("pxtgi_motion_identity", int64_t(0))));
 			if (entry.motion_generation != generation) {
 				entry.motion_generation = generation;
-				(entry.moving ? moving_dirty : static_dirty) = true;
+				if (entry.moving) {
+					moving_dirty = true;
+				} else {
+					_static_dirty(STATIC_GENERATION);
+				}
 			}
 		}
 	}
@@ -2306,10 +2364,23 @@ void PXTGI3D::_build_tree() {
 	const auto build_scene = hardware_layout ? build_hardware_leaf : build_bvh;
 	LocalVector<BuildItem> moving_items;
 	moving_items.reserve(moving_entries.size());
+	// Diagnostic (PXTGI_RT_TIMING): a leaf must name its geometry block's current range. A stale or unallocated one
+	// sends the shader's mesh walk into another block's words.
+	static const bool check_ranges = OS::get_singleton()->has_environment("PXTGI_RT_TIMING");
 	for (int i : moving_entries) {
 		if (entry_valid[i]) {
 			const AABB &b = entry_bounds[i];
 			moving_items.push_back({ b, b.get_center(), i, b.position, b.position + b.size });
+			if (check_ranges && shapes[i].geometry_type) {
+				const ShapeEntry &entry = shapes[i];
+				const GeometryBlock *block = geometry_blocks.getptr(entry.shape_resource);
+				int packed = 0;
+				memcpy(&packed, &entry_floats[i * PhysXGIEffect::PRIMITIVE_FLOATS + 13], sizeof(int));
+				if (block == nullptr || block->offset < 0 || block->offset != entry.geometry_a || packed != entry.geometry_a || entry.geometry_a >= geometry_floats / 4) {
+					geometry_range_errors++;
+					print_line(vformat("PXTGI: RANGE: moving leaf %d (type %d, item %d) names words %d (packed %d) but its block is at %d of %d (frame %d).", i, entry.geometry_type, entry.item_material, entry.geometry_a, packed, block ? block->offset : -2, geometry_floats / 4, int64_t(Engine::get_singleton()->get_frames_drawn())));
+				}
+			}
 		}
 	}
 	LocalVector<uint8_t> moving_groups;
@@ -2407,6 +2478,15 @@ void PXTGI3D::_build_tree() {
 		static_rooted = rooted;
 		static_dirty = false;
 		static_version++;
+		if (static_causes == 0) {
+			static_cause_counts[STATIC_ROOTED]++;
+		}
+		for (int c = 0; c < STATIC_CAUSE_MAX; c++) {
+			if (static_causes & (1u << c)) {
+				static_cause_counts[c]++;
+			}
+		}
+		static_causes = 0;
 		_stage(STAGE_STATIC_TREE, static_since);
 	}
 	const uint64_t since = OS::get_singleton()->get_ticks_usec();
@@ -2546,7 +2626,7 @@ void PXTGI3D::_update_primitives(PhysXGIEffect::Snapshot &r_snapshot) {
 	const bool hardware = trace_mode >= 2 && !PhysXGIEffect::get_shared()->has_hardware_fallback();
 	if (hardware != hardware_layout) {
 		hardware_layout = hardware;
-		static_dirty = true;
+		_static_dirty(STATIC_LAYOUT);
 		moving_dirty = true;
 	}
 	for (const ObjectID &id : pending_meshes) {
@@ -2563,7 +2643,11 @@ void PXTGI3D::_update_primitives(PhysXGIEffect::Snapshot &r_snapshot) {
 	pending_meshes.clear();
 	// Batch lifecycle changes over at most membership_batch_frames (ten unless the scene asks for longer). An explicit
 	// notification applies its affected membership before this publication.
-	if (tracked_root.is_null() || (!pending_membership.is_empty() && (membership_immediate || ++frames_since_rescan >= membership_batch_frames))) {
+	// A frame the game calls busy (busy_frame) leaves the batch waiting, up to three batches long: the scan and the
+	// static part's rebuild are 3 to 4 ms of one frame, and landed on the frames that already ran long. What the
+	// game notified is applied now, by itself.
+	const bool batch_due = !pending_membership.is_empty() && (membership_immediate || (++frames_since_rescan >= membership_batch_frames && (!busy_frame || frames_since_rescan >= 3 * membership_batch_frames)));
+	if (tracked_root.is_null() || batch_due) {
 		const uint64_t since = OS::get_singleton()->get_ticks_usec();
 		// Refresh shared geometry before membership edits consume its current revision.
 		_refresh_geometry();
@@ -2573,6 +2657,9 @@ void PXTGI3D::_update_primitives(PhysXGIEffect::Snapshot &r_snapshot) {
 			rescan_causes.push_back(last_change);
 			last_change = String();
 		}
+	} else if (!notified_membership.is_empty()) {
+		_refresh_geometry();
+		_rescan(true);
 	}
 	_refresh_geometry();
 	const int n = shapes.size();
@@ -2640,12 +2727,22 @@ void PXTGI3D::_update_primitives(PhysXGIEffect::Snapshot &r_snapshot) {
 		}
 		float *record = &entry_floats[i * PF];
 		if (valid != bool(entry_valid[i])) {
+			if (!entry.moving && pending_membership.has(entry.shape_node)) {
+				// A static shape whose node has left already goes with the batch that removes it (a retiring cell is
+				// freed over many frames). Found here first by the verification slice, each rebuilt the static part
+				// on its own frame: 30 of a 30 s city ride's 59 rebuilds with a batch of sixty frames.
+				continue;
+			}
 			entry_valid[i] = valid;
 			if (valid) {
 				memcpy(record, scratch, sizeof(scratch));
 				entry_bounds[i] = bounds;
 			}
-			(entry.moving ? moving_dirty : static_dirty) = true;
+			if (entry.moving) {
+				moving_dirty = true;
+			} else {
+				_static_dirty(STATIC_VALIDITY);
+			}
 			records_changed++;
 		} else if (valid && memcmp(scratch, record, sizeof(scratch)) != 0) {
 			// The first 16 floats are its pose and shape; the rest its look.
@@ -2660,7 +2757,7 @@ void PXTGI3D::_update_primitives(PhysXGIEffect::Snapshot &r_snapshot) {
 					// Preserve this frame's append order; the next publication
 					// restores shape-index order, as the former full scan did.
 					moving_entries_dirty = true;
-					static_dirty = true;
+					_static_dirty(STATIC_MOVED);
 				}
 				moving_dirty = true;
 			} else if (uint32_t(i) < entry_slot.size() && entry_slot[i] >= 0) {
@@ -2951,7 +3048,7 @@ void PXTGI3D::notify_body_changed(Node3D *p_body) {
 		const bool mesh_update = mesh && (index || (is_tracked(mesh) && mesh->get_mesh().is_valid() && mesh->get_gi_mode() != GeometryInstance3D::GI_MODE_DISABLED));
 		if (mesh_update || (!mesh && _membership_changed(p_node, index ? &shapes[*index] : nullptr))) {
 			pending_membership.insert(id);
-			membership_immediate = true;
+			notified_membership.insert(id);
 		}
 	};
 	if (Object::cast_to<MeshInstance3D>(p_body) || Object::cast_to<CollisionShape3D>(p_body)) {
@@ -3152,7 +3249,11 @@ void PXTGI3D::disable_bodies(const Array &p_bodies, bool p_check_membership) {
 			// and all of its metadata again during the next publication.
 			if (index && entry_valid[*index]) {
 				entry_valid[*index] = false;
-				(shapes[*index].moving ? moving_dirty : static_dirty) = true;
+				if (shapes[*index].moving) {
+					moving_dirty = true;
+				} else {
+					_static_dirty(STATIC_TERRAIN);
+				}
 				records_changed++;
 			}
 			if (index == nullptr || (p_check_membership && _membership_changed(shape, &shapes[*index]))) {
@@ -3481,7 +3582,19 @@ Dictionary PXTGI3D::get_stats(bool p_reset) {
 	stats["moving"] = int64_t(moving_entries.size());
 	stats["static_leaves"] = int64_t(static_leaves);
 	stats["geometry_floats"] = int64_t(geometry_floats);
+	stats["geometry_range_errors"] = int64_t(geometry_range_errors);
 	stats["rescan_causes"] = rescan_causes;
+	{
+		// How many rebuilds of the static part each cause was part of (a rebuild can have several).
+		static const char *cause_names[STATIC_CAUSE_MAX] = { "removed", "regrouped", "added", "root", "geometry", "generation", "layout", "validity", "moved", "terrain", "rooted" };
+		Dictionary causes;
+		for (int c = 0; c < STATIC_CAUSE_MAX; c++) {
+			if (static_cause_counts[c]) {
+				causes[cause_names[c]] = int64_t(static_cause_counts[c]);
+			}
+		}
+		stats["static_rebuilds"] = causes;
+	}
 	stats["mesh_proxies"] = int64_t(proxy_entries.size());
 	stats["tracked"] = int64_t(tracked.size());
 	stats["scan_retained"] = int64_t(scan_retained);
@@ -3514,6 +3627,9 @@ Dictionary PXTGI3D::get_stats(bool p_reset) {
 		terrain_parent_matches = 0;
 		reflection_item_evictions = 0;
 		rescan_causes.clear();
+		for (int c = 0; c < STATIC_CAUSE_MAX; c++) {
+			static_cause_counts[c] = 0;
+		}
 	}
 	return stats;
 }
@@ -3952,8 +4068,8 @@ void PXTGI3D::_publish() {
 		}
 	}
 	// A city holds hundreds of lamps and the nearest change slowly: every lamp is weighed on every eighth publication
-	// (and at once when one joins or leaves), twice a frame's worth of the nearest in between. Weighing all of them
-	// each frame was 0.2 ms of it on Aurora Circuit.
+	// (and at once when one joins or leaves); in between, twice a frame's worth of the nearest that are lit and as
+	// many of the nearest that are not. Weighing all of them each frame was 0.2 ms of it on Aurora Circuit.
 	if ((publish_serial & 7) == 1 || near_lights_for != omnis.size() + spots.size()) {
 		near_lights_for = omnis.size() + spots.size();
 		nearest_light_ids(omnis, eye, 2 * PhysXGIEffect::Snapshot::MAX_OMNIS, near_omnis);
@@ -4193,6 +4309,8 @@ void PXTGI3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_reflection_resolution_scale"), &PXTGI3D::get_reflection_resolution_scale);
 	ClassDB::bind_method(D_METHOD("set_rays_per_texel", "rays"), &PXTGI3D::set_rays_per_texel);
 	ClassDB::bind_method(D_METHOD("get_rays_per_texel"), &PXTGI3D::get_rays_per_texel);
+	ClassDB::bind_method(D_METHOD("set_busy_frame", "busy"), &PXTGI3D::set_busy_frame);
+	ClassDB::bind_method(D_METHOD("is_busy_frame"), &PXTGI3D::is_busy_frame);
 	ClassDB::bind_method(D_METHOD("set_membership_batch_frames", "frames"), &PXTGI3D::set_membership_batch_frames);
 	ClassDB::bind_method(D_METHOD("get_membership_batch_frames"), &PXTGI3D::get_membership_batch_frames);
 	ClassDB::bind_method(D_METHOD("set_emissive_candidates", "candidates"), &PXTGI3D::set_emissive_candidates);
@@ -4224,6 +4342,7 @@ void PXTGI3D::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "rays_per_texel", PROPERTY_HINT_RANGE, "1,4,1"), "set_rays_per_texel", "get_rays_per_texel");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "emissive_candidates", PROPERTY_HINT_RANGE, "1,16,1"), "set_emissive_candidates", "get_emissive_candidates");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "membership_batch_frames", PROPERTY_HINT_RANGE, "1,600,1"), "set_membership_batch_frames", "get_membership_batch_frames");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "busy_frame", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_NONE), "set_busy_frame", "is_busy_frame");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "multi_bounce"), "set_multi_bounce", "get_multi_bounce");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "blue_noise"), "set_blue_noise", "get_blue_noise");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "gi_history_clamp"), "set_gi_history_clamp", "get_gi_history_clamp");

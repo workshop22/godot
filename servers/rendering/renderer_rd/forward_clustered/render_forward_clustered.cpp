@@ -30,6 +30,7 @@
 
 #include "render_forward_clustered.h"
 
+#include "core/os/os.h"
 #include "core/config/project_settings.h"
 #include "servers/rendering/renderer_rd/environment/fog.h"
 #include "servers/rendering/renderer_rd/framebuffer_cache_rd.h"
@@ -5063,6 +5064,10 @@ void RenderForwardClustered::_note_drawn_pass(uint64_t p_key) {
 	pass.color_pass_flags = uint32_t((p_key >> 48) & 0xFF);
 	pass.framebuffer_format_id = RD::FramebufferFormatID(p_key & 0xFFFFFFFFFFFFull);
 	drawn_passes.push_back(pass);
+	static const bool log_passes = OS::get_singleton()->has_environment("LIGHTCYCLE_PASS_LOG");
+	if (log_passes) {
+		print_line(vformat("PASS_LOG: pass layout %d first drawn: version %d, color pass flags %d, framebuffer format %d (frame %d).", drawn_passes.size(), pass.version, pass.color_pass_flags, int64_t(pass.framebuffer_format_id), int64_t(Engine::get_singleton()->get_frames_drawn())));
+	}
 }
 
 void RenderForwardClustered::_drawn_passes_copy(LocalVector<DrawnPass> &r_passes) {

@@ -35,14 +35,37 @@ Local changes of 2026-11-13, for the game's ray traced Lighting:
 
 - `reflection_jitter`: a reflection ray starts at a point drawn in its texel (blue noise, anew each frame or
   fixed) instead of the texel's middle, on the pixel's own surface: a reflected line thinner than a texel is
-  met as often as it covers it instead of as rows of beads.
+  met as often as it covers it instead of as rows of beads. Its motion and the item differentials are taken
+  from that point.
 - `PXTGI3D.hardware_fallback()` (static): hardware ray queries were asked for and the renderer fell back to the
   software walk for good. The game reads it to leave tracing rather than run the walk unannounced.
 - Main-thread cost in a streamed city: `update_terrain_visibility` decides every record each frame from a copy
-  whose inputs it reads again an eighth a frame; the nearest lamps are chosen from a shortlist between looks at
-  every lamp (each eighth publication); emissives are scored every eighth and the light sources hashed every
+  whose inputs it reads again an eighth a frame; the nearest lamps are chosen from a shortlist (the nearest
+  lit, and as many of the nearest dark ones, which may light up) between looks at every lamp (each eighth
+  publication); emissives are scored every eighth and the light sources hashed every
   sixteenth publication; the verification slices are 24 records. `get_stats` adds the `items`, `lights`,
   `settings` and `sources` clocks and the render thread's time in the frame callback (`render_thread`).
+- `busy_frame`: the game marks a frame that already runs long; a membership batch that is due then waits for a
+  frame that is not, up to three batches (the scan and the static part's rebuild are 3 to 4 ms of one frame).
+- `notify_body_changed` applies the notified nodes at the next publication by themselves; it used to bring the
+  whole pending batch forward, so a streamed cell attached mesh by mesh rebuilt the static part on any frame.
+  A static shape found invalid while its removal is pending goes with that batch too. `get_stats` adds
+  `static_rebuilds`: how many rebuilds of the static part each cause was part of.
+- The render thread's motion pass skips a static shape that kept its slot across a rebuild of the static part
+  (5 to 7 ms of that frame for a city's 43,000 shapes, 0.9 ms now).
+
+A GPU device loss under hardware tracing on the game's Aurora Circuit (`VK_EXT_device_fault`: a write to
+address 0; six of about 105 rides on 2026-11-13, always in the same stretch) points, on the evidence so far, at
+the game and not at this module: a planar mirror viewport that shares the traced world woke there mid-ride with the world's compositor, so the
+renderer gave it this effect's passes (the effect itself returns for a view whose environment is not its own)
+and made 156 pipelines for them in the background while the city streamed its structures in. The game gives
+its mirror cameras an empty compositor (its `docs/look.md`, Ray traced Lighting, has the evidence and the
+count of rides since). Diagnostics kept from the
+hunt, all off unless the environment variable is set: `PXTGI_RT_TIMING` also prints a structure outgrowing its
+capacity, meshes retired, an instance with a degenerate transform, mesh data that is not finite, `DANGLING`
+when the static structure names a mesh retired without its rebuild, and `RANGE` when a moving leaf names
+geometry words its block is not at; `LIGHTCYCLE_PASS_LOG` (the Forward+ renderer) prints each pass layout the
+first time it draws, which is what found the viewport.
 
 ## Upstream audit
 

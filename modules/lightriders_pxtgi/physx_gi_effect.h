@@ -84,6 +84,7 @@ public:
 	LocalVector<ShapeHistory> previous_shapes;
 	HashMap<uint64_t, uint32_t> previous_shape_slots;
 	LocalVector<uint32_t> primitive_history_slots; // checked hint: dense indices can move after pruning
+	LocalVector<uint64_t> primitive_slot_ids; // the shape each slot's world and motion were last worked out for
 	ShapeHistory *get_shape_history(uint64_t p_id);
 	ShapeHistory *add_shape_history(uint64_t p_id, uint64_t p_generation, const Transform3D &p_world, const Transform3D &p_local);
 	void erase_shape_history(uint64_t p_id);
