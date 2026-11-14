@@ -30,6 +30,8 @@
 
 #include "rendering_device_driver.h"
 
+void (*RenderingDeviceDriver::device_lost_debug_hook)() = nullptr;
+
 /**************/
 /**** MISC ****/
 /**************/

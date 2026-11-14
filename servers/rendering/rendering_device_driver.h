@@ -91,6 +91,10 @@ class RenderingDeviceDriver : public RenderingDeviceCommons {
 	GDSOFTCLASS(RenderingDeviceDriver, RenderingDeviceCommons);
 
 public:
+	// Diagnostics (LIGHTCYCLE_CRUMBS, rendering_device_graph.cpp): called once the device is lost, after the driver
+	// has printed the breadcrumbs it found.
+	static void (*device_lost_debug_hook)();
+
 	struct ID {
 		uint64_t id = 0;
 		_ALWAYS_INLINE_ ID() = default;

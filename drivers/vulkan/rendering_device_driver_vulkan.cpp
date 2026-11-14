@@ -32,6 +32,7 @@
 
 #include "core/config/engine.h"
 #include "core/config/project_settings.h"
+#include "core/io/file_access.h"
 #include "core/os/os.h"
 #include "core/templates/fixed_vector.h"
 #include "drivers/vulkan/vulkan_hooks.h"
@@ -1100,6 +1101,7 @@ Error RenderingDeviceDriverVulkan::_check_device_capabilities() {
 		// vkGetDeviceFaultInfoEXT is only valid when the deviceFault feature is enabled at device creation.
 		if (enabled_device_extension_names.has(VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
 			device_fault_support = device_fault_features.deviceFault;
+			device_fault_vendor_binary_support = device_fault_features.deviceFault && device_fault_features.deviceFaultVendorBinary && OS::get_singleton()->has_environment("LIGHTCYCLE_GPU_DUMP");
 		}
 #if defined(VK_TRACK_DEVICE_MEMORY)
 		if (enabled_device_extension_names.has(VK_EXT_DEVICE_MEMORY_REPORT_EXTENSION_NAME)) {
@@ -1427,6 +1429,7 @@ Error RenderingDeviceDriverVulkan::_initialize_device(const LocalVector<VkDevice
 		device_fault_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT;
 		device_fault_features.pNext = create_info_next;
 		device_fault_features.deviceFault = VK_TRUE;
+		device_fault_features.deviceFaultVendorBinary = device_fault_vendor_binary_support ? VK_TRUE : VK_FALSE;
 		create_info_next = &device_fault_features;
 	}
 
@@ -7015,8 +7018,28 @@ void RenderingDeviceDriverVulkan::on_device_lost() const {
 			? (VkDeviceFaultAddressInfoEXT *)memalloc(fault_counts.addressInfoCount * sizeof(VkDeviceFaultAddressInfoEXT))
 			: nullptr;
 	const uint64_t vendor_binary_size = fault_counts.vendorBinarySize;
-	fault_counts.vendorBinarySize = 0;
+	uint8_t *vendor_binary = nullptr;
+	if (device_fault_vendor_binary_support && vendor_binary_size > 0) {
+		vendor_binary = (uint8_t *)memalloc(vendor_binary_size);
+		fault_info.pVendorBinaryData = vendor_binary;
+	} else {
+		fault_counts.vendorBinarySize = 0;
+	}
 	vkres = device_functions.GetDeviceFaultInfoEXT(vk_device, &fault_counts, &fault_info);
+	if (vendor_binary != nullptr) {
+		if (vkres == VK_SUCCESS || vkres == VK_INCOMPLETE) {
+			const String path = OS::get_singleton()->get_environment("LIGHTCYCLE_GPU_DUMP").path_join(vformat("gpu-crash-%d-%d.nv-gpudmp", OS::get_singleton()->get_process_id(), OS::get_singleton()->get_ticks_msec()));
+			Ref<FileAccess> file = FileAccess::open(path, FileAccess::WRITE);
+			if (file.is_valid()) {
+				file->store_buffer(vendor_binary, fault_counts.vendorBinarySize);
+				file->close();
+				_err_print_error(FUNCTION_STR, __FILE__, __LINE__, vformat("Vendor crash dump saved: %s (%d bytes).", path, int64_t(fault_counts.vendorBinarySize)));
+			} else {
+				_err_print_error(FUNCTION_STR, __FILE__, __LINE__, "Vendor crash dump could not be saved to " + path);
+			}
+		}
+		memfree(vendor_binary);
+	}
 	// The vendor binary is not requested, so drivers that have one return VK_INCOMPLETE; the description and the
 	// vendor and address infos, sized from the count query above, are still complete.
 	if (vkres != VK_SUCCESS && vkres != VK_INCOMPLETE) {
@@ -7024,7 +7047,7 @@ void RenderingDeviceDriverVulkan::on_device_lost() const {
 	} else {
 		err_msg += "** Report from VK_EXT_device_fault **";
 		err_msg += "\nDescription: " + String(fault_info.description);
-		err_msg += "\nVendor binary: " + itos(vendor_binary_size) + " bytes (not requested)";
+		err_msg += "\nVendor binary: " + itos(vendor_binary_size) + (device_fault_vendor_binary_support ? " bytes" : " bytes (not requested)");
 		err_msg += "\nVendor infos:";
 		for (uint32_t vd = 0; vd < fault_counts.vendorInfoCount; ++vd) {
 			const VkDeviceFaultVendorInfoEXT *vendor_info = &fault_info.pVendorInfos[vd];
@@ -7120,7 +7143,8 @@ void RenderingDeviceDriverVulkan::print_lost_device_info() {
 			last_breadcrumb_offset = biggest_id * sizeof(uint32_t) * 2u;
 		}
 
-		const size_t entries_to_print = 8u; // Note: The value is arbitrary.
+		// With a marker before every graph command (LIGHTCYCLE_CRUMBS) eight entries are one pass or less.
+		const size_t entries_to_print = device_lost_debug_hook != nullptr ? 96u : 8u; // Note: The value is arbitrary.
 		for (size_t i = 0u; i < entries_to_print; ++i) {
 			const uint32_t last_breadcrumb = *reinterpret_cast<uint32_t *>(breadcrumb_ptr + last_breadcrumb_offset + sizeof(uint32_t));
 			const uint32_t phase = last_breadcrumb & uint32_t(~((1 << 16) - 1));
@@ -7186,6 +7210,9 @@ void RenderingDeviceDriverVulkan::print_lost_device_info() {
 		breadcrumb_ptr = nullptr;
 	} else {
 		_err_print_error(FUNCTION_STR, __FILE__, __LINE__, "Couldn't map breadcrumb buffer. VkResult = " + itos(map_result));
+	}
+	if (device_lost_debug_hook != nullptr) {
+		device_lost_debug_hook();
 	}
 #endif
 	on_device_lost();

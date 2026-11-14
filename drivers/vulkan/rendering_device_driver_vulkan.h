@@ -169,6 +169,9 @@ class RenderingDeviceDriverVulkan : public RenderingDeviceDriver {
 	RaytracingCapabilities raytracing_capabilities;
 	bool pipeline_cache_control_support = false;
 	bool device_fault_support = false;
+	// Diagnostics (LIGHTCYCLE_GPU_DUMP=<folder>): the vendor's crash dump is asked for with the fault report and saved
+	// there. NVIDIA's is an Aftermath dump (.nv-gpudmp): what the GPU was executing and what the faulting address was.
+	bool device_fault_vendor_binary_support = false;
 	bool framebuffer_depth_resolve = false;
 #if defined(VK_TRACK_DEVICE_MEMORY)
 	bool device_memory_report_support = false;

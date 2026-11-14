@@ -30,6 +30,8 @@
 
 #include "rendering_device_graph.h"
 
+#include "core/os/os.h"
+
 #define PRINT_RENDER_GRAPH 0
 #define FORCE_FULL_ACCESS_BITS 0
 #define PRINT_RESOURCE_TRACKER_TOTAL 0
@@ -1091,12 +1093,105 @@ void RenderingDeviceGraph::_wait_for_secondary_command_buffer_tasks() {
 	}
 }
 
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+// Diagnostics (LIGHTCYCLE_CRUMBS), added hunting the device loss under ray traced Lighting: a breadcrumb before every
+// command the graph replays, and here what each one was. Forward+ passes, compute lists, copies and acceleration
+// structure builds carry no breadcrumb of their own, so a lost device named only the canvas pass before the frame's
+// 3D work. The breadcrumb's phase is 100 + the command's type and its user data the low 16 bits of the sequence
+// number; the driver prints the last ones executed, then the hook prints the last commands sent.
+struct LightcycleCrumb {
+	uint32_t sequence = 0;
+	uint32_t detail = 0;
+	int64_t frame = 0;
+	int16_t level = 0;
+	uint8_t type = 0;
+	bool marked = false; // a breadcrumb went before it
+	char label[44] = {};
+};
+static const uint32_t LIGHTCYCLE_CRUMB_COUNT = 8192;
+static LightcycleCrumb lightcycle_crumbs[LIGHTCYCLE_CRUMB_COUNT];
+static uint32_t lightcycle_crumb_sequence = 0;
+
+static void lightcycle_crumbs_dump() {
+	static const char *names[] = { "none", "BLAS build", "TLAS build", "buffer clear", "buffer copy", "buffer get data", "buffer update", "compute list", "raytracing list", "draw list", "texture clear color", "texture clear depth", "texture copy", "texture get data", "texture resolve", "texture update", "timestamp", "driver callback" };
+	const uint32_t count = MIN(lightcycle_crumb_sequence, uint32_t(2600));
+	print_line(vformat("CRUMBS: the last %d graph commands sent, oldest first (* had a breadcrumb before it; its user data is the sequence number's low 16 bits).", count));
+	for (uint32_t k = lightcycle_crumb_sequence - count; k != lightcycle_crumb_sequence; k++) {
+		const LightcycleCrumb &crumb = lightcycle_crumbs[k % LIGHTCYCLE_CRUMB_COUNT];
+		print_line(vformat("CRUMB%s %d (user data %d) frame %d level %d: %s, detail %d, label \"%s\"", crumb.marked ? "*" : "", crumb.sequence, crumb.sequence & 0xFFFF, crumb.frame, crumb.level, crumb.type < 18 ? names[crumb.type] : "?", crumb.detail, String::utf8(crumb.label)));
+	}
+}
+#endif
+
 void RenderingDeviceGraph::_run_render_commands(int32_t p_level, const RecordedCommandSort *p_sorted_commands, uint32_t p_sorted_commands_count, RDD::CommandBufferID &r_command_buffer, CommandBufferPool &r_command_buffer_pool, int32_t &r_current_label_index, int32_t &r_current_label_level) {
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+	// Which commands get a breadcrumb: "all", or any of "as" (acceleration structure builds), "compute", "draw",
+	// "copy" (buffer and texture copies, clears, resolves, updates), separated by commas. Every breadcrumb is a
+	// buffer fill between two commands, and those alone kept the device from being lost in 106 rides: the classes
+	// are there to find which neighbours they keep apart.
+	static uint32_t crumb_types = UINT32_MAX;
+	if (crumb_types == UINT32_MAX) {
+		crumb_types = 0;
+		const String wanted = OS::get_singleton()->get_environment("LIGHTCYCLE_CRUMBS");
+		for (const String &part : wanted.split(",", false)) {
+			if (part == "as") {
+				crumb_types |= (1u << RecordedCommand::TYPE_BOTTOM_LEVEL_ACCELERATION_STRUCTURE_BUILD) | (1u << RecordedCommand::TYPE_TOP_LEVEL_ACCELERATION_STRUCTURE_BUILD);
+			} else if (part == "compute") {
+				crumb_types |= (1u << RecordedCommand::TYPE_COMPUTE_LIST) | (1u << RecordedCommand::TYPE_RAYTRACING_LIST);
+			} else if (part == "draw") {
+				crumb_types |= 1u << RecordedCommand::TYPE_DRAW_LIST;
+			} else if (part == "copy") {
+				crumb_types |= (1u << RecordedCommand::TYPE_BUFFER_CLEAR) | (1u << RecordedCommand::TYPE_BUFFER_COPY) | (1u << RecordedCommand::TYPE_BUFFER_GET_DATA) | (1u << RecordedCommand::TYPE_BUFFER_UPDATE) | (1u << RecordedCommand::TYPE_TEXTURE_CLEAR_COLOR) | (1u << RecordedCommand::TYPE_TEXTURE_CLEAR_DEPTH_STENCIL) | (1u << RecordedCommand::TYPE_TEXTURE_COPY) | (1u << RecordedCommand::TYPE_TEXTURE_GET_DATA) | (1u << RecordedCommand::TYPE_TEXTURE_RESOLVE) | (1u << RecordedCommand::TYPE_TEXTURE_UPDATE);
+			} else if (!part.is_empty()) {
+				crumb_types |= 0x7FFFFFFFu & ~(1u << RecordedCommand::TYPE_CAPTURE_TIMESTAMP);
+			}
+		}
+	}
+#endif
 	for (uint32_t i = 0; i < p_sorted_commands_count; i++) {
 		const uint32_t command_index = p_sorted_commands[i].index;
 		const uint32_t command_data_offset = command_data_offsets[command_index];
 		const RecordedCommand *command = reinterpret_cast<const RecordedCommand *>(&command_data[command_data_offset]);
 		_run_label_command_change(r_command_buffer, command->label_index, p_level, false, true, &p_sorted_commands[i], p_sorted_commands_count - i, r_current_label_index, r_current_label_level);
+#if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+		if (crumb_types != 0 && command->type != RecordedCommand::TYPE_CAPTURE_TIMESTAMP) {
+			RDD::device_lost_debug_hook = lightcycle_crumbs_dump;
+			// LIGHTCYCLE_CRUMBS_DUMP_FRAME=<n>: the same list once, without a loss, when the graph passes that frame.
+			static int64_t dump_frame = OS::get_singleton()->has_environment("LIGHTCYCLE_CRUMBS_DUMP_FRAME") ? OS::get_singleton()->get_environment("LIGHTCYCLE_CRUMBS_DUMP_FRAME").to_int() : -1;
+			if (dump_frame >= 0 && tracking_frame > dump_frame) {
+				dump_frame = -1;
+				lightcycle_crumbs_dump();
+			}
+			LightcycleCrumb &crumb = lightcycle_crumbs[lightcycle_crumb_sequence % LIGHTCYCLE_CRUMB_COUNT];
+			crumb.sequence = lightcycle_crumb_sequence;
+			crumb.frame = tracking_frame;
+			crumb.level = int16_t(p_level);
+			crumb.type = uint8_t(command->type);
+			crumb.detail = 0;
+			if (command->type == RecordedCommand::TYPE_TOP_LEVEL_ACCELERATION_STRUCTURE_BUILD) {
+				crumb.detail = reinterpret_cast<const RecordedTopLevelAccelerationStructureBuildCommand *>(command)->instance_count;
+			} else if (command->type == RecordedCommand::TYPE_DRAW_LIST) {
+				const RecordedDrawListCommand *draw = reinterpret_cast<const RecordedDrawListCommand *>(command);
+				crumb.detail = uint32_t(draw->region.size.x) * 10000u + uint32_t(draw->region.size.y);
+			} else if (command->type == RecordedCommand::TYPE_COMPUTE_LIST) {
+				crumb.detail = reinterpret_cast<const RecordedComputeListCommand *>(command)->instruction_data_size;
+			}
+			crumb.label[0] = 0;
+			if (command->label_index >= 0 && command_label_count > 0) {
+				const char *label_chars = &command_label_chars[command_label_offsets[command->label_index]];
+				uint32_t n = 0;
+				for (; n < sizeof(crumb.label) - 1 && label_chars[n] != 0; n++) {
+					crumb.label[n] = label_chars[n];
+				}
+				crumb.label[n] = 0;
+			}
+			crumb.marked = (crumb_types & (1u << command->type)) != 0;
+			if (crumb.marked) {
+				driver->command_insert_breadcrumb(r_command_buffer, ((100u + uint32_t(command->type)) << 16u) | (lightcycle_crumb_sequence & 0xFFFFu));
+			}
+			lightcycle_crumb_sequence++;
+		}
+#endif
 
 		switch (command->type) {
 			case RecordedCommand::TYPE_BOTTOM_LEVEL_ACCELERATION_STRUCTURE_BUILD: {

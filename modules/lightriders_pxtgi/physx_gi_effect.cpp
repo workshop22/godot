@@ -2835,7 +2835,7 @@ static void hw_guard_write(const String &p_state) {
 
 void PhysXGIEffect::_hw_free(RenderingDevice *p_rd) {
 	// Structures before the buffers they were built from (freeing a buffer frees what was built from it).
-	for (RID r : { hw_static_tlas, hw_moving_tlas, hw_box_blas }) {
+	for (RID r : { hw_static_tlas, hw_moving_tlas, hw_static_spare, hw_moving_spare, hw_box_blas }) {
 		if (r.is_valid()) {
 			p_rd->free_rid(r);
 		}
@@ -2861,6 +2861,8 @@ void PhysXGIEffect::_hw_free(RenderingDevice *p_rd) {
 	}
 	hw_static_tlas = RID();
 	hw_moving_tlas = RID();
+	hw_static_spare = RID();
+	hw_moving_spare = RID();
 	hw_moving_instances.clear();
 	hw_moving_spans.clear();
 	hw_previous_primitive_keys.clear();
@@ -3308,17 +3310,28 @@ bool PhysXGIEffect::_hw_update(RenderingDevice *p_rd, const Snapshot &p_snapshot
 				instances[0].mask = 0; // nothing: a ray never meets it
 				instances[0].hit_sbt_range = RD::HitShaderBindingTableRange(uint64_t(1) << 32);
 			}
+			static const bool pingpong = OS::get_singleton()->has_environment("PXTGI_HW_PINGPONG");
 			// Built again in place: a new structure (and freeing the old one under frames in flight) only when it grows.
 			if (instances.size() > hw_static_capacity) {
 				if (rt_timing()) {
 					print_line(vformat("PXTGI: static structure outgrows %d: %d shapes (frame %d).", hw_static_capacity, instances.size(), int64_t(Engine::get_singleton()->get_frames_drawn())));
 				}
-				if (hw_static_tlas.is_valid()) {
-					p_rd->free_rid(hw_static_tlas);
+				for (RID *r : { &hw_static_tlas, &hw_static_spare }) {
+					if (r->is_valid()) {
+						p_rd->free_rid(*r);
+						*r = RID();
+					}
 				}
 				hw_static_capacity = instances.size() + instances.size() / 4;
 				hw_static_tlas = p_rd->tlas_create(hw_static_capacity, RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT);
 				ERR_FAIL_COND_V(!hw_static_tlas.is_valid(), false);
+			} else if (pingpong) {
+				// The other of the pair: the one in use was traced by the frame before and stays as it is.
+				if (hw_static_spare.is_null()) {
+					hw_static_spare = p_rd->tlas_create(hw_static_capacity, RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT);
+					ERR_FAIL_COND_V(!hw_static_spare.is_valid(), false);
+				}
+				SWAP(hw_static_tlas, hw_static_spare);
 			}
 			ERR_FAIL_COND_V(p_rd->tlas_build(hw_static_tlas, Span<RD::AccelerationStructureInstance>(instances.ptr(), instances.size())) != OK, false);
 			if (rt_timing()) {
@@ -3408,14 +3421,27 @@ bool PhysXGIEffect::_hw_update(RenderingDevice *p_rd, const Snapshot &p_snapshot
 		if (rt_timing()) {
 			print_line(vformat("PXTGI: moving structure outgrows %d: %d instances (frame %d).", hw_moving_capacity, instances.size(), int64_t(Engine::get_singleton()->get_frames_drawn())));
 		}
-		if (hw_moving_tlas.is_valid()) {
-			p_rd->free_rid(hw_moving_tlas);
+		for (RID *r : { &hw_moving_tlas, &hw_moving_spare }) {
+			if (r->is_valid()) {
+				p_rd->free_rid(*r);
+				*r = RID();
+			}
 		}
 		// Sized once for an Arena round's walls (about 2,050) and the bikes: growing it in play stalled the render
 		// thread for 130 ms on the Ring.
 		hw_moving_capacity = MAX(8192u, Math::next_power_of_2(uint32_t(instances.size() * 2)));
 		hw_moving_tlas = p_rd->tlas_create(hw_moving_capacity, RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT);
 		ERR_FAIL_COND_V(!hw_moving_tlas.is_valid(), false);
+	} else {
+		static const bool pingpong = OS::get_singleton()->has_environment("PXTGI_HW_PINGPONG");
+		if (pingpong) {
+			// The other of the pair every frame: this frame never builds the structure the frame before traced.
+			if (hw_moving_spare.is_null()) {
+				hw_moving_spare = p_rd->tlas_create(hw_moving_capacity, RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT);
+				ERR_FAIL_COND_V(!hw_moving_spare.is_valid(), false);
+			}
+			SWAP(hw_moving_tlas, hw_moving_spare);
+		}
 	}
 	const uint64_t submit_since = timing ? OS::get_singleton()->get_ticks_usec() : 0;
 	hw_moving_create_us = timing ? submit_since - instances_ready : 0;

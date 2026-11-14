@@ -8163,7 +8163,11 @@ void RenderingDevice::_end_frame() {
 	_submit_transfer_barriers(command_buffer);
 
 	GodotProfileZoneGrouped(_profile_zone, "draw_graph.end");
-	draw_graph.end(RENDER_GRAPH_REORDER == 1, RENDER_GRAPH_FULL_BARRIERS == 1, command_buffer, frames[frame].command_buffer_pool);
+	// Diagnostics for the device loss under ray traced Lighting: the graph's commands in the order they were recorded
+	// (LIGHTCYCLE_NO_REORDER), a full barrier before every level (LIGHTCYCLE_FULL_BARRIERS).
+	static const bool no_reorder = OS::get_singleton()->has_environment("LIGHTCYCLE_NO_REORDER");
+	static const bool full_barriers = OS::get_singleton()->has_environment("LIGHTCYCLE_FULL_BARRIERS");
+	draw_graph.end(RENDER_GRAPH_REORDER == 1 && !no_reorder, RENDER_GRAPH_FULL_BARRIERS == 1 || full_barriers, command_buffer, frames[frame].command_buffer_pool);
 	GodotProfileZoneGrouped(_profile_zone, "driver->command_buffer_end");
 	driver->command_buffer_end(command_buffer);
 	GodotProfileZoneGrouped(_profile_zone, "driver->end_segment");

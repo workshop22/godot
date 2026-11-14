@@ -456,6 +456,8 @@ Error RenderingContextDriverVulkan::_initialize_instance_extensions() {
 #else
 	bool want_debug_utils = OS::get_singleton()->is_stdout_verbose();
 #endif
+	// The render graph's breadcrumb diagnostic (LIGHTCYCLE_CRUMBS) names each command by its label.
+	want_debug_utils = want_debug_utils || OS::get_singleton()->has_environment("LIGHTCYCLE_CRUMBS");
 	if (want_debug_utils) {
 		_register_requested_instance_extension(VK_EXT_DEBUG_UTILS_EXTENSION_NAME, false);
 	}

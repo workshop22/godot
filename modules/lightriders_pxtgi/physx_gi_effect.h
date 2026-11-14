@@ -363,6 +363,10 @@ private:
 	uint64_t hw_blocks_version = UINT64_MAX;
 	RID hw_static_tlas;
 	RID hw_moving_tlas;
+	// Experiment (PXTGI_HW_PINGPONG): a second structure of each, so that a frame never builds the one the frame
+	// before traced. The spare of the pair in use.
+	RID hw_static_spare;
+	RID hw_moving_spare;
 	LocalVector<RD::AccelerationStructureInstance> hw_moving_instances;
 	LocalVector<uint8_t> hw_moving_spans; // same instance slots; reusable only after a complete successful build
 	Vector<uint64_t> hw_previous_primitive_keys; // COW keys from the last successful moving build
