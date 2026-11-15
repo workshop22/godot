@@ -46,7 +46,7 @@ Local changes of 2026-11-13, for the game's ray traced Lighting:
   sixteenth publication; the verification slices are 24 records. `get_stats` adds the `items`, `lights`,
   `settings` and `sources` clocks and the render thread's time in the frame callback (`render_thread`).
 - `busy_frame`: the game marks a frame that already runs long; a membership batch that is due then waits for a
-  frame that is not, up to three batches (the scan and the static part's rebuild are 3 to 4 ms of one frame).
+  frame that is not, up to three batches. Once a streamed hardware batch starts, bounded slices drain it.
 - `notify_body_changed` applies the notified nodes at the next publication by themselves; it used to bring the
   whole pending batch forward, so a streamed cell attached mesh by mesh rebuilt the static part on any frame.
   A static shape found invalid while its removal is pending goes with that batch too. `get_stats` adds
@@ -79,6 +79,36 @@ binary; `LIGHTCYCLE_GPU_DIAGNOSTICS` requests supported NVIDIA diagnostic config
 as an integer bitmask. These two options add no command markers and remain disabled by default.
 Driver dumps may omit shader, resource or page-fault details. Intrusive audits and rejected
 experiments are kept outside the production pin.
+
+## Streamed cell admission
+
+Hardware city batches (`membership_batch_frames > 10`) retain their collection interval, then
+apply at most 256 pending members or a 500 microsecond target per publication. Initial discovery,
+software tracing, explicit gameplay notifications and immediate short-batch retirement remain
+synchronous. A separate dense static membership list survives moving-entry swap removal. Hardware
+leaf rebuilds visit changed slots and fold exact live bounds from a compact AABB array. Invalid
+static leaves use swap removal rather than shifting a suffix. Software keeps its spatial SAH tree.
+`get_stats` reports `static_records_written`, `membership_slice_max` and `membership_pending`.
+Initial hardware discovery reserves 50% growth headroom in the CPU scene arrays, to reduce
+reallocation during streaming.
+
+Already prepared immutable mesh revisions are published while their shape nodes await admission.
+The hardware descriptor list is complete and independently versioned, with a required/live flag;
+software geometry descriptors still contain allocated ranges only. The renderer prepares at most
+four pending uploads and BLASes or a 500 microsecond target per frame. A single resource operation
+can exceed the time target. Required missing geometry retains the synchronous path. Cancellation,
+resource edits and root replacement update the complete list; snapshot-owned arrays survive skipped
+publications, and RenderingDevice retains deferred destruction and in-flight resource protection.
+
+Static instance arrays persist between admissions. Exact per-slot identity and acceleration-record
+revisions authorize reuse across skipped publications; only changed slots are rewritten. The same
+revisions skip retained static pose comparisons. Complete dirty-slot history patches the rotating CPU
+record, identity and key buffers; missing history or a software-layout change uses a full copy. Adjacent
+hardware GPU publications upload touched static ranges, moving records and the complete flat-tree
+bounds; skipped publications or new buffers upload the whole snapshot. A changed instance list still
+records a full TLAS build.
+The empty-static mask-zero instance, owner reset and terminal software fallback are retained. The
+full memory barrier workaround and draw-graph dependency rules are unchanged.
 
 ## Upstream audit
 

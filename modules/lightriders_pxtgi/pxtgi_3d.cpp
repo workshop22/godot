@@ -30,8 +30,8 @@
 
 #include "pxtgi_3d.h"
 
-#include "pxtgi_render_thread.h"
 #include "physx_gi_effect.h"
+#include "pxtgi_render_thread.h"
 
 #include "core/config/engine.h"
 #include "core/config/project_settings.h"
@@ -398,6 +398,8 @@ void PXTGI3D::_deactivate() {
 	look_order.clear();
 	look_slots.clear();
 	pending_membership.clear();
+	_clear_pending_geometry();
+	membership_draining = false;
 	notified_membership.clear();
 	pending_meshes.clear();
 	tracked_root = ObjectID();
@@ -1252,7 +1254,11 @@ void PXTGI3D::_update_geometry_publication(ObjectID p_shape, bool p_remove) {
 		int &slot = p_hardware ? block->hardware_publication_slot : block->publication_slot;
 		LocalVector<ObjectID> &ids = p_hardware ? block_publication_ids : geometry_publication_ids;
 		HashSet<uint32_t> *dirty = p_hardware ? block_publication_dirty : geometry_publication_dirty;
-		if (live && (!p_hardware || block->type == 5)) {
+		const bool wanted = p_hardware ? !p_remove && block->type == 5 && (live || pending_geometry_users.has(p_shape)) : live;
+		if (p_hardware && (wanted || slot >= 0)) {
+			hardware_blocks_version++;
+		}
+		if (wanted) {
 			if (slot < 0) {
 				slot = ids.size();
 				ids.push_back(p_shape);
@@ -1393,9 +1399,53 @@ void PXTGI3D::_track_all(Node *p_root) {
 	collect(p_root, tracked);
 	tracked_root = p_root->get_instance_id();
 	pending_membership.clear();
+	_clear_pending_geometry();
+	membership_draining = false;
 	notified_membership.clear();
 	for (const ObjectID &id : tracked) {
 		pending_membership.insert(id);
+	}
+}
+
+// Only already prepared immutable geometry is offered ahead of admission. New or edited
+// resources retain the synchronous path; this signal must not bake geometry on the main thread.
+void PXTGI3D::_queue_pending_geometry(Node *p_node) {
+	if (trace_mode < 2 || pending_geometry_nodes.has(p_node->get_instance_id())) {
+		return;
+	}
+	const CollisionShape3D *shape = Object::cast_to<CollisionShape3D>(p_node);
+	if (!shape || shape->get_shape().is_null()) {
+		return;
+	}
+	const ObjectID resource = shape->get_shape()->get_instance_id();
+	const GeometryBlock *block = geometry_blocks.getptr(resource);
+	if (!block || block->type != 5 || geometry_dirty.has(resource)) {
+		return;
+	}
+	pending_geometry_nodes.insert(p_node->get_instance_id(), resource);
+	uint32_t &pending_users = pending_geometry_users[resource];
+	if (pending_users++ == 0) {
+		_update_geometry_publication(resource);
+	}
+}
+
+void PXTGI3D::_forget_pending_geometry(ObjectID p_node) {
+	const ObjectID *found = pending_geometry_nodes.getptr(p_node);
+	if (!found) {
+		return;
+	}
+	const ObjectID resource = *found;
+	pending_geometry_nodes.erase(p_node);
+	uint32_t &pending_users = pending_geometry_users[resource];
+	if (--pending_users == 0) {
+		pending_geometry_users.erase(resource);
+		_update_geometry_publication(resource);
+	}
+}
+
+void PXTGI3D::_clear_pending_geometry() {
+	while (!pending_geometry_nodes.is_empty()) {
+		_forget_pending_geometry(pending_geometry_nodes.begin()->key);
 	}
 }
 
@@ -1432,6 +1482,7 @@ void PXTGI3D::_node_added(Node *p_node) {
 		pending_meshes.push_back(id);
 	} else if (!Object::cast_to<Light3D>(p_node)) {
 		pending_membership.insert(id);
+		_queue_pending_geometry(p_node);
 		if (last_change.is_empty()) {
 			last_change = "added " + String(p_node->get_path());
 		}
@@ -1442,6 +1493,7 @@ void PXTGI3D::_node_added(Node *p_node) {
 // applied together at publication, after node_added has completed any reparenting.
 void PXTGI3D::_node_removed(Node *p_node) {
 	const ObjectID id = p_node->get_instance_id();
+	_forget_pending_geometry(id);
 	if (tracked.erase(id)) {
 		_unobserve(id);
 		// Collision and mesh retirement never needs to search the light lists.
@@ -1556,8 +1608,38 @@ void PXTGI3D::_unobserve(ObjectID p_id) {
 	looks.erase(p_id);
 }
 
+// Valid static leaves have dense, stable slots. Hiding one swaps only the last leaf;
+// filtering an invalid entry out during publication would shift the entire suffix.
+void PXTGI3D::_set_static_membership(int p_index, bool p_valid) {
+	ShapeEntry &entry = shapes[p_index];
+	const bool wanted = p_valid && !entry.moving;
+	if (wanted && entry.static_slot < 0) {
+		entry.static_slot = static_entries.size();
+		static_entries.push_back(p_index);
+		static_slots_dirty.insert(entry.static_slot);
+	} else if (!wanted && entry.static_slot >= 0) {
+		const int slot = entry.static_slot;
+		static_slots_dirty.insert(slot);
+		const int last = static_entries[static_entries.size() - 1];
+		static_entries.remove_at_unordered(slot);
+		if (uint32_t(slot) < static_entries.size()) {
+			shapes[last].static_slot = slot;
+		}
+		entry.static_slot = -1;
+		entry_slot[p_index] = -1;
+	}
+	if (wanted && entry.static_slot >= 0) {
+		static_slots_dirty.insert(entry.static_slot);
+	}
+}
+
 void PXTGI3D::_register_entry(ShapeEntry &r_entry, int p_index) {
 	moving_entries_dirty = true;
+	if (!r_entry.moving) {
+		r_entry.static_slot = static_entries.size();
+		static_entries.push_back(p_index);
+		static_slots_dirty.insert(r_entry.static_slot);
+	}
 	if (r_entry.mesh_proxy) {
 		r_entry.proxy_slot = proxy_entries.size();
 		proxy_entries.push_back(p_index);
@@ -1597,6 +1679,10 @@ void PXTGI3D::_unregister_entry(const ShapeEntry &p_entry) {
 	remove(dynamic_entries, p_entry.dynamic_slot, &ShapeEntry::dynamic_slot);
 	remove(proxy_entries, p_entry.proxy_slot, &ShapeEntry::proxy_slot);
 	remove(emissive_entries, p_entry.emissive_slot, &ShapeEntry::emissive_slot);
+	if (p_entry.static_slot >= 0) {
+		static_slots_dirty.insert(p_entry.static_slot);
+	}
+	remove(static_entries, p_entry.static_slot, &ShapeEntry::static_slot);
 	if (p_entry.body_indices) {
 		remove(*p_entry.body_indices, p_entry.body_slot, &ShapeEntry::body_slot);
 		if (p_entry.body_indices->is_empty()) {
@@ -1646,6 +1732,9 @@ void PXTGI3D::_remove_entry(int p_index) {
 		}
 		if (moved.proxy_slot >= 0) {
 			proxy_entries[moved.proxy_slot] = p_index;
+		}
+		if (moved.static_slot >= 0) {
+			static_entries[moved.static_slot] = p_index;
 		}
 		if (moved.emissive_slot >= 0) {
 			emissive_entries[moved.emissive_slot] = p_index;
@@ -1828,6 +1917,7 @@ bool PXTGI3D::_sync_member(ObjectID p_id) {
 	entry_slot.push_back(-1);
 	memset(&entry_floats[index * PF], 0, PF * sizeof(float));
 	entry_valid[index] = _refresh_entry(index, &entry_floats[index * PF], entry_bounds[index]);
+	_set_static_membership(index, entry_valid[index]);
 	if (entry.moving) {
 		moving_dirty = true;
 	} else {
@@ -1874,6 +1964,13 @@ void PXTGI3D::_rescan(bool p_notified_only) {
 		dynamic_entries.clear();
 		proxy_entries.clear();
 		emissive_entries.clear();
+		static_entries.clear();
+		ordered_static_ids.clear();
+		ordered_static_keys.clear();
+		ordered_static_revisions.clear();
+		ordered_static_bounds.clear();
+		static_slots_dirty.clear();
+		static_slots_reset = true;
 		moving_entries.clear();
 		moving_entries_dirty = true;
 		entry_floats.clear();
@@ -1912,17 +2009,20 @@ void PXTGI3D::_rescan(bool p_notified_only) {
 			affected_geometry.insert(shapes[*index].shape_resource);
 		}
 	};
-	if (p_notified_only) {
-		for (const ObjectID &id : notified_membership) {
-			remember_geometry(id);
-			geometry_changed |= _sync_member(id);
-			remember_geometry(id);
-			pending_membership.erase(id);
-		}
-		if (pending_membership.is_empty()) {
-			frames_since_rescan = 0; // nothing waits: the next batch counts its own frames
-		}
-	} else {
+	// Gameplay notifications are immediate even while an unrelated city batch drains.
+	for (const ObjectID &id : notified_membership) {
+		remember_geometry(id);
+		geometry_changed |= _sync_member(id);
+		remember_geometry(id);
+		pending_membership.erase(id);
+		_forget_pending_geometry(id);
+	}
+	notified_membership.clear();
+	if (!p_notified_only) {
+		// Initial discovery and explicit short-batch retirement retain their synchronous contract.
+		// A streamed hardware scene has prepared geometry; bound its membership work, not its rate.
+		const bool sliced = hardware_layout && membership_batch_frames > 10 && !fresh_root && !membership_immediate;
+		LocalVector<ObjectID> applied;
 		for (const ObjectID &id : pending_membership) {
 			if (!fresh_root) {
 				remember_geometry(id);
@@ -1931,12 +2031,40 @@ void PXTGI3D::_rescan(bool p_notified_only) {
 			if (!fresh_root) {
 				remember_geometry(id);
 			}
+			applied.push_back(id);
+			if (sliced && (applied.size() >= 256 || OS::get_singleton()->get_ticks_usec() - walk_since >= 500)) {
+				break;
+			}
 		}
-		pending_membership.clear();
-		frames_since_rescan = 0;
+		for (ObjectID id : applied) {
+			pending_membership.erase(id);
+			_forget_pending_geometry(id);
+		}
+		if (sliced) {
+			membership_slice_max = MAX(membership_slice_max, applied.size());
+		}
+		membership_draining = !pending_membership.is_empty();
 		membership_immediate = false;
 	}
-	notified_membership.clear();
+	if (pending_membership.is_empty()) {
+		frames_since_rescan = 0;
+		membership_draining = false;
+	}
+	if (fresh_root && hardware_layout && membership_batch_frames > 10) {
+		const uint32_t capacity = shapes.size() + shapes.size() / 2;
+		shapes.reserve(capacity);
+		entry_floats.reserve(capacity * PhysXGIEffect::PRIMITIVE_FLOATS);
+		entry_bounds.reserve(capacity);
+		entry_valid.reserve(capacity);
+		entry_slot.reserve(capacity);
+		static_entries.reserve(capacity);
+		ordered_floats.reserve(capacity * PhysXGIEffect::PRIMITIVE_FLOATS);
+		leaf_order.reserve(capacity);
+		ordered_static_ids.reserve(capacity);
+		ordered_static_keys.reserve(capacity);
+		ordered_static_revisions.reserve(capacity);
+		ordered_static_bounds.reserve(capacity);
+	}
 	_stage(STAGE_SCAN_WALK, walk_since);
 	_stage(STAGE_SCAN_MEMBERS, members_since);
 	LocalVector<ObjectID> changed_geometry;
@@ -2215,6 +2343,7 @@ void PXTGI3D::_refresh_geometry() {
 	}
 	for (int i : changed) {
 		entry_valid[i] = _refresh_entry(i, &entry_floats[i * PhysXGIEffect::PRIMITIVE_FLOATS], entry_bounds[i]);
+		_set_static_membership(i, entry_valid[i]);
 		if (shapes[i].moving) {
 			moving_dirty = true;
 		} else {
@@ -2352,6 +2481,9 @@ bool PXTGI3D::_refresh_entry(int p_index, float *r_out, AABB &r_bounds) {
 					moving_dirty = true;
 				} else {
 					_static_dirty(STATIC_GENERATION);
+					if (entry.static_slot >= 0) {
+						static_slots_dirty.insert(entry.static_slot);
+					}
 				}
 			}
 		}
@@ -2362,6 +2494,7 @@ bool PXTGI3D::_refresh_entry(int p_index, float *r_out, AABB &r_bounds) {
 // The tree for the shapes as they are: the static part rebuilt only when it changed (or the root joining it to the
 // moving part comes or goes), the moving part every time.
 void PXTGI3D::_build_tree() {
+	constexpr int PF = PhysXGIEffect::PRIMITIVE_FLOATS;
 	constexpr int NF = PhysXGIEffect::NODE_FLOATS;
 	const int n = shapes.size();
 	const auto build_scene = hardware_layout ? build_hardware_leaf : build_bvh;
@@ -2457,23 +2590,97 @@ void PXTGI3D::_build_tree() {
 			}
 		}
 	};
+	uint32_t valid_static = static_leaves;
 	if (static_dirty) {
-		collect_static();
+		if (hardware_layout) {
+			valid_static = static_entries.size();
+		} else {
+			collect_static();
+			valid_static = static_items.size();
+		}
 	}
-	const bool rooted = !moving_items.is_empty() && (static_dirty ? !static_items.is_empty() : static_leaves > 0);
+	const bool rooted = !moving_items.is_empty() && valid_static > 0;
 	const bool static_rebuilt = static_dirty || rooted != static_rooted;
 	if (static_rebuilt) {
-		if (!static_dirty) {
-			collect_static(); // the same shapes, laid out with or without the shared root
-		}
 		tree_nodes.clear();
-		ordered_floats.clear();
-		leaf_order.clear();
 		if (rooted) {
 			tree_nodes.resize(NF);
 		}
-		if (!static_items.is_empty()) {
-			build_scene(static_items, 0, static_items.size(), entry_floats.ptr(), tree_nodes, ordered_floats, leaf_order, rooted ? 1 : 0);
+		if (hardware_layout) {
+			// Retain the dense static prefix. A swap removal changes one slot; additions append.
+			// Only changed records are written. Bounds still fold the live leaves exactly, including removals.
+			const uint32_t retained = MIN(ordered_static_ids.size(), valid_static);
+			ordered_static_ids.resize(valid_static);
+			ordered_static_keys.resize(valid_static);
+			ordered_static_revisions.resize(valid_static);
+			ordered_static_bounds.resize(valid_static);
+			ordered_floats.resize(valid_static * PF);
+			leaf_order.resize(valid_static);
+			if (static_slots_reset) {
+				for (uint32_t slot = 0; slot < valid_static; slot++) {
+					static_slots_dirty.insert(slot);
+				}
+				static_slots_reset = false;
+			}
+			for (uint32_t slot : static_slots_dirty) {
+				if (slot >= valid_static) {
+					continue;
+				}
+				const int i = static_entries[slot];
+				const ShapeEntry &entry = shapes[i];
+				const Pair<uint64_t, uint64_t> identity(uint64_t(entry.shape_node), entry.motion_generation);
+				const uint64_t key = entry.geometry_type == 5 ? entry.geometry_key : 0;
+				const float *record = &entry_floats[i * PF];
+				float *out = &ordered_floats[slot * PF];
+				const bool record_changed = slot >= retained || memcmp(out, record, PF * sizeof(float)) != 0;
+				if (record_changed) {
+					memcpy(out, record, PF * sizeof(float));
+					static_records_written++;
+				}
+				if (record_changed || ordered_static_ids[slot] != identity || ordered_static_keys[slot] != key) {
+					ordered_static_ids[slot] = identity;
+					ordered_static_keys[slot] = key;
+					ordered_static_revisions[slot] = ++static_slot_serial;
+					touched_slots.push_back(slot);
+				}
+				leaf_order[slot] = i;
+				entry_slot[i] = slot;
+				ordered_static_bounds[slot] = entry_bounds[i];
+			}
+			static_slots_dirty.clear();
+			if (valid_static) {
+				Vector3 lo = ordered_static_bounds[0].position;
+				Vector3 hi = lo + ordered_static_bounds[0].size;
+				for (uint32_t slot = 1; slot < valid_static; slot++) {
+					const AABB &bounds = ordered_static_bounds[slot];
+					lo = lo.min(bounds.position);
+					hi = hi.max(bounds.position + bounds.size);
+				}
+				const uint32_t node = tree_nodes.size();
+				tree_nodes.resize(node + NF);
+				float *out = &tree_nodes[node];
+				for (int k = 0; k < 3; k++) {
+					out[k] = lo[k];
+					out[4 + k] = hi[k];
+				}
+				store_int(&out[3], 0);
+				store_int(&out[7], valid_static);
+			}
+		} else {
+			ordered_static_ids.clear();
+			ordered_static_keys.clear();
+			ordered_static_revisions.clear();
+			ordered_static_bounds.clear();
+			static_slots_dirty.clear();
+			static_slots_reset = true;
+			if (!static_dirty) {
+				collect_static();
+			}
+			ordered_floats.clear();
+			leaf_order.clear();
+			if (!static_items.is_empty()) {
+				build_bvh(static_items, 0, static_items.size(), entry_floats.ptr(), tree_nodes, ordered_floats, leaf_order, rooted ? 1 : 0);
+			}
 		}
 		static_node_floats = tree_nodes.size();
 		static_record_floats = ordered_floats.size();
@@ -2545,7 +2752,7 @@ void PXTGI3D::_build_tree() {
 			}
 		}
 	}
-	const bool reset_slots = static_rebuilt || entry_slot.size() != uint32_t(n);
+	const bool reset_slots = !hardware_layout && (static_rebuilt || entry_slot.size() != uint32_t(n));
 	entry_slot.resize(n);
 	if (reset_slots) {
 		for (int i = 0; i < n; i++) {
@@ -2646,10 +2853,9 @@ void PXTGI3D::_update_primitives(PhysXGIEffect::Snapshot &r_snapshot) {
 	pending_meshes.clear();
 	// Batch lifecycle changes over at most membership_batch_frames (ten unless the scene asks for longer). An explicit
 	// notification applies its affected membership before this publication.
-	// A frame the game calls busy (busy_frame) leaves the batch waiting, up to three batches long: the scan and the
-	// static part's rebuild are 3 to 4 ms of one frame, and landed on the frames that already ran long. What the
-	// game notified is applied now, by itself.
-	const bool batch_due = !pending_membership.is_empty() && (membership_immediate || (++frames_since_rescan >= membership_batch_frames && (!busy_frame || frames_since_rescan >= 3 * membership_batch_frames)));
+	// A busy frame can defer the start by up to three batches. Once due, streamed hardware membership
+	// drains in bounded slices; explicit gameplay notifications are applied by themselves immediately.
+	const bool batch_due = !pending_membership.is_empty() && (membership_immediate || membership_draining || (++frames_since_rescan >= membership_batch_frames && (!busy_frame || frames_since_rescan >= 3 * membership_batch_frames)));
 	if (tracked_root.is_null() || batch_due) {
 		const uint64_t since = OS::get_singleton()->get_ticks_usec();
 		// Refresh shared geometry before membership edits consume its current revision.
@@ -2738,6 +2944,7 @@ void PXTGI3D::_update_primitives(PhysXGIEffect::Snapshot &r_snapshot) {
 				continue;
 			}
 			entry_valid[i] = valid;
+			_set_static_membership(i, valid);
 			if (valid) {
 				memcpy(record, scratch, sizeof(scratch));
 				entry_bounds[i] = bounds;
@@ -2756,6 +2963,7 @@ void PXTGI3D::_update_primitives(PhysXGIEffect::Snapshot &r_snapshot) {
 			records_changed++;
 			if (placed) {
 				if (!entry.moving) {
+					_set_static_membership(i, false);
 					entry.moving = true;
 					moving_entries.push_back(i);
 					// Preserve this frame's append order; the next publication
@@ -2792,14 +3000,25 @@ void PXTGI3D::_update_primitives(PhysXGIEffect::Snapshot &r_snapshot) {
 		primitives_version++;
 		TouchRecord &touched_now = touch_history[primitives_version % TOUCH_HISTORY];
 		touched_now.version = primitives_version;
+		touched_now.hardware = hardware_layout;
 		touched_now.slots = touched_slots;
 		Vector<float> &next_primitives = primitive_spares[publication_spare];
 		BufferStamp &next_primitives_stamp = primitive_spare_stamps[publication_spare];
-		bool patch_primitives = next_primitives_stamp.static_version == static_version && next_primitives_stamp.version < primitives_version &&
-				primitives_version - next_primitives_stamp.version < TOUCH_HISTORY && uint32_t(next_primitives.size()) >= static_record_floats;
-		for (uint64_t v = next_primitives_stamp.version + 1; patch_primitives && v <= primitives_version; v++) {
-			patch_primitives = touch_history[v % TOUCH_HISTORY].version == v;
-		}
+		// Complete dirty-slot history covers additions, swaps and identity-only replacements.
+		// Missing history or a software layout still copies the complete prefix.
+		auto can_patch = [&](const BufferStamp &p_stamp) {
+			if (p_stamp.version >= primitives_version || primitives_version - p_stamp.version >= TOUCH_HISTORY) {
+				return false;
+			}
+			for (uint64_t v = p_stamp.version + 1; v <= primitives_version; v++) {
+				const TouchRecord &touch = touch_history[v % TOUCH_HISTORY];
+				if (touch.version != v || (p_stamp.static_version != static_version && (!hardware_layout || !touch.hardware))) {
+					return false;
+				}
+			}
+			return true;
+		};
+		const bool patch_primitives = can_patch(next_primitives_stamp);
 		next_primitives.resize(ordered_floats.size());
 		if (ordered_floats.size()) {
 			float *out = next_primitives.ptrw();
@@ -2826,11 +3045,21 @@ void PXTGI3D::_update_primitives(PhysXGIEffect::Snapshot &r_snapshot) {
 			Vector<Pair<uint64_t, uint64_t>> &next_ids = id_spares[publication_spare];
 			BufferStamp &next_ids_stamp = id_spare_stamps[publication_spare];
 			// The older publication's own static identities, when it was laid out as this one is.
+			const bool patch_ids = hardware_layout && can_patch(next_ids_stamp);
 			const bool ids_in_place = next_ids_stamp.static_version == static_version && uint32_t(next_ids.size()) >= static_leaves;
 			next_ids.resize_uninitialized(leaf_order.size());
 			Pair<uint64_t, uint64_t> *ids = next_ids.ptrw();
-			uint32_t kept = ids_in_place ? static_leaves : 0;
-			if (!ids_in_place && keep_static_prefix && published_ids.size() >= int(static_leaves)) {
+			uint32_t kept = ids_in_place || patch_ids ? static_leaves : 0;
+			if (patch_ids) {
+				for (uint64_t v = next_ids_stamp.version + 1; v <= primitives_version; v++) {
+					for (uint32_t slot : touch_history[v % TOUCH_HISTORY].slots) {
+						if (slot < static_leaves) {
+							ids[slot] = ordered_static_ids[slot];
+						}
+					}
+				}
+			}
+			if (!patch_ids && !ids_in_place && keep_static_prefix && published_ids.size() >= int(static_leaves)) {
 				kept = static_leaves;
 				if (kept) {
 					memcpy(ids, published_ids.ptr(), kept * sizeof(Pair<uint64_t, uint64_t>));
@@ -2841,6 +3070,7 @@ void PXTGI3D::_update_primitives(PhysXGIEffect::Snapshot &r_snapshot) {
 				ids[k] = { uint64_t(entry.shape_node), entry.motion_generation };
 			}
 			next_ids_stamp.static_version = static_version;
+			next_ids_stamp.version = primitives_version;
 			SWAP(published_ids, next_ids);
 			SWAP(published_ids_stamp, next_ids_stamp);
 			Vector<float> &next_nodes = node_spares[publication_spare];
@@ -2870,9 +3100,9 @@ void PXTGI3D::_update_primitives(PhysXGIEffect::Snapshot &r_snapshot) {
 		}
 		radiance_dirty = false;
 		// The static records edited in place since the last publication, as a few runs (near ones joined: a run is
-		// one upload). They only describe this one publication; a rebuilt static part is sent whole.
+		// one upload). They describe this publication; hardware membership changes preserve these slots.
 		r_snapshot.touched_count = 0;
-		if (!touched_slots.is_empty() && keep_static_prefix) {
+		if (!touched_slots.is_empty() && (keep_static_prefix || hardware_layout)) {
 			touched_slots.sort();
 			uint32_t gap = 64;
 			while (true) {
@@ -2910,11 +3140,30 @@ void PXTGI3D::_update_primitives(PhysXGIEffect::Snapshot &r_snapshot) {
 		if (copy_keys) {
 			Vector<uint64_t> &next_keys = key_spares[publication_spare];
 			BufferStamp &next_keys_stamp = key_spare_stamps[publication_spare];
+			bool patch_keys = hardware_layout && next_keys_stamp.version < primitives_version && primitives_version - next_keys_stamp.version < TOUCH_HISTORY;
+			for (uint64_t v = next_keys_stamp.version + 1; patch_keys && v <= primitives_version; v++) {
+				patch_keys = touch_history[v % TOUCH_HISTORY].version == v && touch_history[v % TOUCH_HISTORY].hardware;
+			}
 			const bool keys_in_place = next_keys_stamp.static_version == static_version && uint32_t(next_keys.size()) >= static_leaves;
+			Vector<uint64_t> &next_revisions = static_revision_spares[publication_spare];
+			next_revisions.resize(ordered_static_revisions.size());
+			uint64_t *revisions = next_revisions.ptrw();
 			next_keys.resize(leaf_order.size());
 			uint64_t *keys = next_keys.ptrw();
-			uint32_t kept = keys_in_place ? static_leaves : 0;
-			if (!keys_in_place && keep_static_prefix && published_keys.size() >= int(static_leaves)) {
+			uint32_t kept = keys_in_place || patch_keys ? static_leaves : 0;
+			if (patch_keys) {
+				for (uint64_t v = next_keys_stamp.version + 1; v <= primitives_version; v++) {
+					for (uint32_t slot : touch_history[v % TOUCH_HISTORY].slots) {
+						if (slot < static_leaves) {
+							keys[slot] = ordered_static_keys[slot];
+							revisions[slot] = ordered_static_revisions[slot];
+						}
+					}
+				}
+			} else if (!ordered_static_revisions.is_empty()) {
+				memcpy(revisions, ordered_static_revisions.ptr(), ordered_static_revisions.size() * sizeof(uint64_t));
+			}
+			if (!patch_keys && !keys_in_place && keep_static_prefix && published_keys.size() >= int(static_leaves)) {
 				kept = static_leaves;
 				if (kept) {
 					memcpy(keys, published_keys.ptr(), kept * sizeof(uint64_t));
@@ -2925,10 +3174,13 @@ void PXTGI3D::_update_primitives(PhysXGIEffect::Snapshot &r_snapshot) {
 				keys[k] = entry.geometry_type == 5 ? entry.geometry_key : 0;
 			}
 			next_keys_stamp.static_version = static_version;
+			next_keys_stamp.version = primitives_version;
+			SWAP(published_static_revisions, next_revisions);
 			SWAP(published_keys, next_keys);
 			SWAP(published_keys_stamp, next_keys_stamp);
 		}
 		r_snapshot.primitive_keys = published_keys;
+		r_snapshot.static_revisions = published_static_revisions;
 		r_snapshot.primitive_groups = published_groups;
 		_stage(STAGE_HARDWARE_PUBLISH, hardware_since);
 	}
@@ -2955,7 +3207,7 @@ void PXTGI3D::_update_primitives(PhysXGIEffect::Snapshot &r_snapshot) {
 
 void PXTGI3D::_publish_geometry(PhysXGIEffect::Snapshot &r_snapshot) {
 	const bool geometry_changed = published_geometry_version != geometry_version;
-	const bool blocks_changed = trace_mode >= 2 && published_blocks_version != geometry_version;
+	const bool blocks_changed = trace_mode >= 2 && published_blocks_version != hardware_blocks_version;
 	if (geometry_changed || blocks_changed) {
 		const uint64_t since = OS::get_singleton()->get_ticks_usec();
 		if (geometry_changed) {
@@ -2988,16 +3240,20 @@ void PXTGI3D::_publish_geometry(PhysXGIEffect::Snapshot &r_snapshot) {
 			const uint32_t next = (block_publication + 1) % 3;
 			Vector<uint64_t> &next_keys = block_key_publications[next];
 			Vector<Vector<float>> &next_triangles = block_triangle_publications[next];
+			Vector<uint8_t> &next_required = block_required_publications[next];
 			const uint32_t retained = next_keys.size();
 			next_keys.resize(block_publication_ids.size());
 			next_triangles.resize(block_publication_ids.size());
+			next_required.resize(block_publication_ids.size());
 			uint64_t *keys = next_keys.ptrw();
 			Vector<float> *triangles = next_triangles.ptrw();
+			uint8_t *required = next_required.ptrw();
 			for (uint32_t slot : block_publication_dirty[next]) {
 				if (slot >= block_publication_ids.size()) {
 					continue;
 				}
 				const GeometryBlock &block = geometry_blocks[block_publication_ids[slot]];
+				required[slot] = block.words > 0 && block.offset >= 0;
 				if (slot >= retained || keys[slot] != block.key) {
 					keys[slot] = block.key;
 					triangles[slot] = block.triangles;
@@ -3005,7 +3261,7 @@ void PXTGI3D::_publish_geometry(PhysXGIEffect::Snapshot &r_snapshot) {
 			}
 			block_publication_dirty[next].clear();
 			block_publication = next;
-			published_blocks_version = geometry_version;
+			published_blocks_version = hardware_blocks_version;
 		}
 		_stage(STAGE_GEOMETRY_PUBLISH, since);
 	}
@@ -3015,6 +3271,7 @@ void PXTGI3D::_publish_geometry(PhysXGIEffect::Snapshot &r_snapshot) {
 	if (trace_mode >= 2) {
 		r_snapshot.block_keys = block_key_publications[block_publication];
 		r_snapshot.block_triangles = block_triangle_publications[block_publication];
+		r_snapshot.block_required = block_required_publications[block_publication];
 		r_snapshot.blocks_version = published_blocks_version;
 	}
 }
@@ -3253,6 +3510,7 @@ void PXTGI3D::disable_bodies(const Array &p_bodies, bool p_check_membership) {
 			// and all of its metadata again during the next publication.
 			if (index && entry_valid[*index]) {
 				entry_valid[*index] = false;
+				_set_static_membership(*index, false);
 				if (shapes[*index].moving) {
 					moving_dirty = true;
 				} else {
@@ -3603,6 +3861,9 @@ Dictionary PXTGI3D::get_stats(bool p_reset) {
 	stats["tracked"] = int64_t(tracked.size());
 	stats["scan_retained"] = int64_t(scan_retained);
 	stats["scan_fresh"] = int64_t(scan_fresh);
+	stats["static_records_written"] = int64_t(static_records_written);
+	stats["membership_slice_max"] = int64_t(membership_slice_max);
+	stats["membership_pending"] = int64_t(pending_membership.size());
 	stats["terrain_records"] = int64_t(terrain_records);
 	stats["terrain_changed"] = int64_t(terrain_changed);
 	stats["terrain_removed"] = int64_t(terrain_removed);
@@ -3625,6 +3886,8 @@ Dictionary PXTGI3D::get_stats(bool p_reset) {
 		records_changed = 0;
 		scan_retained = 0;
 		scan_fresh = 0;
+		static_records_written = 0;
+		membership_slice_max = 0;
 		terrain_records = 0;
 		terrain_changed = 0;
 		terrain_removed = 0;

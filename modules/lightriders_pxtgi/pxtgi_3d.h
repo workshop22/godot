@@ -133,6 +133,7 @@ class PXTGI3D : public Node3D {
 		int dynamic_slot = -1;
 		int proxy_slot = -1;
 		int emissive_slot = -1;
+		int static_slot = -1;
 		bool manual_updates = false;
 		uint64_t motion_generation = 0; // pooled proxy identity, independent of geometry revisions
 		Color albedo;
@@ -251,7 +252,13 @@ class PXTGI3D : public Node3D {
 	// Those of them the game notified (notify_body_changed): applied at the next publication, by themselves. The
 	// rest of the batch keeps waiting: a streamed cell's meshes are notified one by one as they are attached, and
 	// each used to bring the whole batch, the static part's rebuild with it, forward to that frame.
+	HashMap<ObjectID, ObjectID> pending_geometry_nodes; // pending shape node -> prepared resource
+	HashMap<ObjectID, uint32_t> pending_geometry_users;
+	void _queue_pending_geometry(Node *p_node);
+	void _forget_pending_geometry(ObjectID p_node);
+	void _clear_pending_geometry();
 	HashSet<ObjectID> notified_membership;
+	bool membership_draining = false; // a due streamed batch continues in bounded slices
 	bool membership_immediate = false; // the whole batch is applied at the next publication (a subtree retired)
 	// Meshes outside any body that came since the last update: only one that glows means finding the shapes again
 	// (effects add and drop plain meshes all the time).
@@ -297,6 +304,17 @@ class PXTGI3D : public Node3D {
 	uint32_t chosen_emissives_for = 0; // the shape count those indices belong to
 	LocalVector<Pair<int, float>> chosen_list; // the same choice in order, each with its share of the picks
 	uint32_t publish_serial = 0; // publications so far: the slow-changing reads take turns on it
+	LocalVector<int> static_entries; // stable dense membership; moving swap removals cannot reorder the city
+	void _set_static_membership(int p_index, bool p_valid);
+	LocalVector<Pair<uint64_t, uint64_t>> ordered_static_ids;
+	LocalVector<uint64_t> ordered_static_keys;
+	LocalVector<uint64_t> ordered_static_revisions;
+	LocalVector<AABB> ordered_static_bounds;
+	HashSet<uint32_t> static_slots_dirty;
+	bool static_slots_reset = true;
+	uint64_t static_slot_serial = 0;
+	uint64_t static_records_written = 0;
+	uint32_t membership_slice_max = 0;
 	LocalVector<int> moving_entries; // the shapes in the moving part of the tree
 	bool moving_entries_dirty = true; // membership/index order changed, independent of pose/tree dirtiness
 	// The tree's records in leaf order and its nodes: the static part first, then the moving part, joined under one
@@ -351,6 +369,7 @@ class PXTGI3D : public Node3D {
 	int published_count = 0;
 	// Hardware tracing: each leaf's mesh (its Shape3D's id; 0 for a box), and every mesh's triangles by that id.
 	Vector<uint64_t> published_keys;
+	Vector<uint64_t> published_static_revisions;
 	Vector<uint8_t> published_groups; // HW leaf order: leader span 1..3, then zero followers; no GPU buffer
 	// The current publication and two rotating spares retain at most three buffers
 	// per field. A renderer still holding a spare is protected by Vector's COW.
@@ -358,6 +377,7 @@ class PXTGI3D : public Node3D {
 	Vector<Pair<uint64_t, uint64_t>> id_spares[2];
 	Vector<float> node_spares[2];
 	Vector<uint64_t> key_spares[2];
+	Vector<uint64_t> static_revision_spares[2]; // travels with the corresponding key buffer/stamp
 	uint32_t publication_spare = 0;
 	// What each publication buffer was last written for (it travels with its buffer): the static layout, and for the
 	// records the publication. A buffer on the current static layout keeps its static part and takes only the changes.
@@ -373,12 +393,15 @@ class PXTGI3D : public Node3D {
 	static constexpr uint32_t TOUCH_HISTORY = 8;
 	struct TouchRecord {
 		uint64_t version = UINT64_MAX;
+		bool hardware = false;
 		LocalVector<uint32_t> slots;
 	};
 	TouchRecord touch_history[TOUCH_HISTORY];
 	LocalVector<ObjectID> block_publication_ids;
 	Vector<uint64_t> block_key_publications[3];
 	Vector<Vector<float>> block_triangle_publications[3];
+	Vector<uint8_t> block_required_publications[3];
+	uint64_t hardware_blocks_version = 0;
 	HashSet<uint32_t> block_publication_dirty[3];
 	uint32_t block_publication = 0;
 	uint64_t published_blocks_version = UINT64_MAX;

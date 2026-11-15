@@ -30,17 +30,16 @@
 
 #include "physx_gi_effect.h"
 
-#include "pxtgi_render_thread.h"
 #include "physx_compositor_effects.h"
 #include "pxtgi_blue_noise.h"
+#include "pxtgi_render_thread.h"
 
 #include "core/config/engine.h"
 #include "core/io/file_access.h"
 #include "core/math/math_funcs_binary.h"
+#include "core/object/callable_mp.h"
 #include "core/os/os.h"
 #include "core/templates/hashfuncs.h"
-
-#include "core/object/callable_mp.h"
 #include "scene/3d/camera_3d.h"
 #include "scene/resources/3d/world_3d.h"
 #include "servers/rendering/renderer_rd/effects/copy_effects.h"
@@ -2861,6 +2860,7 @@ void PhysXGIEffect::_hw_free(RenderingDevice *p_rd) {
 		}
 	}
 	hw_meshes.clear();
+	hw_pending_meshes.clear();
 	if (hw_box_vertices.is_valid()) {
 		p_rd->free_rid(hw_box_vertices);
 	}
@@ -2875,6 +2875,11 @@ void PhysXGIEffect::_hw_free(RenderingDevice *p_rd) {
 	hw_moving_capacity = 0;
 	hw_static_capacity = 0;
 	hw_static_version = UINT64_MAX;
+	hw_static_instances.clear();
+	hw_static_records.clear();
+	hw_static_keys.clear();
+	hw_static_revisions.clear();
+	hw_static_count = -1;
 	hw_blocks_version = UINT64_MAX;
 	if (hw_guarded) {
 		hw_guard_write("clean");
@@ -3095,6 +3100,27 @@ static bool rt_timing() {
 	return on;
 }
 
+bool PhysXGIEffect::_hw_upload_mesh(RenderingDevice *p_rd, uint64_t p_key, const Vector<float> &p_triangles) {
+	if (hw_meshes.has(p_key)) {
+		return true;
+	}
+	ERR_FAIL_COND_V(p_triangles.size() < 12, false);
+	if (rt_timing()) {
+		int bad = 0;
+		for (float value : p_triangles) {
+			bad += Math::is_finite(value) ? 0 : 1;
+		}
+		if (bad > 0 || p_triangles.size() % 12 != 0) {
+			print_line(vformat("PXTGI: mesh %d has %d floats, %d of them not finite (frame %d).", int64_t(p_key), p_triangles.size(), bad, int64_t(Engine::get_singleton()->get_frames_drawn())));
+		}
+	}
+	const Span<uint8_t> data((const uint8_t *)p_triangles.ptr(), p_triangles.size() * sizeof(float));
+	const RID vertices = p_rd->vertex_buffer_create(data.size(), data, RD::BUFFER_CREATION_DEVICE_ADDRESS_BIT | RD::BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT);
+	ERR_FAIL_COND_V(vertices.is_null(), false);
+	hw_meshes.insert(p_key, HardwareMesh{ vertices, RID(), uint32_t(p_triangles.size() / 4), hw_blocks_version });
+	return true;
+}
+
 // Brings the structures up to date for this frame; false (and software from then on) when anything fails.
 bool PhysXGIEffect::_hw_update(RenderingDevice *p_rd, const Snapshot &p_snapshot, const Vector<Transform3D> &p_worlds) {
 	// Only a successful build restores reuse validity. Every early return leaves
@@ -3216,16 +3242,25 @@ bool PhysXGIEffect::_hw_update(RenderingDevice *p_rd, const Snapshot &p_snapshot
 			hw_groups.erase(key);
 		}
 	};
-	// Upload each part's unchanged 16-byte-corner stream once. Its singleton BLAS
-	// is created only if a static or ungrouped moving instance actually needs it.
+	// Upload each required revision's unchanged 16-byte-corner stream once.
+	// Pending city revisions are prepared separately below, before membership admission.
 	if (blocks_changed) {
 		hw_blocks_version = p_snapshot.blocks_version;
+		hw_pending_meshes.clear();
 		LocalVector<int> missing;
 		for (int i = 0; i < p_snapshot.block_keys.size(); i++) {
-			if (HardwareMesh *mesh = hw_meshes.getptr(p_snapshot.block_keys[i])) {
+			const bool required = i >= p_snapshot.block_required.size() || p_snapshot.block_required[i];
+			HardwareMesh *mesh = hw_meshes.getptr(p_snapshot.block_keys[i]);
+			if (mesh) {
 				mesh->seen_version = hw_blocks_version;
-			} else if (p_snapshot.block_triangles[i].size() >= 12) {
+			}
+			if (p_snapshot.block_triangles[i].size() < 12) {
+				continue;
+			}
+			if (required && !mesh) {
 				missing.push_back(i);
+			} else if (!required && (!mesh || mesh->blas.is_null())) {
+				hw_pending_meshes.push_back({ p_snapshot.block_keys[i], p_snapshot.block_triangles[i] });
 			}
 		}
 		retire_groups();
@@ -3258,22 +3293,7 @@ bool PhysXGIEffect::_hw_update(RenderingDevice *p_rd, const Snapshot &p_snapshot
 		for (int i : missing) {
 			const uint64_t key = p_snapshot.block_keys[i];
 			const Vector<float> &tris = p_snapshot.block_triangles[i];
-			if (hw_meshes.has(key) || tris.size() < 12) {
-				continue;
-			}
-			if (rt_timing()) {
-				int bad = 0;
-				for (int k = 0; k < tris.size(); k++) {
-					bad += Math::is_finite(tris[k]) ? 0 : 1;
-				}
-				if (bad > 0 || tris.size() % 12 != 0) {
-					print_line(vformat("PXTGI: mesh %d has %d floats, %d of them not finite (frame %d).", int64_t(key), tris.size(), bad, int64_t(Engine::get_singleton()->get_frames_drawn())));
-				}
-			}
-			const Span<uint8_t> data((const uint8_t *)tris.ptr(), tris.size() * sizeof(float));
-			const RID vertices = p_rd->vertex_buffer_create(data.size(), data, RD::BUFFER_CREATION_DEVICE_ADDRESS_BIT | RD::BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT);
-			ERR_FAIL_COND_V(!vertices.is_valid(), false);
-			hw_meshes.insert(key, HardwareMesh{ vertices, RID(), uint32_t(tris.size() / 4), hw_blocks_version });
+			ERR_FAIL_COND_V(!_hw_upload_mesh(p_rd, key, tris), false);
 			built++;
 			triangles += tris.size() / 12;
 		}
@@ -3283,61 +3303,101 @@ bool PhysXGIEffect::_hw_update(RenderingDevice *p_rd, const Snapshot &p_snapshot
 	} else {
 		retire_groups();
 	}
+	// Pending city geometry is offered before its membership batch becomes due. Prepare
+	// a few complete immutable revisions per frame; active shapes always take the required path.
+	// Replacing the complete pending list on a snapshot change also cancels retired arrivals.
+	if (!hw_pending_meshes.is_empty()) {
+		const uint64_t since = OS::get_singleton()->get_ticks_usec();
+		int prepared = 0;
+		while (!hw_pending_meshes.is_empty()) {
+			const HardwarePendingMesh &pending = hw_pending_meshes[hw_pending_meshes.size() - 1];
+			ERR_FAIL_COND_V(!_hw_upload_mesh(p_rd, pending.key, pending.triangles), false);
+			HardwareGroupKey key;
+			key.keys[0] = pending.key;
+			ERR_FAIL_COND_V(_hw_blas(p_rd, key).is_null(), false);
+			hw_pending_meshes.resize(hw_pending_meshes.size() - 1);
+			prepared++;
+			if (prepared >= 4 || OS::get_singleton()->get_ticks_usec() - since >= 500) {
+				break;
+			}
+		}
+		if (rt_timing()) {
+			print_line(vformat("PXTGI: prepared %d pending meshes in %.2f ms, %d remain.", prepared, (OS::get_singleton()->get_ticks_usec() - since) / 1000.0, hw_pending_meshes.size()));
+		}
+	}
 	// The static shapes: their structure is rebuilt only when they really changed (the static part of the tree can be
 	// laid out again with the same shapes).
 	const uint64_t static_since = OS::get_singleton()->get_ticks_usec();
 	if (p_snapshot.static_version != hw_static_version || hw_static_tlas.is_null()) {
-		hw_static_version = p_snapshot.static_version;
 		const int count = p_snapshot.static_count;
-		// Where and what each shape is (a record's first 16 floats); its look is read from the records at a hit.
-		uint32_t hash = HASH_MURMUR3_SEED;
+		LocalVector<RD::AccelerationStructureInstance> &instances = hw_static_instances;
+		instances.resize(MAX(count, 1));
+		hw_static_records.resize_uninitialized(count * 16);
+		hw_static_keys.resize_uninitialized(count);
+		hw_static_revisions.resize_initialized(count);
+		bool changed = count != hw_static_count || hw_static_tlas.is_null();
+		int rewritten = 0;
+		const uint64_t since = OS::get_singleton()->get_ticks_usec();
 		for (int i = 0; i < count; i++) {
-			hash = hash_murmur3_buffer(p_snapshot.primitives.ptr() + i * PRIMITIVE_FLOATS, 16 * sizeof(float), hash);
+			const float *record = p_snapshot.primitives.ptr() + i * PRIMITIVE_FLOATS;
+			const uint64_t key = i < p_snapshot.primitive_keys.size() ? p_snapshot.primitive_keys[i] : 0;
+			const uint64_t revision = i < p_snapshot.static_revisions.size() ? p_snapshot.static_revisions[i] : 0;
+			// These are monotonically assigned to exact slot identity/record changes on the main thread.
+			// Complete snapshots and owner reset make them valid even when publications were skipped.
+			if (i < hw_static_count && revision != 0 && hw_static_revisions[i] == revision) {
+				continue;
+			}
+			// Exact revision and placement equality, including the ray mask. A hash cannot authorize reuse.
+			// Independent compact records survive skipped publications without pinning the main-thread buffers.
+			const HardwareMesh *mesh = blocks_changed && key ? hw_meshes.getptr(key) : nullptr;
+			const bool live_blas = !blocks_changed || (key ? mesh && mesh->blas == instances[i].blas : instances[i].blas == hw_box_blas);
+			if (i < hw_static_count && hw_static_keys[i] == key && live_blas && instances[i].mask == (record[19] < 0.0f ? 2 : 1) &&
+					memcmp(record, hw_static_records.ptr() + i * 16, 16 * sizeof(float)) == 0) {
+				hw_static_revisions[i] = revision;
+				continue;
+			}
+			if (!_hw_instance(p_rd, p_snapshot, i, p_worlds[i], instances[i])) {
+				print_line(vformat("PXTGI: static shape %d has no hardware structure (type %d); tracing stays in software.", i, int(record[12] + 0.5f)));
+				return false;
+			}
+			memcpy(hw_static_records.ptr() + i * 16, record, 16 * sizeof(float));
+			hw_static_keys[i] = key;
+			hw_static_revisions[i] = revision;
+			changed = true;
+			rewritten++;
 		}
-		if (p_snapshot.primitive_keys.size() >= count) {
-			hash = hash_murmur3_buffer(p_snapshot.primitive_keys.ptr(), count * sizeof(uint64_t), hash);
+		if (count == 0) {
+			instances[0] = RD::AccelerationStructureInstance();
+			instances[0].blas = hw_box_blas;
+			instances[0].mask = 0;
+			instances[0].hit_sbt_range = RD::HitShaderBindingTableRange(uint64_t(1) << 32);
 		}
-		if (hash != hw_static_hash || hw_static_tlas.is_null()) {
-			hw_static_hash = hash;
-			const uint64_t since = OS::get_singleton()->get_ticks_usec();
-			LocalVector<RD::AccelerationStructureInstance> instances;
-			instances.resize(MAX(count, 1));
-			for (int i = 0; i < count; i++) {
-				if (!_hw_instance(p_rd, p_snapshot, i, p_worlds[i], instances[i])) {
-					print_line(vformat("PXTGI: static shape %d has no hardware structure (type %d); tracing stays in software.", i, int(p_snapshot.primitives[i * PRIMITIVE_FLOATS + 12] + 0.5f)));
-					return false;
-				}
+		if (instances.size() > hw_static_capacity) {
+			if (rt_timing()) {
+				print_line(vformat("PXTGI: static structure outgrows %d: %d shapes (frame %d).", hw_static_capacity, instances.size(), int64_t(Engine::get_singleton()->get_frames_drawn())));
 			}
-			if (count == 0) {
-				instances[0].blas = hw_box_blas;
-				instances[0].mask = 0; // nothing: a ray never meets it
-				instances[0].hit_sbt_range = RD::HitShaderBindingTableRange(uint64_t(1) << 32);
+			if (hw_static_tlas.is_valid()) {
+				p_rd->free_rid(hw_static_tlas);
 			}
-			// Built again in place: a new structure (and freeing the old one under frames in flight) only when it grows.
-			if (instances.size() > hw_static_capacity) {
-				if (rt_timing()) {
-					print_line(vformat("PXTGI: static structure outgrows %d: %d shapes (frame %d).", hw_static_capacity, instances.size(), int64_t(Engine::get_singleton()->get_frames_drawn())));
-				}
-				if (hw_static_tlas.is_valid()) {
-					p_rd->free_rid(hw_static_tlas);
-				}
-				hw_static_capacity = instances.size() + instances.size() / 4;
-				hw_static_tlas = p_rd->tlas_create(hw_static_capacity, RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT);
-				ERR_FAIL_COND_V(!hw_static_tlas.is_valid(), false);
-			}
+			hw_static_capacity = instances.size() + instances.size() / 4;
+			hw_static_tlas = p_rd->tlas_create(hw_static_capacity, RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT);
+			ERR_FAIL_COND_V(!hw_static_tlas.is_valid(), false);
+		}
+		if (changed) {
 			ERR_FAIL_COND_V(p_rd->tlas_build(hw_static_tlas, Span<RD::AccelerationStructureInstance>(instances.ptr(), instances.size())) != OK, false);
-			if (rt_timing()) {
-				rt_static_keys.clear();
-				rt_dangling_keys.clear();
-				for (int i = 0; i < count && i < p_snapshot.primitive_keys.size(); i++) {
-					if (p_snapshot.primitive_keys[i] != 0) {
-						rt_static_keys.insert(p_snapshot.primitive_keys[i]);
-					}
+		}
+		// Only successful builds advance the cache. A failed attempt takes the terminal software path.
+		hw_static_version = p_snapshot.static_version;
+		hw_static_count = count;
+		if (rt_timing() && changed) {
+			rt_static_keys.clear();
+			rt_dangling_keys.clear();
+			for (int i = 0; i < count && i < p_snapshot.primitive_keys.size(); i++) {
+				if (p_snapshot.primitive_keys[i] != 0) {
+					rt_static_keys.insert(p_snapshot.primitive_keys[i]);
 				}
 			}
-			if (rt_timing()) {
-				print_line(vformat("PXTGI: static structure, %d shapes in %.2f ms (frame %d).", count, (OS::get_singleton()->get_ticks_usec() - since) / 1000.0, int64_t(Engine::get_singleton()->get_frames_drawn())));
-			}
+			print_line(vformat("PXTGI: static structure, %d shapes, %d instances rewritten in %.2f ms (frame %d).", count, rewritten, (OS::get_singleton()->get_ticks_usec() - since) / 1000.0, int64_t(Engine::get_singleton()->get_frames_drawn())));
 		}
 	}
 	hw_static_us = OS::get_singleton()->get_ticks_usec() - static_since;
@@ -3625,6 +3685,7 @@ void PhysXGIView::free_data() {
 	previous_shape_slots.clear();
 	primitive_history_slots.clear();
 	primitive_slot_ids.clear();
+	primitive_static_revisions.clear();
 	previous_moving_shapes.clear();
 	current_moving_shapes.clear();
 	primitive_motion_data.clear();
@@ -3849,8 +3910,7 @@ void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_rende
 	if (v.have_history && (cam_transform != v.prev_cam_transform || scene_rd->cam_projection != v.prev_camera_projection)) {
 		unsettle();
 	}
-	if (v.have_history && (cam_transform.origin.distance_squared_to(v.prev_cam_transform.origin) > 400.0f ||
-			Math::abs(cam_transform.basis.get_rotation_quaternion().dot(v.prev_cam_transform.basis.get_rotation_quaternion())) < 0.9f)) {
+	if (v.have_history && (cam_transform.origin.distance_squared_to(v.prev_cam_transform.origin) > 400.0f || Math::abs(cam_transform.basis.get_rotation_quaternion().dot(v.prev_cam_transform.basis.get_rotation_quaternion())) < 0.9f)) {
 		// A teleport or hard camera cut has no trustworthy previous colour. Do not
 		// seed the new view's reflection/radiance history with the old scene.
 		v.have_history = false;
@@ -3904,9 +3964,16 @@ void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_rende
 			memcpy(motion_data + i * 16, identity, sizeof(identity));
 		}
 	}
+	v.primitive_static_revisions.resize_initialized(s.static_count);
+	uint64_t *static_revisions = v.primitive_static_revisions.ptr();
 	uint32_t next_history_slot = UINT32_MAX;
 	for (int i = static_changed ? 0 : s.static_count; i < s.primitive_count; i++) {
 		const Pair<uint64_t, uint64_t> &identity = s.primitive_ids[i];
+		const uint64_t revision = i < s.static_revisions.size() ? s.static_revisions[i] : 0;
+		const bool same_revision = i < s.static_count && revision != 0 && static_revisions[i] == revision;
+		if (i < s.static_count) {
+			static_revisions[i] = revision;
+		}
 		// Most leaves keep their slot across streamed membership changes. Reuse
 		// their dense history index only while it still names this exact shape;
 		// reordering, pruning and slot reuse otherwise fall back to the ID map.
@@ -3920,7 +3987,7 @@ void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_rende
 			PhysXGIView::ShapeHistory *kept = history_slot < v.previous_shapes.size() && v.previous_shapes[history_slot].id == identity.first ? &v.previous_shapes[history_slot] : v.get_shape_history(identity.first);
 			const float *pose = &s.primitives[i * PRIMITIVE_FLOATS];
 			bool same_pose = kept != nullptr;
-			for (int r = 0; r < 3 && same_pose; r++) {
+			for (int r = 0; r < 3 && same_pose && !same_revision; r++) {
 				same_pose = kept->local.basis.rows[r] == Vector3(pose[r * 4], pose[r * 4 + 1], pose[r * 4 + 2]) && kept->local.origin[r] == pose[r * 4 + 3];
 			}
 			if (same_pose && kept->is_static && kept->generation == identity.second) {
@@ -4344,10 +4411,9 @@ void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_rende
 		const uint32_t record_bytes = PRIMITIVE_FLOATS * sizeof(float);
 		const uint32_t node_bytes = NODE_FLOATS * sizeof(float);
 		// A city is tens of thousands of static shapes and a few hundred moving ones (riders, ribbons), and something
-		// moves every frame. The publication directly after the one these buffers hold, on the same static layout,
-		// differs only after the static part, at the shared root and at the static records it names: send those.
-		// Anything else (a skipped publication, a new static layout, new buffers) sends everything.
-		const bool partial = !recreated && s.primitives_version == held + 1 && s.static_version == primitives_static_uploaded &&
+		// moves every frame. Adjacent publications name every changed static range, including hardware
+		// membership edits. Software layout changes, skipped publications and new buffers send everything.
+		const bool partial = !recreated && s.primitives_version == held + 1 && (s.static_version == primitives_static_uploaded || s.hardware_layout) &&
 				s.static_count >= 0 && s.static_count <= s.primitive_count && s.static_node_count >= 0 && s.static_node_count <= s.node_count;
 		if (partial) {
 			if (s.primitive_count > s.static_count) {
@@ -4361,11 +4427,16 @@ void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_rende
 				}
 			}
 			if (s.nodes_version != nodes_uploaded && s.node_count > 0) {
-				if (s.static_node_count > 0) {
-					rd->buffer_update(node_buffer, 0, node_bytes, s.nodes.ptr());
-				}
-				if (s.node_count > s.static_node_count) {
-					rd->buffer_update(node_buffer, s.static_node_count * node_bytes, (s.node_count - s.static_node_count) * node_bytes, s.nodes.ptr() + s.static_node_count * NODE_FLOATS);
+				if (s.hardware_layout && s.static_version != primitives_static_uploaded) {
+					// Flat hardware trees have at most three nodes, including the changed static bounds.
+					rd->buffer_update(node_buffer, 0, s.node_count * node_bytes, s.nodes.ptr());
+				} else {
+					if (s.static_node_count > 0) {
+						rd->buffer_update(node_buffer, 0, node_bytes, s.nodes.ptr());
+					}
+					if (s.node_count > s.static_node_count) {
+						rd->buffer_update(node_buffer, s.static_node_count * node_bytes, (s.node_count - s.static_node_count) * node_bytes, s.nodes.ptr() + s.static_node_count * NODE_FLOATS);
+					}
 				}
 			}
 		} else {

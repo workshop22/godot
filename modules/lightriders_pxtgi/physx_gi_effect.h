@@ -85,6 +85,7 @@ public:
 	HashMap<uint64_t, uint32_t> previous_shape_slots;
 	LocalVector<uint32_t> primitive_history_slots; // checked hint: dense indices can move after pruning
 	LocalVector<uint64_t> primitive_slot_ids; // the shape each slot's world and motion were last worked out for
+	LocalVector<uint64_t> primitive_static_revisions;
 	ShapeHistory *get_shape_history(uint64_t p_id);
 	ShapeHistory *add_shape_history(uint64_t p_id, uint64_t p_generation, const Transform3D &p_world, const Transform3D &p_local);
 	void erase_shape_history(uint64_t p_id);
@@ -198,9 +199,11 @@ public:
 		int moving_root = -1; // the software walk's moving part (unused by hardware tracing)
 		// Hardware tracing (trace_mode 2, 3): each leaf's mesh id (0: a box), the meshes' triangles by id.
 		Vector<uint64_t> primitive_keys;
+		Vector<uint64_t> static_revisions; // exact per-slot identity/record revision, independent of publication skips
 		Vector<uint8_t> primitive_groups; // CPU-only: leader span 1..3, zero followers, in this exact leaf order
 		Vector<uint64_t> block_keys;
 		Vector<Vector<float>> block_triangles;
+		Vector<uint8_t> block_required; // allocated/live now; others prepare pending membership under a bound
 		uint64_t blocks_version = 0;
 		Vector<float> nodes;
 		int node_count = 0;
@@ -360,6 +363,12 @@ private:
 	LocalVector<HardwareGroupPlan> hw_group_plan;
 	HashSet<HardwareGroupKey> hw_live_groups;
 	LocalVector<HardwareGroupKey> hw_retired_groups;
+	struct HardwarePendingMesh {
+		uint64_t key = 0;
+		Vector<float> triangles; // immutable snapshot ownership, never a scene resource pointer
+	};
+	LocalVector<HardwarePendingMesh> hw_pending_meshes;
+	bool _hw_upload_mesh(RenderingDevice *p_rd, uint64_t p_key, const Vector<float> &p_triangles);
 	uint64_t hw_blocks_version = UINT64_MAX;
 	RID hw_static_tlas;
 	RID hw_moving_tlas;
@@ -370,7 +379,11 @@ private:
 	uint32_t hw_moving_capacity = 0;
 	uint32_t hw_static_capacity = 0;
 	uint64_t hw_static_version = UINT64_MAX;
-	uint32_t hw_static_hash = 0;
+	LocalVector<RD::AccelerationStructureInstance> hw_static_instances;
+	LocalVector<float> hw_static_records; // first 16 floats per instance; never pins a rotating publication buffer
+	LocalVector<uint64_t> hw_static_keys;
+	LocalVector<uint64_t> hw_static_revisions;
+	int hw_static_count = -1;
 	bool hw_failed = false;
 	std::atomic<bool> hw_terminal_fallback{ false }; // published only after a terminal hardware failure
 	bool hw_active = false; // the hardware variants run this frame
