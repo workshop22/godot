@@ -820,12 +820,40 @@ private:
 		uint32_t command = 0;
 		bool acceleration = false;
 		bool write = false;
+		uint64_t stages = 0;
+		uint64_t access = 0;
 		bool operator<(const AuditAccess &p_other) const { return command < p_other.command; }
 	};
 	bool audit_graph_enabled = false;
 	uint64_t audit_graph_errors = 0;
 	uint64_t audit_graph_access_count = 0;
 	LocalVector<AuditAccess> audit_graph_accesses;
+	struct AuditTextureAccess {
+		uint64_t resource = 0;
+		uint32_t command = 0;
+		RDD::TextureSubresourceRange subresources;
+		Rect2i region;
+		ResourceUsage usage = RESOURCE_USAGE_NONE;
+		bool write = false;
+	};
+	LocalVector<AuditTextureAccess> audit_texture_accesses;
+	uint64_t audit_texture_errors = 0;
+	uint64_t audit_texture_count = 0;
+	// Intra-graph CPU visibility check over the barriers and order actually emitted.
+	struct AuditBarrierState {
+		int32_t writer = -1;
+		uint64_t stages = 0;
+		uint64_t access = 0;
+		bool available = false;
+		uint64_t visible_stages[32] = {};
+	};
+	bool audit_barriers_enabled = false;
+	uint64_t audit_barrier_errors = 0;
+	uint64_t audit_barrier_access_count = 0;
+	HashMap<uint64_t, AuditBarrierState> audit_barrier_states[2];
+	LocalVector<Pair<uint32_t, uint32_t>> audit_barrier_ranges;
+	void _audit_emitted_barriers();
+	void _audit_replayed_accesses(uint32_t p_command, int32_t p_level);
 	void _audit_dependencies(VectorView<RecordedCommandSort> p_commands, bool p_reorder);
 	LocalVector<uint8_t> command_data;
 	LocalVector<uint32_t> command_data_offsets;

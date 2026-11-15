@@ -409,9 +409,21 @@ void RenderingDeviceGraph::_add_command_to_graph(ResourceTracker **p_resource_tr
 		if (audit_graph_enabled) {
 			// Texture slices/partial coverage need a separate range-aware oracle.
 			if (resource_tracker->buffer_driver_id.id != 0) {
-				audit_graph_accesses.push_back({ resource_tracker->buffer_driver_id.id, uint32_t(p_command_index), false, _is_write_usage(p_resource_usages[i]) });
+				audit_graph_accesses.push_back({ resource_tracker->buffer_driver_id.id, uint32_t(p_command_index), false, _is_write_usage(p_resource_usages[i]), uint64_t(r_command->self_stages), uint64_t(_usage_to_access_bits(p_resource_usages[i])) });
 			} else if (resource_tracker->acceleration_structure_driver_id.id != 0) {
-				audit_graph_accesses.push_back({ resource_tracker->acceleration_structure_driver_id.id, uint32_t(p_command_index), true, _is_write_usage(p_resource_usages[i]) });
+				audit_graph_accesses.push_back({ resource_tracker->acceleration_structure_driver_id.id, uint32_t(p_command_index), true, _is_write_usage(p_resource_usages[i]), uint64_t(r_command->self_stages), uint64_t(_usage_to_access_bits(p_resource_usages[i])) });
+			} else if (audit_barriers_enabled && resource_tracker->texture_driver_id.id != 0) {
+				ResourceTracker *root = resource_tracker;
+				while (root->parent != nullptr) {
+					root = root->parent;
+				}
+				Rect2i region(Point2i(), resource_tracker->texture_size);
+				const ResourceUsage usage = p_resource_usages[i];
+				if (r_command->type == RecordedCommand::TYPE_DRAW_LIST &&
+						(usage == RESOURCE_USAGE_ATTACHMENT_COLOR_READ_WRITE || usage == RESOURCE_USAGE_ATTACHMENT_DEPTH_STENCIL_READ_WRITE)) {
+					region = reinterpret_cast<RecordedDrawListCommand *>(r_command)->region;
+				}
+				audit_texture_accesses.push_back({ root->texture_driver_id.id, uint32_t(p_command_index), resource_tracker->texture_subresources, region, usage, _is_write_usage(usage) });
 			}
 		}
 		resource_tracker->reset_if_outdated(tracking_frame);
@@ -633,7 +645,11 @@ void RenderingDeviceGraph::_add_command_to_graph(ResourceTracker **p_resource_tr
 		if (different_usage) {
 			// Even if the usage of the resource isn't a write usage explicitly, a different usage implies a transition and it should therefore be considered a write.
 			// In the case of buffers however, this is not exactly necessary if the driver does not consider different buffer usages as different states.
-			write_usage = write_usage || bool(resource_tracker->texture_driver_id) || driver_buffers_require_transitions;
+			static const bool order_as_transitions = OS::get_singleton()->has_environment("LIGHTCYCLE_AS_TRANSITION_ORDER");
+			static const bool order_buffer_transitions = OS::get_singleton()->has_environment("LIGHTCYCLE_BUFFER_TRANSITION_ORDER");
+			write_usage = write_usage || bool(resource_tracker->texture_driver_id) || driver_buffers_require_transitions ||
+					(order_as_transitions && bool(resource_tracker->acceleration_structure_driver_id)) ||
+					(order_buffer_transitions && bool(resource_tracker->buffer_driver_id));
 			resource_tracker->usage = new_resource_usage;
 		}
 
@@ -1161,6 +1177,9 @@ void RenderingDeviceGraph::_run_render_commands(int32_t p_level, const RecordedC
 		const uint32_t command_data_offset = command_data_offsets[command_index];
 		const RecordedCommand *command = reinterpret_cast<const RecordedCommand *>(&command_data[command_data_offset]);
 		_run_label_command_change(r_command_buffer, command->label_index, p_level, false, true, &p_sorted_commands[i], p_sorted_commands_count - i, r_current_label_index, r_current_label_level);
+		if (audit_barriers_enabled) {
+			_audit_replayed_accesses(command_index, p_level);
+		}
 #if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
 		if (crumb_types != 0 && command->type != RecordedCommand::TYPE_CAPTURE_TIMESTAMP) {
 			RDD::device_lost_debug_hook = lightcycle_crumbs_dump;
@@ -1559,6 +1578,9 @@ void RenderingDeviceGraph::_group_barriers_for_render_commands(RDD::CommandBuffe
 	const VectorView<RDD::BufferBarrier> buffer_barriers = VectorView<RDD::BufferBarrier>();
 #endif
 	const VectorView<RDD::AccelerationStructureBarrier> acceleration_structure_barriers = !are_acceleration_structure_barriers_empty ? barrier_group.acceleration_structure_barriers : VectorView<RDD::AccelerationStructureBarrier>();
+	if (audit_barriers_enabled) {
+		_audit_emitted_barriers();
+	}
 
 	driver->command_pipeline_barrier(p_command_buffer, barrier_group.src_stages, barrier_group.dst_stages, memory_barriers, buffer_barriers, texture_barriers, acceleration_structure_barriers);
 
@@ -1834,7 +1856,8 @@ void RenderingDeviceGraph::_print_compute_list(const uint8_t *p_instruction_data
 }
 
 void RenderingDeviceGraph::initialize(RDD *p_driver, RenderPassCreationFunction p_render_pass_creation_function, uint32_t p_frame_count, RDD::CommandQueueFamilyID p_secondary_command_queue_family, uint32_t p_secondary_command_buffers_per_frame) {
-	audit_graph_enabled = OS::get_singleton()->has_environment("LIGHTCYCLE_GRAPH_AUDIT");
+	audit_barriers_enabled = OS::get_singleton()->has_environment("LIGHTCYCLE_BARRIER_AUDIT");
+	audit_graph_enabled = OS::get_singleton()->has_environment("LIGHTCYCLE_GRAPH_AUDIT") || audit_barriers_enabled;
 	DEV_ASSERT(p_driver != nullptr);
 	DEV_ASSERT(p_render_pass_creation_function != nullptr);
 	DEV_ASSERT(p_frame_count > 0);
@@ -1878,6 +1901,10 @@ void RenderingDeviceGraph::finalize() {
 
 void RenderingDeviceGraph::begin() {
 	audit_graph_accesses.clear();
+	audit_texture_accesses.clear();
+	audit_barrier_states[0].clear();
+	audit_barrier_states[1].clear();
+	audit_barrier_ranges.clear();
 	command_data.clear();
 	command_data_offsets.clear();
 	command_normalization_barriers.clear();
@@ -2703,6 +2730,103 @@ void RenderingDeviceGraph::end_label() {
 	command_label_index = -1;
 }
 
+static uint64_t audit_stage_scope(uint64_t p_stages) {
+	if (p_stages & RDD::PIPELINE_STAGE_RESOLVE_BIT) {
+		p_stages |= RDD::PIPELINE_STAGE_COPY_BIT;
+	}
+	if (p_stages & RDD::PIPELINE_STAGE_ALL_COMMANDS_BIT) {
+		return UINT64_MAX;
+	}
+	if (p_stages & RDD::PIPELINE_STAGE_ALL_GRAPHICS_BIT) {
+		p_stages |= RDD::PIPELINE_STAGE_DRAW_INDIRECT_BIT | RDD::PIPELINE_STAGE_VERTEX_INPUT_BIT |
+				RDD::PIPELINE_STAGE_VERTEX_SHADER_BIT | RDD::PIPELINE_STAGE_TESSELLATION_CONTROL_SHADER_BIT |
+				RDD::PIPELINE_STAGE_TESSELLATION_EVALUATION_SHADER_BIT | RDD::PIPELINE_STAGE_GEOMETRY_SHADER_BIT |
+				RDD::PIPELINE_STAGE_FRAGMENT_SHADER_BIT | RDD::PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+				RDD::PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | RDD::PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+	}
+	return p_stages;
+}
+
+void RenderingDeviceGraph::_audit_emitted_barriers() {
+	const uint64_t read_bits = RDD::BARRIER_ACCESS_INDIRECT_COMMAND_READ_BIT | RDD::BARRIER_ACCESS_INDEX_READ_BIT |
+			RDD::BARRIER_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | RDD::BARRIER_ACCESS_UNIFORM_READ_BIT |
+			RDD::BARRIER_ACCESS_INPUT_ATTACHMENT_READ_BIT | RDD::BARRIER_ACCESS_SHADER_READ_BIT |
+			RDD::BARRIER_ACCESS_COLOR_ATTACHMENT_READ_BIT | RDD::BARRIER_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+			RDD::BARRIER_ACCESS_COPY_READ_BIT | RDD::BARRIER_ACCESS_HOST_READ_BIT |
+			RDD::BARRIER_ACCESS_ACCELERATION_STRUCTURE_READ_BIT;
+	const uint64_t write_bits = RDD::BARRIER_ACCESS_SHADER_WRITE_BIT | RDD::BARRIER_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+			RDD::BARRIER_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | RDD::BARRIER_ACCESS_COPY_WRITE_BIT |
+			RDD::BARRIER_ACCESS_HOST_WRITE_BIT | RDD::BARRIER_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT;
+	const uint64_t src_stages = audit_stage_scope(uint64_t(barrier_group.src_stages));
+	const uint64_t dst_stages = audit_stage_scope(uint64_t(barrier_group.dst_stages));
+	auto apply = [&](AuditBarrierState &r_state, uint64_t p_src, uint64_t p_dst) {
+		if ((src_stages & r_state.stages) && ((p_src & RDD::BARRIER_ACCESS_MEMORY_WRITE_BIT) || (p_src & r_state.access))) {
+			r_state.available = true;
+		}
+		if (!r_state.available) {
+			return;
+		}
+		if (p_dst & RDD::BARRIER_ACCESS_MEMORY_READ_BIT) {
+			p_dst |= read_bits;
+		}
+		if (p_dst & RDD::BARRIER_ACCESS_MEMORY_WRITE_BIT) {
+			p_dst |= write_bits;
+		}
+		for (uint32_t b = 0; b < 32; b++) {
+			if (p_dst & (uint64_t(1) << b)) {
+				r_state.visible_stages[b] |= dst_stages;
+			}
+		}
+	};
+	// Match this experiment's Vulkan global-mask conversion. Per-AS barriers preserve AS_READ.
+	static const bool global_as_reads = OS::get_singleton()->has_environment("LIGHTCYCLE_GLOBAL_AS_READS");
+	const uint64_t mask = global_as_reads ? UINT64_MAX : ~uint64_t(RDD::BARRIER_ACCESS_ACCELERATION_STRUCTURE_READ_BIT);
+	for (uint32_t kind = 0; kind < 2; kind++) {
+		for (KeyValue<uint64_t, AuditBarrierState> &entry : audit_barrier_states[kind]) {
+			apply(entry.value, uint64_t(barrier_group.memory_barrier.src_access) & mask, uint64_t(barrier_group.memory_barrier.dst_access) & mask);
+		}
+	}
+	for (const RDD::AccelerationStructureBarrier &barrier : barrier_group.acceleration_structure_barriers) {
+		if (AuditBarrierState *state = audit_barrier_states[1].getptr(barrier.acceleration_structure.id)) {
+			apply(*state, uint64_t(barrier.src_access), uint64_t(barrier.dst_access));
+		}
+	}
+}
+
+void RenderingDeviceGraph::_audit_replayed_accesses(uint32_t p_command, int32_t p_level) {
+	const Pair<uint32_t, uint32_t> &range = audit_barrier_ranges[p_command];
+	for (uint32_t i = range.first; i < range.second; i++) {
+		const AuditAccess &access = audit_graph_accesses[i];
+		AuditBarrierState &state = audit_barrier_states[access.acceleration ? 1 : 0][access.resource];
+		if (state.writer >= 0 && state.writer != int32_t(p_command)) {
+			uint64_t missing = 0;
+			for (uint32_t b = 0; b < 32; b++) {
+				if ((access.access & (uint64_t(1) << b)) && !(audit_stage_scope(access.stages) & state.visible_stages[b])) {
+					missing |= uint64_t(1) << b;
+				}
+			}
+			if (missing != 0) {
+				audit_barrier_errors++;
+				if (audit_barrier_errors <= 32) {
+					const RecordedCommand *writer = reinterpret_cast<const RecordedCommand *>(&command_data[command_data_offsets[state.writer]]);
+					const RecordedCommand *reader = reinterpret_cast<const RecordedCommand *>(&command_data[command_data_offsets[p_command]]);
+					const char *label = reader->label_index >= 0 ? &command_label_chars[command_label_offsets[reader->label_index]] : "";
+					print_line(vformat("BARRIER_AUDIT UNCOVERED frame=%d kind=%s resource=%d writer=%d type=%d stages=%d access=%d reader=%d type=%d level=%d stages=%d access=%d missing=%d available=%d label=%s", tracking_frame, access.acceleration ? "AS" : "buffer", access.resource, state.writer, writer->type, state.stages, state.access, p_command, reader->type, p_level, access.stages, access.access, missing, int(state.available), label));
+				}
+			}
+		}
+		if (access.write && state.writer != int32_t(p_command)) {
+			state = AuditBarrierState();
+			state.writer = p_command;
+			state.stages = access.stages;
+			const uint64_t read_bits = RDD::BARRIER_ACCESS_SHADER_READ_BIT | RDD::BARRIER_ACCESS_ACCELERATION_STRUCTURE_READ_BIT |
+					RDD::BARRIER_ACCESS_COLOR_ATTACHMENT_READ_BIT | RDD::BARRIER_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
+			state.access = access.access & ~read_bits;
+		}
+		audit_barrier_access_count++;
+	}
+}
+
 void RenderingDeviceGraph::_audit_dependencies(VectorView<RecordedCommandSort> p_commands, bool p_reorder) {
 	struct History {
 		int32_t writer = -1;
@@ -2714,7 +2838,54 @@ void RenderingDeviceGraph::_audit_dependencies(VectorView<RecordedCommandSort> p
 	for (uint32_t i = 0; i < p_commands.size(); i++) {
 		levels[p_commands[i].index] = p_reorder ? p_commands[i].level : p_commands[i].index;
 	}
+	if (audit_barriers_enabled) {
+		HashMap<uint64_t, LocalVector<uint32_t>> textures;
+		for (uint32_t i = 0; i < audit_texture_accesses.size(); i++) {
+			const AuditTextureAccess &access = audit_texture_accesses[i];
+			LocalVector<uint32_t> &previous_accesses = textures[access.resource];
+			for (uint32_t j : previous_accesses) {
+				const AuditTextureAccess &previous = audit_texture_accesses[j];
+				if (previous.command == access.command || levels[previous.command] < levels[access.command]) {
+					continue;
+				}
+				const RDD::TextureSubresourceRange &a = previous.subresources;
+				const RDD::TextureSubresourceRange &b = access.subresources;
+				if (!(uint64_t(a.aspect) & uint64_t(b.aspect)) || a.base_mipmap >= b.base_mipmap + b.mipmap_count || b.base_mipmap >= a.base_mipmap + a.mipmap_count || a.base_layer >= b.base_layer + b.layer_count || b.base_layer >= a.base_layer + a.layer_count) {
+					continue;
+				}
+				const bool layout_change = _usage_to_image_layout(previous.usage) != _usage_to_image_layout(access.usage);
+				if (!previous.write && !access.write && !layout_change) {
+					continue;
+				}
+				if (previous.usage == access.usage && (access.usage == RESOURCE_USAGE_ATTACHMENT_COLOR_READ_WRITE || access.usage == RESOURCE_USAGE_ATTACHMENT_DEPTH_STENCIL_READ_WRITE) && !previous.region.intersects(access.region)) {
+					continue;
+				}
+				audit_texture_errors++;
+				if (audit_texture_errors <= 32) {
+					const RecordedCommand *current = reinterpret_cast<const RecordedCommand *>(&command_data[command_data_offsets[access.command]]);
+					const char *label = current->label_index >= 0 ? &command_label_chars[command_label_offsets[current->label_index]] : "";
+					print_line(vformat("TEXTURE_AUDIT HAZARD frame=%d resource=%d before=%d level=%d usage=%d mip=%d layers=%d+%d after=%d level=%d usage=%d mip=%d layers=%d+%d label=%s", tracking_frame, access.resource, previous.command, levels[previous.command], previous.usage, a.base_mipmap, a.base_layer, a.layer_count, access.command, levels[access.command], access.usage, b.base_mipmap, b.base_layer, b.layer_count, label));
+				}
+			}
+			previous_accesses.push_back(i);
+		}
+		audit_texture_count += audit_texture_accesses.size();
+		if (tracking_frame % 600 == 0) {
+			print_line(vformat("BARRIER_AUDIT frame=%d buffer_as_accesses=%d uncovered=%d texture_accesses=%d texture_hazards=%d", tracking_frame, audit_barrier_access_count, audit_barrier_errors, audit_texture_count, audit_texture_errors));
+		}
+	}
 	audit_graph_accesses.sort();
+	if (audit_barriers_enabled) {
+		audit_barrier_ranges.resize(command_count);
+		uint32_t cursor = 0;
+		for (uint32_t c = 0; c < command_count; c++) {
+			const uint32_t start = cursor;
+			while (cursor < audit_graph_accesses.size() && audit_graph_accesses[cursor].command == c) {
+				cursor++;
+			}
+			audit_barrier_ranges[c] = Pair<uint32_t, uint32_t>(start, cursor);
+		}
+	}
 	for (const AuditAccess &access : audit_graph_accesses) {
 		History &history = histories[access.acceleration ? 1 : 0][access.resource];
 		auto check = [&](uint32_t p_previous) {
