@@ -8165,7 +8165,14 @@ void RenderingDevice::_end_frame() {
 	_submit_transfer_barriers(command_buffer);
 
 	GodotProfileZoneGrouped(_profile_zone, "draw_graph.end");
-	draw_graph.end(RENDER_GRAPH_REORDER == 1, RENDER_GRAPH_FULL_BARRIERS == 1, command_buffer, frames[frame].command_buffer_pool);
+	// Workaround for the unresolved device loss under hardware ray queries: fully order graph
+	// levels while acceleration structures are alive. Keep normal barriers for raster-only work.
+	bool full_barriers = RENDER_GRAPH_FULL_BARRIERS == 1 || acceleration_structure_owner.get_rid_count() > 0;
+	// A freed RID can still be referenced by recorded or in-flight GPU work until its deferred destruction.
+	for (uint32_t i = 0; !full_barriers && i < frames.size(); i++) {
+		full_barriers = !frames[i].acceleration_structures_to_dispose_of.is_empty();
+	}
+	draw_graph.end(RENDER_GRAPH_REORDER == 1, full_barriers, command_buffer, frames[frame].command_buffer_pool);
 	GodotProfileZoneGrouped(_profile_zone, "driver->command_buffer_end");
 	driver->command_buffer_end(command_buffer);
 	GodotProfileZoneGrouped(_profile_zone, "driver->end_segment");

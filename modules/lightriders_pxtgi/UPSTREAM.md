@@ -54,18 +54,26 @@ Local changes of 2026-11-13, for the game's ray traced Lighting:
 - The render thread's motion pass skips a static shape that kept its slot across a rebuild of the static part
   (5 to 7 ms of that frame for a city's 43,000 shapes, 0.9 ms now).
 
-A GPU device loss under hardware tracing on the game's Aurora Circuit (`VK_EXT_device_fault`: a write to
-address 0; six of about 105 rides on 2026-11-13, always in the same stretch) points, on the evidence so far, at
-the game and not at this module: a planar mirror viewport that shares the traced world woke there mid-ride with the world's compositor, so the
-renderer gave it this effect's passes (the effect itself returns for a view whose environment is not its own)
-and made 156 pipelines for them in the background while the city streamed its structures in. The game gives
-its mirror cameras an empty compositor (its `docs/look.md`, Ray traced Lighting, has the evidence and the
-count of rides since). Diagnostics kept from the
-hunt, all off unless the environment variable is set: `PXTGI_RT_TIMING` also prints a structure outgrowing its
-capacity, meshes retired, an instance with a degenerate transform, mesh data that is not finite, `DANGLING`
-when the static structure names a mesh retired without its rebuild, and `RANGE` when a moving leaf names
-geometry words its block is not at; `LIGHTCYCLE_PASS_LOG` (the Forward+ renderer) prints each pass layout the
-first time it draws, which is what found the viewport.
+Hardware ray queries on the game's Aurora Circuit have triggered a GPU device loss with a
+`VK_EXT_device_fault` write to address 0. The cause remains open. Full memory barriers before
+each render-graph level, with command reordering retained, are the tested workaround. The
+RenderingDevice enables them while any acceleration structure is alive or waiting for deferred
+destruction; raster-only work otherwise retains normal graph barriers. The game's engine pin
+and validation record identify the exact build and ride counts.
+
+The workaround includes the five corrections shared by both comparison arms: concurrent
+sharing of transfer resources across the graphics and transfer queue families, shader-read
+visibility for immutable texture uploads, acceleration-structure read access in global memory
+barriers, and reader ordering after the buffer and acceleration-structure commands carrying
+their visibility transitions. Empty-range shadow queries are also rejected before dispatch.
+These correct real defects; none was shown to explain or independently prevent the race loss.
+
+The game's empty mirror compositor avoids unnecessary traced passes and a pipeline-compilation
+hitch. It did not stop the device loss and is not its identified cause.
+
+Diagnostics are off unless requested: `PXTGI_RT_TIMING` reports structure capacity, retired
+meshes, degenerate or non-finite data, dangling static references and moving-leaf range errors;
+`LIGHTCYCLE_PASS_LOG` prints each Forward+ pass layout the first time it draws.
 
 ## Upstream audit
 
