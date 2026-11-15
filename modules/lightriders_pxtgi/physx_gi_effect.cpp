@@ -713,6 +713,11 @@ int trace_world(vec3 o, vec3 d, inout float t, out vec3 normal) {
 
 // Whether anything lies along the ray before reach (shadow rays).
 bool blocked(vec3 o, vec3 d, float reach) {
+	// The end bias can consume a short light segment. No occluder lies in an empty range.
+	// A negative tMax is invalid for a hardware ray query.
+	if (reach <= 0.0) {
+		return false;
+	}
 	vec3 n;
 	return walk_world(o, d, reach, n, true, false) >= 0;
 }
