@@ -2274,6 +2274,8 @@ Error RenderingDevice::_texture_initialize(RID p_texture, uint32_t p_layer, cons
 				tb.src_access = RDD::BARRIER_ACCESS_COPY_WRITE_BIT;
 				tb.prev_layout = p_dst_layout;
 				tb.next_layout = RDD::TEXTURE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+				// Immutable textures have no graph tracker to make uploads visible to sampling.
+				tb.dst_access = RDD::BARRIER_ACCESS_SHADER_READ_BIT;
 				tb.subresources.aspect = texture->barrier_aspect_flags;
 				tb.subresources.mipmap_count = texture->mipmaps;
 				tb.subresources.base_layer = p_layer;
