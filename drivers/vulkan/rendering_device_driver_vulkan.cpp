@@ -2001,6 +2001,14 @@ RDD::BufferID RenderingDeviceDriverVulkan::buffer_create(uint64_t p_size, BitFie
 	create_info.size = p_size;
 	create_info.usage = p_usage & ~BUFFER_USAGE_DYNAMIC_PERSISTENT_BIT;
 	create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	// A semaphore orders uploads across queue families but does not transfer exclusive ownership.
+	if (resource_queue_families[0] != UINT32_MAX &&
+			resource_queue_families[0] != resource_queue_families[1] &&
+			(create_info.usage & (VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT))) {
+		create_info.sharingMode = VK_SHARING_MODE_CONCURRENT;
+		create_info.queueFamilyIndexCount = 2;
+		create_info.pQueueFamilyIndices = resource_queue_families;
+	}
 
 	VmaMemoryUsage vma_usage = VMA_MEMORY_USAGE_UNKNOWN;
 	uint32_t vma_flags_to_remove = 0;
@@ -2356,6 +2364,14 @@ RDD::TextureID RenderingDeviceDriverVulkan::texture_create(const TextureFormat &
 	}
 
 	create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	// A semaphore orders uploads across queue families but does not transfer exclusive ownership.
+	if (resource_queue_families[0] != UINT32_MAX &&
+			resource_queue_families[0] != resource_queue_families[1] &&
+			(create_info.usage & (VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT))) {
+		create_info.sharingMode = VK_SHARING_MODE_CONCURRENT;
+		create_info.queueFamilyIndexCount = 2;
+		create_info.pQueueFamilyIndices = resource_queue_families;
+	}
 	create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
 	// Allocate memory.
@@ -3184,6 +3200,11 @@ RDD::CommandQueueID RenderingDeviceDriverVulkan::command_queue_create(CommandQue
 
 	// Make a virtual queue on top of a real queue. Use the queue from the family with the least amount of virtual queues created.
 	uint32_t family_index = p_cmd_queue_family.id - 1;
+	if (p_identify_as_main_queue) {
+		resource_queue_families[0] = family_index;
+		const CommandQueueFamilyID transfer = command_queue_family_get(COMMAND_QUEUE_FAMILY_TRANSFER_BIT);
+		resource_queue_families[1] = transfer ? uint32_t(transfer.id - 1) : family_index;
+	}
 	TightLocalVector<Queue> &queue_family = queue_families[family_index];
 	uint32_t picked_queue_index = UINT_MAX;
 	uint32_t picked_virtual_count = UINT_MAX;

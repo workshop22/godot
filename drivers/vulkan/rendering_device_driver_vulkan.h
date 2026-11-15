@@ -145,6 +145,7 @@ class RenderingDeviceDriverVulkan : public RenderingDeviceDriver {
 	bool process_exiting = false;
 	RenderingContextDriver::Device context_device = {};
 	uint32_t frame_count = 1;
+	uint32_t resource_queue_families[2] = { UINT32_MAX, UINT32_MAX };
 	VkPhysicalDevice physical_device = VK_NULL_HANDLE;
 	VkPhysicalDeviceProperties physical_device_properties = {};
 	VkPhysicalDeviceFeatures physical_device_features = {};
