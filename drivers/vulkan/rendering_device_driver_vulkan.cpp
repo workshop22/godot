@@ -32,6 +32,7 @@
 
 #include "core/config/engine.h"
 #include "core/config/project_settings.h"
+#include "core/io/file_access.h"
 #include "core/os/os.h"
 #include "core/templates/fixed_vector.h"
 #include "drivers/vulkan/vulkan_hooks.h"
@@ -607,6 +608,9 @@ Error RenderingDeviceDriverVulkan::_initialize_device_extensions() {
 	}
 #endif
 	_register_requested_device_extension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME, false);
+	if (OS::get_singleton()->has_environment("LIGHTCYCLE_GPU_DIAGNOSTICS")) {
+		_register_requested_device_extension(VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME, false);
+	}
 
 	{
 		// Debug marker extensions.
@@ -924,6 +928,7 @@ Error RenderingDeviceDriverVulkan::_check_device_capabilities() {
 		VkPhysicalDeviceRayTracingValidationFeaturesNV raytracing_validation_features = {};
 		VkPhysicalDeviceRayQueryFeaturesKHR ray_query_features = {};
 		VkPhysicalDeviceFaultFeaturesEXT device_fault_features = {};
+		VkPhysicalDeviceDiagnosticsConfigFeaturesNV diagnostics_config_features = {};
 
 		const bool use_1_2_features = physical_device_properties.apiVersion >= VK_API_VERSION_1_2;
 		if (use_1_2_features) {
@@ -1027,6 +1032,11 @@ Error RenderingDeviceDriverVulkan::_check_device_capabilities() {
 		}
 
 		VkPhysicalDeviceFeatures2 device_features_2 = {};
+		if (enabled_device_extension_names.has(VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME)) {
+			diagnostics_config_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DIAGNOSTICS_CONFIG_FEATURES_NV;
+			diagnostics_config_features.pNext = next_features;
+			next_features = &diagnostics_config_features;
+		}
 		device_features_2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
 		device_features_2.pNext = next_features;
 		functions.GetPhysicalDeviceFeatures2(physical_device, &device_features_2);
@@ -1098,8 +1108,10 @@ Error RenderingDeviceDriverVulkan::_check_device_capabilities() {
 		}
 
 		// vkGetDeviceFaultInfoEXT is only valid when the deviceFault feature is enabled at device creation.
+		diagnostics_config_support = diagnostics_config_features.diagnosticsConfig;
 		if (enabled_device_extension_names.has(VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
 			device_fault_support = device_fault_features.deviceFault;
+			device_fault_vendor_binary_support = device_fault_features.deviceFault && device_fault_features.deviceFaultVendorBinary && OS::get_singleton()->has_environment("LIGHTCYCLE_GPU_DUMP");
 		}
 #if defined(VK_TRACK_DEVICE_MEMORY)
 		if (enabled_device_extension_names.has(VK_EXT_DEVICE_MEMORY_REPORT_EXTENSION_NAME)) {
@@ -1422,11 +1434,26 @@ Error RenderingDeviceDriverVulkan::_initialize_device(const LocalVector<VkDevice
 		create_info_next = &pipeline_cache_control_features;
 	}
 
+	// Opt-in crash-dump enrichment; no configuration flags are enabled unless explicitly requested.
+	VkPhysicalDeviceDiagnosticsConfigFeaturesNV diagnostics_config_features = {};
+	VkDeviceDiagnosticsConfigCreateInfoNV diagnostics_config_info = {};
+	if (diagnostics_config_support) {
+		diagnostics_config_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DIAGNOSTICS_CONFIG_FEATURES_NV;
+		diagnostics_config_features.diagnosticsConfig = VK_TRUE;
+		diagnostics_config_features.pNext = create_info_next;
+		create_info_next = &diagnostics_config_features;
+		diagnostics_config_info.sType = VK_STRUCTURE_TYPE_DEVICE_DIAGNOSTICS_CONFIG_CREATE_INFO_NV;
+		diagnostics_config_info.flags = OS::get_singleton()->get_environment("LIGHTCYCLE_GPU_DIAGNOSTICS").to_int();
+		diagnostics_config_info.pNext = create_info_next;
+		create_info_next = &diagnostics_config_info;
+		print_line(vformat("NVIDIA crash diagnostics enabled, flags %d.", diagnostics_config_info.flags));
+	}
 	VkPhysicalDeviceFaultFeaturesEXT device_fault_features = {};
 	if (device_fault_support) {
 		device_fault_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT;
 		device_fault_features.pNext = create_info_next;
 		device_fault_features.deviceFault = VK_TRUE;
+		device_fault_features.deviceFaultVendorBinary = device_fault_vendor_binary_support ? VK_TRUE : VK_FALSE;
 		create_info_next = &device_fault_features;
 	}
 
@@ -7038,16 +7065,36 @@ void RenderingDeviceDriverVulkan::on_device_lost() const {
 			? (VkDeviceFaultAddressInfoEXT *)memalloc(fault_counts.addressInfoCount * sizeof(VkDeviceFaultAddressInfoEXT))
 			: nullptr;
 	const uint64_t vendor_binary_size = fault_counts.vendorBinarySize;
-	fault_counts.vendorBinarySize = 0;
+	uint8_t *vendor_binary = nullptr;
+	if (device_fault_vendor_binary_support && vendor_binary_size > 0) {
+		vendor_binary = (uint8_t *)memalloc(vendor_binary_size);
+		fault_info.pVendorBinaryData = vendor_binary;
+	} else {
+		fault_counts.vendorBinarySize = 0;
+	}
 	vkres = device_functions.GetDeviceFaultInfoEXT(vk_device, &fault_counts, &fault_info);
-	// The vendor binary is not requested, so drivers that have one return VK_INCOMPLETE; the description and the
+	if (vendor_binary != nullptr) {
+		if (vkres == VK_SUCCESS || vkres == VK_INCOMPLETE) {
+			const String path = OS::get_singleton()->get_environment("LIGHTCYCLE_GPU_DUMP").path_join(vformat("gpu-crash-%d-%d.nv-gpudmp", OS::get_singleton()->get_process_id(), OS::get_singleton()->get_ticks_msec()));
+			Ref<FileAccess> file = FileAccess::open(path, FileAccess::WRITE);
+			if (file.is_valid()) {
+				file->store_buffer(vendor_binary, fault_counts.vendorBinarySize);
+				file->close();
+				_err_print_error(FUNCTION_STR, __FILE__, __LINE__, vformat("Vendor crash dump saved: %s (%d bytes).", path, int64_t(fault_counts.vendorBinarySize)));
+			} else {
+				_err_print_error(FUNCTION_STR, __FILE__, __LINE__, "Vendor crash dump could not be saved to " + path);
+			}
+		}
+		memfree(vendor_binary);
+	}
+	// When the vendor binary is not requested, drivers that have one return VK_INCOMPLETE; the description and the
 	// vendor and address infos, sized from the count query above, are still complete.
 	if (vkres != VK_SUCCESS && vkres != VK_INCOMPLETE) {
 		_err_print_error(FUNCTION_STR, __FILE__, __LINE__, "vkGetDeviceFaultInfoEXT returned " + itos(vkres) + " when getting fault info, skipping VK_EXT_device_fault report...");
 	} else {
 		err_msg += "** Report from VK_EXT_device_fault **";
 		err_msg += "\nDescription: " + String(fault_info.description);
-		err_msg += "\nVendor binary: " + itos(vendor_binary_size) + " bytes (not requested)";
+		err_msg += "\nVendor binary: " + itos(vendor_binary_size) + (device_fault_vendor_binary_support ? " bytes" : " bytes (not requested)");
 		err_msg += "\nVendor infos:";
 		for (uint32_t vd = 0; vd < fault_counts.vendorInfoCount; ++vd) {
 			const VkDeviceFaultVendorInfoEXT *vendor_info = &fault_info.pVendorInfos[vd];

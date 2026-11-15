@@ -74,6 +74,11 @@ hitch. It did not stop the device loss and is not its identified cause.
 Diagnostics are off unless requested: `PXTGI_RT_TIMING` reports structure capacity, retired
 meshes, degenerate or non-finite data, dangling static references and moving-leaf range errors;
 `LIGHTCYCLE_PASS_LOG` prints each Forward+ pass layout the first time it draws.
+`LIGHTCYCLE_GPU_DUMP` names an existing writable directory for the driver's vendor crash
+binary; `LIGHTCYCLE_GPU_DIAGNOSTICS` requests supported NVIDIA diagnostic configuration flags
+as an integer bitmask. These two options add no command markers and remain disabled by default.
+Driver dumps may omit shader, resource or page-fault details. Intrusive audits and rejected
+experiments are kept outside the production pin.
 
 ## Upstream audit
 
