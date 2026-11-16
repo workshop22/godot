@@ -1,4 +1,4 @@
-# PXTGI rendering trial
+# PXTGI rendering module
 
 Rendering sources from Wild Ox Studios' MIT-licensed `godot_physx` module:
 https://github.com/uno1982/godot/tree/e2b3875bf68975aaac9154b55d05b14685c31857/modules/godot_physx
@@ -11,8 +11,8 @@ thread call helper carries its callable locally instead of including the PhysX
 server header. Engine base: Lightriders' pinned Godot 4.7.2 patch series.
 
 The game instantiates PXTGI through its opt-in Video Lighting setting. Standard remains
-the default; map holds and device fallback belong to the game. This branch's additional
-admission and wall-batch changes require the matching experimental game/editor pair.
+the default; map holds and device fallback belong to the game. Streamed cell admission
+and persistent wall batches use the publication and lifetime contracts below.
 
 Local scene-integration changes expose reflection reach independently of GI reach,
 allow a proxy to opt out of box-light sampling with `pxtgi_sample_emission`, and
@@ -20,8 +20,7 @@ retain traced emission for sources outside the direct-light selection. Reflectio
 run at full viewport resolution. The optional `filtered_reflections` mode uses
 coherent mirror rays and the existing roughness resolve instead of stochastic GGX
 directions; this is an artistic approximation for the wet-road study. Camera cuts
-invalidate previous-colour reuse. These changes are experimental, not upstream
-quality or performance claims.
+invalidate previous-colour reuse. These local rendering options make no upstream quality or performance claims.
 
 The standalone module also carries the upstream lens dirt, lens flare/settings and
 light shafts nodes/effects from the same source revision. They use the local render
@@ -30,7 +29,7 @@ use aligned vec4 records on both sides of the GPU buffer; explicit UV rejection
 replaces border-sampler reads. Lens extraction bounds non-finite HDR inputs. A local
 `reflection_softness` setting adds a separable depth/normal-aware reflection-only blur
 without feeding blurred output back into temporal history. These effects remain
-opt-in through the game experiment.
+opt-in through the game.
 
 Local integration for the game's ray traced Lighting:
 
