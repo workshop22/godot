@@ -324,6 +324,21 @@ layout(std430, set = 0, binding = 10) restrict readonly buffer Geometry {
 }
 geo;
 
+// A wall batch keeps its immutable triangles. Per-wall RGB and hit eligibility
+// travel with the same complete snapshot as its primitive/table-base records.
+layout(std430, set = 0, binding = 24) restrict readonly buffer WallMaterials {
+	vec4 v[];
+}
+wall_materials;
+
+vec4 wall_material(Primitive q, int triangle) {
+	if (q.emission.w >= 0.0) {
+		return vec4(q.emission.rgb, 1.0);
+	}
+	int group = int(geo.v[floatBitsToInt(q.shape.z) + triangle * 3].w);
+	return wall_materials.v[int(-q.emission.w) - 1 + group];
+}
+
 // Where a local ray enters a mesh tree node's box (1e30: it misses it, or only beyond best).
 float mesh_box_entry(vec3 o, vec3 inv, int at, float best) {
 	vec3 t0 = (geo.v[at].xyz - o) * inv;
@@ -340,7 +355,7 @@ float mesh_box_entry(vec3 o, vec3 inv, int at, float best) {
 int nearest_triangle = 0;
 vec2 nearest_bary = vec2(0.0);
 
-bool hit_mesh(int nodes, int tris, vec3 o, vec3 d, inout float t, out vec3 n) {
+bool hit_mesh(int nodes, int tris, int wall_base, vec3 o, vec3 d, inout float t, out vec3 n) {
 	bool found = false;
 	vec3 inv = 1.0 / d;
 	int stack[24];
@@ -376,6 +391,9 @@ bool hit_mesh(int nodes, int tris, vec3 o, vec3 d, inout float t, out vec3 n) {
 			} else {
 			int first = floatBitsToInt(lo.w);
 			for (int k = first; k < first + count; k++) {
+				if (wall_base >= 0 && wall_materials.v[wall_base + int(geo.v[tris + k * 3].w)].a < 0.5) {
+					continue;
+				}
 				vec3 a = geo.v[tris + k * 3].xyz;
 				vec3 e1 = geo.v[tris + k * 3 + 1].xyz - a;
 				vec3 e2 = geo.v[tris + k * 3 + 2].xyz - a;
@@ -481,7 +499,7 @@ bool hit_primitive(Primitive q, vec3 o, vec3 d, inout float best, out vec3 norma
 		t = t_in;
 	} else if (type == 5) {
 		t = best;
-		if (!hit_mesh(floatBitsToInt(q.shape.y), floatBitsToInt(q.shape.z), lo, ld, t, n)) {
+		if (!hit_mesh(floatBitsToInt(q.shape.y), floatBitsToInt(q.shape.z), int(-q.emission.w) - 1, lo, ld, t, n)) {
 			return false;
 		}
 	} else if (type == 2 || type == 3) {
@@ -673,6 +691,13 @@ vec3 hw_normal(int slot, int tri, vec3 p, vec3 d) {
 		rayQueryEXT q; \
 		rayQueryInitializeEXT(q, SCENE, flags, items ? 2u : 1u, o, 0.0, d, t); \
 		while (rayQueryProceedEXT(q)) { \
+			if (rayQueryGetIntersectionTypeEXT(q, false) == gl_RayQueryCandidateIntersectionTriangleEXT) { \
+				int candidate = rayQueryGetIntersectionInstanceCustomIndexEXT(q, false) + rayQueryGetIntersectionGeometryIndexEXT(q, false); \
+				int triangle = rayQueryGetIntersectionPrimitiveIndexEXT(q, false); \
+				if (wall_material(prims.p[candidate], triangle).a > 0.5) { \
+					rayQueryConfirmIntersectionEXT(q); \
+				} \
+			} \
 		} \
 		if (rayQueryGetIntersectionTypeEXT(q, true) == gl_RayQueryCommittedIntersectionTriangleEXT) { \
 			t = rayQueryGetIntersectionTEXT(q, true); \
@@ -690,7 +715,9 @@ int walk_world(vec3 o, vec3 d, inout float t, out vec3 normal, bool any_hit, boo
 	if (f.counts.y == 0) {
 		return hit;
 	}
-	uint flags = gl_RayFlagsOpaqueEXT | (any_hit ? gl_RayFlagsTerminateOnFirstHitEXT : 0u);
+	// Ordinary instances force opaque; wall batches force non-opaque so departed
+	// triangles can be rejected. A ray-level Opaque flag would override that.
+	uint flags = any_hit ? gl_RayFlagsTerminateOnFirstHitEXT : 0u;
 	HW_QUERY(static_scene)
 	if (!any_hit || hit < 0) {
 		HW_QUERY(moving_scene)
@@ -945,6 +972,8 @@ vec3 direct_light(vec3 x, vec3 n, bool indirect) {
 float reflect_path = 0.0;
 
 vec3 world_light(vec3 x, vec3 n, int hit, sampler2D depth_tex, sampler2D color_tex, bool from_pixels, bool with_glow, bool sharp) {
+	// Later lighting/shadow queries may replace nearest_triangle.
+	vec3 emission = wall_material(prims.p[hit], nearest_triangle).rgb;
 	// Direct sampling replaces only the emitters actually selected, not every glowing
 	// surface in the world. Unselected sources still contribute through traced hits.
 	if (!with_glow) {
@@ -976,7 +1005,7 @@ vec3 world_light(vec3 x, vec3 n, int hit, sampler2D depth_tex, sampler2D color_t
 				if (on_screen(pp)) {
 					float lod = reflect_path > 0.0 ? reflected_lod(reflect_path, -v.z) : min(2.0, max(f.polish.z - 1.0, 0.0));
 					vec3 seen = textureLod(color_tex, (pp + 0.5) / vec2(f.sizes.xy), lod).rgb;
-					return with_glow ? seen : max(seen - prims.p[hit].emission.rgb * f.sun_color.w, vec3(0.0));
+					return with_glow ? seen : max(seen - emission * f.sun_color.w, vec3(0.0));
 				}
 			}
 		}
@@ -991,7 +1020,7 @@ vec3 world_light(vec3 x, vec3 n, int hit, sampler2D depth_tex, sampler2D color_t
 	}
 #endif
 	vec3 albedo = prims.p[hit].albedo.rgb;
-	vec3 glow = with_glow ? prims.p[hit].emission.rgb * f.sun_color.w : vec3(0.0);
+	vec3 glow = with_glow ? emission * f.sun_color.w : vec3(0.0);
 	if (f.cache.z != 0u) {
 		bool claimed;
 		int slot = cache_slot(x, n, from_pixels, claimed);
@@ -2811,7 +2840,7 @@ PhysXGIEffect::~PhysXGIEffect() {
 				}
 			}
 		}
-		for (RID r : { item_mask_sampler, item_material_buffer, linear_sampler, mip_sampler, nearest_sampler, data_buffer, primitive_buffer, node_buffer, cache_keys, cache_cells, geometry_buffer, blue_noise }) {
+		for (RID r : { item_mask_sampler, item_material_buffer, wall_material_buffer, linear_sampler, mip_sampler, nearest_sampler, data_buffer, primitive_buffer, node_buffer, cache_keys, cache_cells, geometry_buffer, blue_noise }) {
 			if (r.is_valid()) {
 				rd->free_rid(r);
 			}
@@ -3063,6 +3092,11 @@ RID PhysXGIEffect::_hw_blas(RenderingDevice *p_rd, const HardwareGroupKey &p_key
 // One leaf as an instance: its record's local-to-world (a box scaled to its half extents over the unit box), its slot as
 // the custom index. False for a shape the hardware path doesn't have (spheres, capsules, cylinders, hulls) or a mesh
 // whose structure is missing.
+static BitField<RenderingDevice::AccelerationStructureInstanceFlagBits> wall_instance_flags(const float *p_record) {
+	return RenderingDevice::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT |
+			(p_record[23] < 0.0f ? RenderingDevice::ACCELERATION_STRUCTURE_INSTANCE_FORCE_NO_OPAQUE_BIT : RenderingDevice::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT);
+}
+
 bool PhysXGIEffect::_hw_instance(RenderingDevice *p_rd, const Snapshot &p_snapshot, int p_slot, const Transform3D &p_world, RD::AccelerationStructureInstance &r_instance) {
 	const float *r = p_snapshot.primitives.ptr() + p_slot * PRIMITIVE_FLOATS;
 	Transform3D to_world = p_world;
@@ -3091,7 +3125,7 @@ bool PhysXGIEffect::_hw_instance(RenderingDevice *p_rd, const Snapshot &p_snapsh
 	r_instance.mask = r[19] < 0.0f ? 2 : 1;
 	// RenderingDevice wants a hit shader table range on every instance, though a ray query uses none: offset 0, count 1.
 	r_instance.hit_sbt_range = RD::HitShaderBindingTableRange(uint64_t(1) << 32);
-	r_instance.flags = RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT | RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT;
+	r_instance.flags = wall_instance_flags(r);
 	return true;
 }
 
@@ -3201,10 +3235,10 @@ bool PhysXGIEffect::_hw_update(RenderingDevice *p_rd, const Snapshot &p_snapshot
 			bool same = lease != 0 && lease != UINT64_MAX;
 			for (int j = 0; j < span && same; j++) {
 				const float *part = first + j * PRIMITIVE_FLOATS;
-				// All mesh instances use the same cull-disable/force-opaque flags.
-				// The opaque mask and exact transforms (also the shader's inverse)
+				// Ray flags, mask and exact transforms (also the shader's inverse)
 				// must match; items and boxes never enter a composite.
 				same = int(part[12] + 0.5f) == 5 && part[19] >= 0.0f && p_snapshot.primitive_keys[slot + j] != 0 &&
+						wall_instance_flags(part) == wall_instance_flags(first) &&
 						(j == 0 || p_snapshot.primitive_groups[slot + j] == 0) &&
 						p_snapshot.primitive_ids[slot + j].second == lease &&
 						p_worlds[slot + j] == p_worlds[slot] && memcmp(part, first, 12 * sizeof(float)) == 0;
@@ -3352,6 +3386,7 @@ bool PhysXGIEffect::_hw_update(RenderingDevice *p_rd, const Snapshot &p_snapshot
 			const HardwareMesh *mesh = blocks_changed && key ? hw_meshes.getptr(key) : nullptr;
 			const bool live_blas = !blocks_changed || (key ? mesh && mesh->blas == instances[i].blas : instances[i].blas == hw_box_blas);
 			if (i < hw_static_count && hw_static_keys[i] == key && live_blas && instances[i].mask == (record[19] < 0.0f ? 2 : 1) &&
+					instances[i].flags == wall_instance_flags(record) &&
 					memcmp(record, hw_static_records.ptr() + i * 16, 16 * sizeof(float)) == 0) {
 				hw_static_revisions[i] = revision;
 				continue;
@@ -3442,7 +3477,7 @@ bool PhysXGIEffect::_hw_update(RenderingDevice *p_rd, const Snapshot &p_snapshot
 			if (same && cached.blas.is_valid() && cached.blas != hw_box_blas &&
 					(span == 1 || cached.blas == composite) && cached.mask == (record[19] < 0.0f ? 2 : 1) &&
 					cached.hit_sbt_range == RD::HitShaderBindingTableRange(uint64_t(1) << 32) &&
-					uint64_t(cached.flags) == uint64_t(RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT | RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT) &&
+					cached.flags == wall_instance_flags(record) &&
 					cached.transform == p_worlds[slot] && (span > 1 || !blocks_changed || hw_meshes.has(plan.geometry.keys[0]))) {
 				cached.id = uint32_t(slot);
 				continue;
@@ -3454,7 +3489,7 @@ bool PhysXGIEffect::_hw_update(RenderingDevice *p_rd, const Snapshot &p_snapshot
 			cached.id = uint32_t(slot);
 			cached.mask = 1;
 			cached.hit_sbt_range = RD::HitShaderBindingTableRange(uint64_t(1) << 32);
-			cached.flags = RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT | RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT;
+			cached.flags = wall_instance_flags(record);
 		} else if (!_hw_instance(p_rd, p_snapshot, slot, p_worlds[slot], cached)) {
 			print_line(vformat("PXTGI: moving shape %d has no hardware structure; tracing stays in software.", slot));
 			return false;
@@ -3758,6 +3793,9 @@ void PhysXGIEffect::_dispatch(RenderingDevice *p_rd, int p_pass, const Vector<RD
 		uniforms.push_back(u);
 	}
 	uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_UNIFORM_BUFFER, 9, data_buffer));
+	if (p_pass == PASS_TRACE || p_pass == PASS_REFLECT || p_pass == PASS_CACHE) {
+		uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 24, wall_material_buffer));
+	}
 	const bool hw = hw_active && hw_pipelines[p_pass].is_valid();
 	if (hw) {
 		uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_ACCELERATION_STRUCTURE, 15, hw_static_tlas));
@@ -3845,6 +3883,7 @@ void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_rende
 		snapshot_owner = owner;
 		primitives_uploaded = UINT64_MAX;
 		geometry_uploaded = UINT64_MAX;
+		wall_materials_uploaded = UINT64_MAX;
 		geometry_offsets.clear();
 		geometry_descriptors.clear();
 		_hw_free(rd);
@@ -4451,6 +4490,25 @@ void PhysXGIEffect::_render_frame(int p_callback_type, const RenderData *p_rende
 		nodes_uploaded = s.nodes_version;
 	}
 	primitives_uploaded = s.primitives_version;
+	if (wall_materials_uploaded != s.wall_materials_version || wall_material_buffer.is_null()) {
+		const uint32_t required = MAX(s.wall_materials.size(), 4);
+		if (wall_material_buffer.is_null() || required > wall_material_capacity) {
+			if (wall_material_buffer.is_valid()) {
+				rd->free_rid(wall_material_buffer);
+			}
+			wall_material_capacity = Math::next_power_of_2(required);
+			wall_material_buffer = rd->storage_buffer_create(wall_material_capacity * sizeof(float));
+			ERR_FAIL_COND(wall_material_buffer.is_null());
+		}
+		// Complete rather than delta data: a renderer may miss any number of
+		// publications, including a body retirement and reuse of the same range.
+		if (s.wall_materials.is_empty()) {
+			ERR_FAIL_COND(rd->buffer_clear(wall_material_buffer, 0, 4 * sizeof(float)) != OK);
+		} else {
+			ERR_FAIL_COND(rd->buffer_update(wall_material_buffer, 0, s.wall_materials.size() * sizeof(float), s.wall_materials.ptr()) != OK);
+		}
+		wall_materials_uploaded = s.wall_materials_version;
+	}
 	const uint64_t geometry_since = OS::get_singleton()->get_ticks_usec();
 	if (s.geometry_version != geometry_uploaded || geometry_buffer.is_null()) {
 		// A wall revision changes kilobytes, not the hundreds of megabytes of city

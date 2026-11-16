@@ -10,8 +10,9 @@ path is retained; the optional awake-PhysX-body shortcut is removed. The render
 thread call helper carries its callable locally instead of including the PhysX
 server header. Engine base: Lightriders' pinned Godot 4.7.2 patch series.
 
-This is a visual comparison candidate. The normal project does not instantiate
-PXTGI; the game trial opts in with `--pxtgi` on `route.first`.
+The game instantiates PXTGI through its opt-in Video Lighting setting. Standard remains
+the default; map holds and device fallback belong to the game. This branch's additional
+admission and wall-batch changes require the matching experimental game/editor pair.
 
 Local scene-integration changes expose reflection reach independently of GI reach,
 allow a proxy to opt out of box-light sampling with `pxtgi_sample_emission`, and
@@ -31,7 +32,7 @@ replaces border-sampler reads. Lens extraction bounds non-finite HDR inputs. A l
 without feeding blurred output back into temporal history. These effects remain
 opt-in through the game experiment.
 
-Local changes of 2026-11-13, for the game's ray traced Lighting:
+Local integration for the game's ray traced Lighting:
 
 - `reflection_jitter`: a reflection ray starts at a point drawn in its texel (blue noise, anew each frame or
   fixed) instead of the texel's middle, on the pixel's own surface: a reflected line thinner than a texel is
@@ -109,6 +110,38 @@ bounds; skipped publications or new buffers upload the whole snapshot. A changed
 records a full TLAS build.
 The empty-static mask-zero instance, owner reset and terminal software fallback are retained. The
 full memory barrier workaround and draw-graph dependency rules are unchanged.
+
+## Persistent wall batches
+
+`PXTGIRenderOnlyConcaveShape3D.set_face_group_counts` assigns up to 32 consecutive
+triangle groups in source-face order. Counts must cover the faces exactly. Group IDs
+travel in each corner's W component through the same SAH permutation as its triangle;
+ordinary geometry and item brightness retain their existing meanings. Grouped resources
+cannot use or produce format-1 baked geometry. A group-boundary edit invalidates the
+compiled geometry even when the faces themselves are unchanged.
+
+`set_wall_batch_runtime_looks` takes the slab/rod/foot bodies, distinct live group indices,
+one albedo and wall-major/part-minor emissions. It validates the complete call and converts
+colors identically to the ordinary runtime setter. Each body owns a reusable 32-vec4 range:
+linear emission RGB and an active bit. Live black walls still block rays; omitted groups
+do not. Full ObjectIDs retain ranges across disabled pool leases and reparenting. Explicit
+clear, replacement with an ordinary runtime look, or actual owner destruction releases them.
+Authored body looks remain untouched.
+
+A negative primitive emission W encodes the material-table base and retains the existing
+moving-surface history classification. Initial allocation and clear patch that record;
+per-wall fading does not dirty primitive records or geometry. Complete COW table snapshots
+have their own version and upload as a whole when changed, including after skipped
+publications. Owner changes reset upload identity. Buffer replacement uses RenderingDevice's
+normal deferred destruction; binding 24 belongs only to the three world-tracing passes.
+
+Hardware batch instances use FORCE_NO_OPAQUE. Queries confirm only live candidate groups;
+ordinary instances still use FORCE_OPAQUE, and composite/reuse checks include the actual
+flags. Software traversal skips inactive triangles before intersection. Both paths fetch
+the hit wall's emission before secondary rays can replace the hit-triangle index. Retaining
+departed triangles until batch retirement avoids repeated BLAS builds without leaving dark
+walls in reflections or shadow rays. Live trims replace only the affected batch's geometry.
+The game's native simulation remains the authority for fades, cuts, expiry and owner death.
 
 ## Upstream audit
 

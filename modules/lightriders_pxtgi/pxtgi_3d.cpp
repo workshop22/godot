@@ -1041,12 +1041,32 @@ PackedByteArray baked_geometry_digest(const Vector<Vector3> &p_faces, const Vect
 } // namespace
 
 void PXTGIRenderOnlyConcaveShape3D::_bind_methods() {
+	ClassDB::bind_method(D_METHOD("set_face_group_counts", "counts"), &PXTGIRenderOnlyConcaveShape3D::set_face_group_counts);
+	ClassDB::bind_method(D_METHOD("get_face_group_counts"), &PXTGIRenderOnlyConcaveShape3D::get_face_group_counts);
 	ClassDB::bind_method(D_METHOD("set_baked_geometry", "data"), &PXTGIRenderOnlyConcaveShape3D::set_baked_geometry);
 	ClassDB::bind_method(D_METHOD("get_baked_geometry"), &PXTGIRenderOnlyConcaveShape3D::get_baked_geometry);
 	ClassDB::bind_method(D_METHOD("bake_geometry"), &PXTGIRenderOnlyConcaveShape3D::bake_geometry);
 	ClassDB::bind_method(D_METHOD("has_baked_geometry"), &PXTGIRenderOnlyConcaveShape3D::has_baked_geometry);
 	ClassDB::bind_method(D_METHOD("matches_mesh_surface", "vertices", "indices"), &PXTGIRenderOnlyConcaveShape3D::matches_mesh_surface);
 	ADD_PROPERTY(PropertyInfo(Variant::ARRAY, "baked_geometry", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_baked_geometry", "get_baked_geometry");
+}
+
+void PXTGIRenderOnlyConcaveShape3D::set_face_group_counts(const PackedInt32Array &p_counts) {
+	ERR_FAIL_COND(p_counts.size() > 32);
+	int64_t total = 0;
+	for (int32_t count : p_counts) {
+		ERR_FAIL_COND(count < 0);
+		total += count;
+	}
+	ERR_FAIL_COND(!p_counts.is_empty() && total * 3 != get_faces().size());
+	if (face_group_counts == p_counts) {
+		return;
+	}
+	face_group_counts = p_counts;
+	if (!p_counts.is_empty()) {
+		set_baked_geometry(Array());
+	}
+	emit_changed();
 }
 
 void PXTGIRenderOnlyConcaveShape3D::set_baked_geometry(const Array &p_data) {
@@ -1075,6 +1095,9 @@ void PXTGIRenderOnlyConcaveShape3D::set_baked_geometry(const Array &p_data) {
 
 Array PXTGIRenderOnlyConcaveShape3D::get_baked_geometry() const {
 	MutexLock lock(baked_mutex);
+	if (!face_group_counts.is_empty()) {
+		return Array();
+	}
 	Array data;
 	if (baked_version) {
 		data.push_back(baked_version);
@@ -1088,6 +1111,9 @@ Array PXTGIRenderOnlyConcaveShape3D::get_baked_geometry() const {
 
 bool PXTGIRenderOnlyConcaveShape3D::has_baked_geometry() {
 	MutexLock lock(baked_mutex);
+	if (!face_group_counts.is_empty()) {
+		return false;
+	}
 	const Vector<Vector3> faces = get_faces();
 	if (baked_checked && checked_faces.ptr() == faces.ptr()) {
 		return baked_valid;
@@ -1153,6 +1179,9 @@ bool PXTGIRenderOnlyConcaveShape3D::has_baked_geometry() {
 
 bool PXTGIRenderOnlyConcaveShape3D::bake_geometry() {
 	MutexLock lock(baked_mutex);
+	if (!face_group_counts.is_empty()) {
+		return false;
+	}
 	if (has_baked_geometry()) {
 		return true;
 	}
@@ -1226,7 +1255,9 @@ void PXTGI3D::_geometry_changed(ObjectID p_shape) {
 		// emits changed without changing geometry, including after CPU preparation.
 		// Held COW inputs keep identity stable; real edits detach their storage.
 		if (const ConcavePolygonShape3D *concave = Object::cast_to<ConcavePolygonShape3D>(shape)) {
-			if (block->source_vertices.ptr() == concave->get_faces().ptr()) {
+			const PXTGIRenderOnlyConcaveShape3D *grouped = Object::cast_to<PXTGIRenderOnlyConcaveShape3D>(shape);
+			if (block->source_vertices.ptr() == concave->get_faces().ptr() &&
+					(!grouped || block->source_groups.ptr() == grouped->get_face_group_counts().ptr())) {
 				return;
 			}
 		} else if (const ConvexPolygonShape3D *convex = Object::cast_to<ConvexPolygonShape3D>(shape)) {
@@ -1310,6 +1341,7 @@ const PXTGI3D::GeometryBlock *PXTGI3D::_geometry_for(const Ref<Shape3D> &p_shape
 	const Callable changed = callable_mp(this, &PXTGI3D::_geometry_changed).bind(id);
 	bool baked = false;
 	Vector<Vector3> corners;
+	PackedFloat32Array wall_groups;
 	if (Ref<ConvexPolygonShape3D> convex = p_shape; convex.is_valid()) {
 		const Vector<Vector3> points = convex->get_points();
 		block.source_vertices = points;
@@ -1330,6 +1362,25 @@ const PXTGI3D::GeometryBlock *PXTGI3D::_geometry_for(const Ref<Shape3D> &p_shape
 	} else if (Ref<ConcavePolygonShape3D> concave = p_shape; concave.is_valid()) {
 		corners = concave->get_faces();
 		block.source_vertices = corners;
+		if (PXTGIRenderOnlyConcaveShape3D *grouped = Object::cast_to<PXTGIRenderOnlyConcaveShape3D>(concave.ptr())) {
+			block.source_groups = grouped->get_face_group_counts();
+			if (!block.source_groups.is_empty()) {
+				ERR_FAIL_COND_V(p_uv || p_vertex_red, nullptr);
+				int64_t count = 0;
+				for (int32_t group : block.source_groups) {
+					count += int64_t(group) * 3;
+				}
+				ERR_FAIL_COND_V(count != corners.size(), nullptr);
+				wall_groups.resize(corners.size());
+				float *groups = wall_groups.ptrw();
+				int corner = 0;
+				for (int group = 0; group < block.source_groups.size(); group++) {
+					for (int i = 0; i < block.source_groups[group] * 3; i++) {
+						groups[corner++] = float(group);
+					}
+				}
+			}
+		}
 		if (!p_uv && !p_vertex_red) {
 			if (PXTGIRenderOnlyConcaveShape3D *prepared = Object::cast_to<PXTGIRenderOnlyConcaveShape3D>(concave.ptr())) {
 				baked = prepared->copy_baked_geometry(block.nodes, block.triangles, block.bounds);
@@ -1365,7 +1416,7 @@ const PXTGI3D::GeometryBlock *PXTGI3D::_geometry_for(const Ref<Shape3D> &p_shape
 		}
 	}
 	if (!baked && corners.size() >= 3) {
-		build_mesh_geometry(corners, block.nodes, block.triangles, block.bounds, p_uv, p_uv ? &block.attributes : nullptr, p_vertex_red);
+		build_mesh_geometry(corners, block.nodes, block.triangles, block.bounds, p_uv, p_uv ? &block.attributes : nullptr, wall_groups.is_empty() ? p_vertex_red : &wall_groups);
 		block.type = 5;
 	}
 	if (block.type) {
@@ -1946,6 +1997,7 @@ void PXTGI3D::_rescan(bool p_notified_only) {
 			}
 		}
 		for (ObjectID id : retired_looks) {
+			_clear_wall_material_offset(id);
 			runtime_body_looks.erase(id);
 		}
 	}
@@ -2456,7 +2508,8 @@ void PXTGI3D::_pack_entry(int p_index, const Transform3D &p_to_world, float p_ty
 	p[20] = entry.emission.r;
 	p[21] = entry.emission.g;
 	p[22] = entry.emission.b;
-	p[23] = entry.fixed ? 1.0f : 0.0f;
+	const int *wall_offset = wall_material_offsets.getptr(entry.body_node);
+	p[23] = wall_offset ? -float(*wall_offset + 1) : (entry.fixed ? 1.0f : 0.0f);
 }
 
 // Shape p_index's GPU record and world bounds, from its node (false when it can't be traced), also noting where the
@@ -3685,6 +3738,7 @@ void PXTGI3D::set_body_group_runtime_looks(const Dictionary &p_groups, const Arr
 				continue;
 			}
 			const ObjectID id = bodies[i];
+			_clear_wall_material_offset(id);
 			const LocalVector<int> *entries = body_entries.getptr(id);
 			if (entries && !entries->is_empty()) {
 				runtime_body_looks.insert(id, linear[i]);
@@ -3696,6 +3750,131 @@ void PXTGI3D::set_body_group_runtime_looks(const Dictionary &p_groups, const Arr
 				}
 			}
 		}
+	}
+}
+
+// The table base is part of the primitive, but changing a wall's fade is not.
+// A static caller also needs a new instance flag; ordinary glow edits do not.
+void PXTGI3D::_patch_wall_material_offset(ObjectID p_body) {
+	const LocalVector<int> *entries = body_entries.getptr(p_body);
+	if (!entries) {
+		return;
+	}
+	const int *offset = wall_material_offsets.getptr(p_body);
+	constexpr int PF = PhysXGIEffect::PRIMITIVE_FLOATS;
+	for (int index : *entries) {
+		const ShapeEntry &entry = shapes[index];
+		const float value = offset ? -float(*offset + 1) : (entry.fixed ? 1.0f : 0.0f);
+		float &record = entry_floats[index * PF + 23];
+		if (record == value) {
+			continue;
+		}
+		record = value;
+		if (entry.static_slot >= 0) {
+			// Leave the previous ordered record intact until the static revision
+			// comparison sees the flag change, including across skipped snapshots.
+			static_slots_dirty.insert(entry.static_slot);
+			_static_dirty(STATIC_GEOMETRY);
+		} else if (entry_slot[index] >= 0) {
+			ordered_floats[entry_slot[index] * PF + 23] = value;
+			touched_slots.push_back(entry_slot[index]);
+		}
+		radiance_dirty = true;
+	}
+}
+
+void PXTGI3D::_clear_wall_material_offset(ObjectID p_body) {
+	const int *found = wall_material_offsets.getptr(p_body);
+	if (!found) {
+		return;
+	}
+	const int offset = *found;
+	wall_material_offsets.erase(p_body);
+	free_wall_material_offsets.push_back(offset);
+	memset(wall_materials.ptrw() + offset * 4, 0, WALL_GROUPS * 4 * sizeof(float));
+	wall_materials_version++;
+	_patch_wall_material_offset(p_body);
+}
+
+void PXTGI3D::set_wall_batch_runtime_looks(const Array &p_bodies, const PackedInt32Array &p_groups, const Color &p_albedo, const Array &p_emissions) {
+	ERR_FAIL_COND(p_bodies.size() != 3 || p_groups.size() > WALL_GROUPS || p_emissions.size() != p_groups.size() * 3);
+	Node3D *bodies[3];
+	ObjectID ids[3];
+	for (int part = 0; part < 3; part++) {
+		bodies[part] = Object::cast_to<Node3D>(p_bodies[part]);
+		ERR_FAIL_NULL(bodies[part]);
+		ids[part] = bodies[part]->get_instance_id();
+		for (int previous = 0; previous < part; previous++) {
+			ERR_FAIL_COND(ids[part] == ids[previous]);
+		}
+	}
+	// Validate the whole call before changing a body or a live table range.
+	uint32_t seen = 0;
+	float values[3][WALL_GROUPS * 4] = {};
+	for (int wall = 0; wall < p_groups.size(); wall++) {
+		const int group = p_groups[wall];
+		ERR_FAIL_COND(group < 0 || group >= WALL_GROUPS || (seen & (1u << group)));
+		seen |= 1u << group;
+		for (int part = 0; part < 3; part++) {
+			ERR_FAIL_COND(p_emissions[wall * 3 + part].get_type() != Variant::COLOR);
+			const Color glow = Color(p_emissions[wall * 3 + part]).srgb_to_linear();
+			float *value = values[part] + group * 4;
+			value[0] = glow.r;
+			value[1] = glow.g;
+			value[2] = glow.b;
+			value[3] = 1.0f; // a live black wall still blocks rays
+		}
+	}
+	for (Node3D *body : bodies) {
+		bool found = false;
+		for (int child = 0; child < body->get_child_count(); child++) {
+			CollisionShape3D *collision = Object::cast_to<CollisionShape3D>(body->get_child(child));
+			if (!collision) {
+				continue;
+			}
+			const PXTGIRenderOnlyConcaveShape3D *shape = Object::cast_to<PXTGIRenderOnlyConcaveShape3D>(collision->get_shape().ptr());
+			ERR_FAIL_NULL(shape);
+			const PackedInt32Array counts = shape->get_face_group_counts();
+			ERR_FAIL_COND(counts.is_empty() || (uint64_t(seen) >> counts.size()) != 0);
+			found = true;
+		}
+		ERR_FAIL_COND(!found);
+	}
+	bool changed = false;
+	const Pair<Color, Color> look(p_albedo.srgb_to_linear(), Color(0, 0, 0, 1));
+	for (int part = 0; part < 3; part++) {
+		const ObjectID id = ids[part];
+		int *known = wall_material_offsets.getptr(id);
+		int offset;
+		if (known) {
+			offset = *known;
+		} else {
+			if (free_wall_material_offsets.is_empty()) {
+				offset = wall_materials.size() / 4;
+				wall_materials.resize((offset + WALL_GROUPS) * 4);
+				memset(wall_materials.ptrw() + offset * 4, 0, sizeof(values[part]));
+			} else {
+				offset = free_wall_material_offsets[free_wall_material_offsets.size() - 1];
+				free_wall_material_offsets.resize(free_wall_material_offsets.size() - 1);
+			}
+			wall_material_offsets.insert(id, offset);
+			_patch_wall_material_offset(id);
+			changed = true;
+		}
+		if (memcmp(wall_materials.ptr() + offset * 4, values[part], sizeof(values[part])) != 0) {
+			memcpy(wall_materials.ptrw() + offset * 4, values[part], sizeof(values[part]));
+			changed = true;
+		}
+		runtime_body_looks.insert(id, look);
+		const LocalVector<int> *entries = body_entries.getptr(id);
+		if (entries && !entries->is_empty()) {
+			_apply_body_look(*entries, look);
+		} else if (bodies[part]->is_inside_tree()) {
+			notify_body_changed(bodies[part]);
+		}
+	}
+	if (changed) {
+		wall_materials_version++;
 	}
 }
 
@@ -3732,6 +3911,7 @@ void PXTGI3D::clear_bodies_runtime_look(const Array &p_bodies, bool p_restore_au
 			continue;
 		}
 		const ObjectID id = p_bodies[i];
+		_clear_wall_material_offset(id);
 		if (!runtime_body_looks.erase(id)) {
 			continue;
 		}
@@ -3844,6 +4024,9 @@ Dictionary PXTGI3D::get_stats(bool p_reset) {
 	stats["moving"] = int64_t(moving_entries.size());
 	stats["static_leaves"] = int64_t(static_leaves);
 	stats["geometry_floats"] = int64_t(geometry_floats);
+	stats["wall_batch_bodies"] = int64_t(wall_material_offsets.size());
+	stats["wall_material_floats"] = int64_t(wall_materials.size());
+	stats["wall_materials_version"] = int64_t(wall_materials_version);
 	stats["geometry_range_errors"] = int64_t(geometry_range_errors);
 	stats["rescan_causes"] = rescan_causes;
 	{
@@ -4313,6 +4496,8 @@ void PXTGI3D::_publish() {
 		_stage(STAGE_SELECT, select_since);
 	}
 	_publish_geometry(s);
+	s.wall_materials = wall_materials;
+	s.wall_materials_version = wall_materials_version;
 
 	const uint64_t lights_since = OS::get_singleton()->get_ticks_usec();
 	// The sun: the brightest directional light Godot draws on surfaces (a hidden one, or a sky-only moon, isn't).
@@ -4553,6 +4738,7 @@ void PXTGI3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_bodies_look", "bodies", "albedo", "emission"), &PXTGI3D::set_bodies_look);
 	ClassDB::bind_method(D_METHOD("set_body_group_looks", "groups", "keys", "albedo", "emissions"), &PXTGI3D::set_body_group_looks);
 	ClassDB::bind_method(D_METHOD("set_body_group_runtime_looks", "groups", "keys", "albedo", "emissions"), &PXTGI3D::set_body_group_runtime_looks);
+	ClassDB::bind_method(D_METHOD("set_wall_batch_runtime_looks", "bodies", "groups", "albedo", "emissions"), &PXTGI3D::set_wall_batch_runtime_looks);
 	ClassDB::bind_method(D_METHOD("wall_query_columns", "revisions", "opacities"), &PXTGI3D::wall_query_columns);
 	ClassDB::bind_method(D_METHOD("clear_bodies_runtime_look", "bodies", "restore_authored"), &PXTGI3D::clear_bodies_runtime_look, DEFVAL(true));
 	ClassDB::bind_method(D_METHOD("update_emitter_group", "bodies", "stations", "values", "time"), &PXTGI3D::update_emitter_group);

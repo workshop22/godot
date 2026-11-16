@@ -62,6 +62,7 @@ class PXTGIRenderOnlyConcaveShape3D : public ConcavePolygonShape3D {
 	Vector<Vector3> matched_faces;
 	Vector<Vector3> matched_vertices;
 	Vector<int32_t> matched_indices;
+	PackedInt32Array face_group_counts; // runtime wall groups, in original triangle order; never baked as format 1
 
 protected:
 	static void _bind_methods();
@@ -69,6 +70,8 @@ protected:
 
 public:
 	PXTGIRenderOnlyConcaveShape3D();
+	void set_face_group_counts(const PackedInt32Array &p_counts);
+	PackedInt32Array get_face_group_counts() const { return face_group_counts; }
 	// Stored format 1: [revision, SHA256, nodes, triangles, bounds]. The digest
 	// binds exact faces, payload bytes and engine scalar precision. No GPU state.
 	void set_baked_geometry(const Array &p_data);
@@ -172,12 +175,13 @@ class PXTGI3D : public Node3D {
 		int hardware_publication_slot = -1;
 		Vector<float> planes; // hull: normal, offset
 		Vector<float> nodes; // mesh: its tree (8 floats a node; indices relative to the mesh)
-		Vector<float> triangles; // mesh: three vec4 corners; lattice vertex brightness in w, otherwise padding
+		Vector<float> triangles; // mesh: three vec4 corners; item brightness or wall group in w, otherwise padding
 		Vector<float> attributes; // item: two vec4s per triangle, in the same SAH order
 		AABB bounds;
 		// COW input references distinguish geometry edits from debug-style changed
 		// signals without copying source data or keeping the Shape3D alive.
 		Vector<Vector3> source_vertices;
+		PackedInt32Array source_groups;
 		Vector<real_t> source_heights;
 		int source_width = 0;
 		int source_depth = 0;
@@ -275,6 +279,15 @@ class PXTGI3D : public Node3D {
 	// Explicit runtime appearance belongs to the body's full lifetime, not its current
 	// shapes or scene membership. The owner clears the override; authoring stays intact.
 	HashMap<ObjectID, Pair<Color, Color>> runtime_body_looks;
+	static constexpr int WALL_GROUPS = 32;
+	// Full body lifetime, including disabled pools. Each range has one linear RGB/active
+	// vec4 per wall; complete COW snapshots also survive skipped publications.
+	HashMap<ObjectID, int> wall_material_offsets;
+	LocalVector<int> free_wall_material_offsets;
+	Vector<float> wall_materials;
+	uint64_t wall_materials_version = 0;
+	void _patch_wall_material_offset(ObjectID p_body);
+	void _clear_wall_material_offset(ObjectID p_body);
 	LocalVector<ObjectID> look_order;
 	HashMap<ObjectID, int> look_slots;
 	uint32_t look_cursor = 0;
@@ -528,6 +541,9 @@ public:
 	// and shape replacement. Generic setters still author metadata underneath it;
 	// update_emitter_group retains its existing priority over the emission channel.
 	void set_body_group_runtime_looks(const Dictionary &p_groups, const Array &p_keys, const Color &p_albedo, const Array &p_emissions);
+	// Three render-only mesh bodies (slab, rod, foot), live group indices, and
+	// wall-major/part-minor emissions. Unlisted groups reject every traced ray.
+	void set_wall_batch_runtime_looks(const Array &p_bodies, const PackedInt32Array &p_groups, const Color &p_albedo, const Array &p_emissions);
 	Array wall_query_columns(const Dictionary &p_revisions, const Dictionary &p_opacities) const;
 	// False defers restoration only for retired leaves; the controlled pool must
 	// notify or author each reused body before publication. Live leaves restore now.

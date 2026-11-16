@@ -168,6 +168,8 @@ public:
 	};
 
 	struct Snapshot {
+		Vector<float> wall_materials;
+		uint64_t wall_materials_version = 0;
 		PackedFloat32Array item_materials;
 		TypedArray<Texture2D> item_masks; // strong references survive skipped main-thread publications
 		String item_shader;
@@ -305,6 +307,9 @@ private:
 	ItemPipelines *active_item_pipelines = nullptr;
 	bool _ensure_item_pipeline(RenderingDevice *p_rd, const String &p_source, bool p_hardware);
 	RID item_material_buffer;
+	RID wall_material_buffer;
+	uint32_t wall_material_capacity = 0; // floats
+	uint64_t wall_materials_uploaded = UINT64_MAX;
 	uint32_t item_material_capacity = 0;
 	RID linear_sampler;
 	RID mip_sampler;
