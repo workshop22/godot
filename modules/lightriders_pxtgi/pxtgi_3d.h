@@ -542,8 +542,8 @@ public:
 	// update_emitter_group retains its existing priority over the emission channel.
 	void set_body_group_runtime_looks(const Dictionary &p_groups, const Array &p_keys, const Color &p_albedo, const Array &p_emissions);
 	// Three render-only mesh bodies (slab, rod, foot), live group indices, and
-	// wall-major/part-minor emissions. Unlisted groups reject every traced ray.
-	void set_wall_batch_runtime_looks(const Array &p_bodies, const PackedInt32Array &p_groups, const Color &p_albedo, const Array &p_emissions);
+	// native levels with one linear color and three strengths. Unlisted groups reject every traced ray.
+	void set_wall_batch_runtime_looks(const Array &p_bodies, const PackedInt32Array &p_groups, const Color &p_albedo, const Color &p_linear_emission, const PackedFloat64Array &p_levels, const PackedFloat32Array &p_strengths);
 	Array wall_query_columns(const Dictionary &p_revisions, const Dictionary &p_opacities) const;
 	// False defers restoration only for retired leaves; the controlled pool must
 	// notify or author each reused body before publication. Live leaves restore now.

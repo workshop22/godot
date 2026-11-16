@@ -3796,8 +3796,8 @@ void PXTGI3D::_clear_wall_material_offset(ObjectID p_body) {
 	_patch_wall_material_offset(p_body);
 }
 
-void PXTGI3D::set_wall_batch_runtime_looks(const Array &p_bodies, const PackedInt32Array &p_groups, const Color &p_albedo, const Array &p_emissions) {
-	ERR_FAIL_COND(p_bodies.size() != 3 || p_groups.size() > WALL_GROUPS || p_emissions.size() != p_groups.size() * 3);
+void PXTGI3D::set_wall_batch_runtime_looks(const Array &p_bodies, const PackedInt32Array &p_groups, const Color &p_albedo, const Color &p_linear_emission, const PackedFloat64Array &p_levels, const PackedFloat32Array &p_strengths) {
+	ERR_FAIL_COND(p_bodies.size() != 3 || p_groups.size() > WALL_GROUPS || p_levels.size() != p_groups.size() || p_strengths.size() != 3);
 	Node3D *bodies[3];
 	ObjectID ids[3];
 	for (int part = 0; part < 3; part++) {
@@ -3815,9 +3815,12 @@ void PXTGI3D::set_wall_batch_runtime_looks(const Array &p_bodies, const PackedIn
 		const int group = p_groups[wall];
 		ERR_FAIL_COND(group < 0 || group >= WALL_GROUPS || (seen & (1u << group)));
 		seen |= 1u << group;
+		ERR_FAIL_COND(!Math::is_finite(p_levels[wall]) || p_levels[wall] < 0.0);
+		// Native fades already multiply a linear palette. Keep that representation
+		// through publication instead of encoding and decoding every wall's RGB.
+		const Color faded = p_linear_emission * float(p_levels[wall]);
 		for (int part = 0; part < 3; part++) {
-			ERR_FAIL_COND(p_emissions[wall * 3 + part].get_type() != Variant::COLOR);
-			const Color glow = Color(p_emissions[wall * 3 + part]).srgb_to_linear();
+			const Color glow = faded * p_strengths[part];
 			float *value = values[part] + group * 4;
 			value[0] = glow.r;
 			value[1] = glow.g;
@@ -4738,7 +4741,7 @@ void PXTGI3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_bodies_look", "bodies", "albedo", "emission"), &PXTGI3D::set_bodies_look);
 	ClassDB::bind_method(D_METHOD("set_body_group_looks", "groups", "keys", "albedo", "emissions"), &PXTGI3D::set_body_group_looks);
 	ClassDB::bind_method(D_METHOD("set_body_group_runtime_looks", "groups", "keys", "albedo", "emissions"), &PXTGI3D::set_body_group_runtime_looks);
-	ClassDB::bind_method(D_METHOD("set_wall_batch_runtime_looks", "bodies", "groups", "albedo", "emissions"), &PXTGI3D::set_wall_batch_runtime_looks);
+	ClassDB::bind_method(D_METHOD("set_wall_batch_runtime_looks", "bodies", "groups", "albedo", "linear_emission", "levels", "strengths"), &PXTGI3D::set_wall_batch_runtime_looks);
 	ClassDB::bind_method(D_METHOD("wall_query_columns", "revisions", "opacities"), &PXTGI3D::wall_query_columns);
 	ClassDB::bind_method(D_METHOD("clear_bodies_runtime_look", "bodies", "restore_authored"), &PXTGI3D::clear_bodies_runtime_look, DEFVAL(true));
 	ClassDB::bind_method(D_METHOD("update_emitter_group", "bodies", "stations", "values", "time"), &PXTGI3D::update_emitter_group);

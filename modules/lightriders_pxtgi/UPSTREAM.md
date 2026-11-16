@@ -121,8 +121,10 @@ cannot use or produce format-1 baked geometry. A group-boundary edit invalidates
 compiled geometry even when the faces themselves are unchanged.
 
 `set_wall_batch_runtime_looks` takes the slab/rod/foot bodies, distinct live group indices,
-one albedo and wall-major/part-minor emissions. It validates the complete call and converts
-colors identically to the ordinary runtime setter. Each body owns a reusable 32-vec4 range:
+one sRGB albedo, one linear emission color, native fade levels and three part strengths.
+It validates the complete call and multiplies color × fade × strength in linear space,
+without allocating per-wall Color Variants or encoding and decoding their RGB each tick.
+Each body owns a reusable 32-vec4 range:
 linear emission RGB and an active bit. Live black walls still block rays; omitted groups
 do not. Full ObjectIDs retain ranges across disabled pool leases and reparenting. Explicit
 clear, replacement with an ordinary runtime look, or actual owner destruction releases them.
@@ -140,7 +142,8 @@ ordinary instances still use FORCE_OPAQUE, and composite/reuse checks include th
 flags. Software traversal skips inactive triangles before intersection. Both paths fetch
 the hit wall's emission before secondary rays can replace the hit-triangle index. Retaining
 departed triangles until batch retirement avoids repeated BLAS builds without leaving dark
-walls in reflections or shadow rays. Live trims replace only the affected batch's geometry.
+walls in reflections or shadow rays. The game handles a live trim by disabling its original
+group and giving the edited wall one loose lease on the same tick; sealed geometry stays immutable.
 The game's native simulation remains the authority for fades, cuts, expiry and owner death.
 
 ## Upstream audit
