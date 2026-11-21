@@ -35,6 +35,7 @@
 #include "core/object/script_language.h"
 #include "core/os/main_loop.h"
 #include "core/os/os.h"
+#include "core/os/thread.h"
 #include "core/string/print_string.h"
 #include "core/version.h"
 #include "main/main.h"
@@ -105,7 +106,8 @@ static void handle_crash(int sig) {
 	}
 
 	// Tell MainLoop about the crash. This can be handled by users too in Node.
-	if (OS::get_singleton()->get_main_loop()) {
+	// Nodes belong to the main thread: a crashed worker thread must not run their code.
+	if (OS::get_singleton()->get_main_loop() && Thread::is_main_thread()) {
 		OS::get_singleton()->get_main_loop()->notification(MainLoop::NOTIFICATION_CRASH);
 	}
 
