@@ -185,46 +185,26 @@ String DirAccessWindows::get_drive(int p_drive) {
 	return drives[p_drive].path;
 }
 
+// The process working directory is shared by every thread: changing it, even briefly, moves
+// another thread's relative paths and its unlocked reads of the directory.
 Error DirAccessWindows::change_dir(String p_dir) {
-	GLOBAL_LOCK_FUNCTION
-
 	String dir = fix_path(p_dir);
 
-	Char16String real_current_dir_name;
-	size_t str_len = GetCurrentDirectoryW(0, nullptr);
-	real_current_dir_name.resize_uninitialized(str_len + 1);
-	GetCurrentDirectoryW(real_current_dir_name.size(), (LPWSTR)real_current_dir_name.ptrw());
-	String prev_dir = String::utf16((const char16_t *)real_current_dir_name.get_data());
-
-	SetCurrentDirectoryW((LPCWSTR)(current_dir.utf16().get_data()));
-	bool worked = (SetCurrentDirectoryW((LPCWSTR)(dir.utf16().get_data())) != 0);
+	DWORD attributes = GetFileAttributesW((LPCWSTR)(dir.utf16().get_data()));
+	if (attributes == INVALID_FILE_ATTRIBUTES || !(attributes & FILE_ATTRIBUTE_DIRECTORY)) {
+		return ERR_INVALID_PARAMETER;
+	}
 
 	String base = _get_root_path();
-	if (!base.is_empty()) {
-		str_len = GetCurrentDirectoryW(0, nullptr);
-		real_current_dir_name.resize_uninitialized(str_len + 1);
-		GetCurrentDirectoryW(real_current_dir_name.size(), (LPWSTR)real_current_dir_name.ptrw());
-		String new_dir = String::utf16((const char16_t *)real_current_dir_name.get_data()).trim_prefix(R"(\\?\)").replace_char('\\', '/');
-		if (!new_dir.begins_with(base)) {
-			worked = false;
-		}
+	if (!base.is_empty() && !dir.trim_prefix(R"(\\?\)").replace_char('\\', '/').begins_with(base)) {
+		return ERR_INVALID_PARAMETER;
 	}
 
-	if (worked) {
-		str_len = GetCurrentDirectoryW(0, nullptr);
-		real_current_dir_name.resize_uninitialized(str_len + 1);
-		GetCurrentDirectoryW(real_current_dir_name.size(), (LPWSTR)real_current_dir_name.ptrw());
-		current_dir = String::utf16((const char16_t *)real_current_dir_name.get_data());
-	}
-
-	SetCurrentDirectoryW((LPCWSTR)(prev_dir.utf16().get_data()));
-
-	return worked ? OK : ERR_INVALID_PARAMETER;
+	current_dir = dir;
+	return OK;
 }
 
 Error DirAccessWindows::make_dir(String p_dir) {
-	GLOBAL_LOCK_FUNCTION
-
 	if (FileAccessWindows::is_path_invalid(p_dir)) {
 #ifdef DEBUG_ENABLED
 		WARN_PRINT("The path :" + p_dir + " is a reserved Windows system pipe, so it can't be used for creating directories.");
@@ -277,8 +257,6 @@ String DirAccessWindows::get_current_dir(bool p_include_drive) const {
 }
 
 bool DirAccessWindows::file_exists(String p_file) {
-	GLOBAL_LOCK_FUNCTION
-
 	String file = fix_path(p_file);
 
 	DWORD fileAttr;
@@ -291,8 +269,6 @@ bool DirAccessWindows::file_exists(String p_file) {
 }
 
 bool DirAccessWindows::dir_exists(String p_dir) {
-	GLOBAL_LOCK_FUNCTION
-
 	String dir = fix_path(p_dir);
 
 	DWORD fileAttr;
@@ -509,15 +485,27 @@ Error DirAccessWindows::create_link(String p_source, String p_target) {
 	}
 }
 
+// GetCurrentDirectoryW leaves the buffer untouched when the directory has grown since the size
+// query (OS.set_cwd on another thread); read again at the new size instead of using the buffer.
+static String _process_working_directory() {
+	Char16String buffer;
+	DWORD size = GetCurrentDirectoryW(0, nullptr);
+	while (size > 0) {
+		buffer.resize_uninitialized(size);
+		DWORD length = GetCurrentDirectoryW(size, (LPWSTR)buffer.ptrw());
+		if (length < size) {
+			return String::utf16((const char16_t *)buffer.get_data(), length);
+		}
+		size = length;
+	}
+	return String();
+}
+
 DirAccessWindows::DirAccessWindows() {
 	p = memnew(DirAccessWindowsPrivate);
 	p->h = INVALID_HANDLE_VALUE;
 
-	Char16String real_current_dir_name;
-	size_t str_len = GetCurrentDirectoryW(0, nullptr);
-	real_current_dir_name.resize_uninitialized(str_len + 1);
-	GetCurrentDirectoryW(real_current_dir_name.size(), (LPWSTR)real_current_dir_name.ptrw());
-	current_dir = String::utf16((const char16_t *)real_current_dir_name.get_data());
+	current_dir = _process_working_directory();
 
 	change_dir(".");
 }
